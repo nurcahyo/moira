@@ -27,6 +27,7 @@ use crate::{
     },
     error::AppError,
     infra::repositories::{AdminRepository, PgAdminRepository},
+    orchestration::require_chatgpt_subscription_opt_in,
     security::Actor,
 };
 
@@ -60,10 +61,19 @@ impl<'a> ProviderAdminService<'a> {
             .settings
             .provider_security
             .allow_http_provider_urls;
+        let allow_chatgpt_subscription = self
+            .state
+            .settings
+            .provider_security
+            .allow_chatgpt_subscription;
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     require_non_empty("display_name", &request.display_name)?;
+                    require_chatgpt_subscription_opt_in(
+                        request.provider_type,
+                        allow_chatgpt_subscription,
+                    )?;
                     let base_url = match request.base_url.as_deref() {
                         Some(value) => Some(validate_provider_base_url(
                             value,
@@ -118,6 +128,57 @@ impl<'a> ProviderAdminService<'a> {
     ) -> Result<ProviderRecord, AppError> {
         self.state.authz.require(actor, "moira:providers:read")?;
         self.repo.get_provider(id).await
+    }
+
+    /// Issue #83's read surface. Aggregates `provider_health_snapshots` rows written by the
+    /// `provider-health-check` worker (`src/infra/workers/provider_health_check.rs`) into one
+    /// rolling summary per provider — see
+    /// `ProviderObservabilityRepository::provider_health_summaries` for the query.
+    ///
+    /// The window is `workers.provider_health_snapshot_retention_hours` — the same duration
+    /// that worker prunes snapshots by, so this never reports on a snapshot the prune sweep
+    /// would already have deleted.
+    pub(crate) async fn provider_health(
+        &self,
+        actor: &Actor,
+    ) -> Result<crate::domain::ProviderHealthResponse, AppError> {
+        self.state.authz.require(actor, "moira:providers:read")?;
+        let pool = self.state.pool.clone().ok_or_else(|| {
+            AppError::Internal("provider health requires a configured database".to_string())
+        })?;
+        let repo = crate::infra::repositories::PgProviderObservabilityRepository::new(pool);
+        let window_hours = self
+            .state
+            .settings
+            .workers
+            .provider_health_snapshot_retention_hours
+            .max(1);
+        let since = chrono::Utc::now() - chrono::Duration::hours(window_hours);
+        let rows =
+            crate::infra::repositories::ProviderObservabilityRepository::provider_health_summaries(
+                &repo, since,
+            )
+            .await?;
+        let providers = rows
+            .into_iter()
+            .map(|row| {
+                Ok(crate::domain::ProviderHealthEntry {
+                    provider_id: row.provider_id,
+                    provider_type: crate::infra::pg_rows::provider_type_from_db(row.provider_type)?,
+                    display_name: row.display_name,
+                    status: crate::infra::pg_rows::provider_health_status_from_db(
+                        &row.current_status,
+                    ),
+                    probes_total: row.probes_total,
+                    probes_successful: row.probes_successful,
+                    average_latency_ms: row.average_latency_ms,
+                    last_probe_at: row.last_probe_at,
+                    last_success_at: row.last_success_at,
+                    last_failure_at: row.last_failure_at,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        Ok(crate::domain::ProviderHealthResponse { providers })
     }
 
     pub(crate) async fn patch_provider(

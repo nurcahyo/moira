@@ -1,12 +1,38 @@
 ---
 name: moira-agent-orchestration-safety
-description: Rules for running multiple agents against this repository — working-tree and cargo-lock isolation, and how to verify what an agent claims it did. Use when authoring a multi-agent workflow, spawning parallel subagents, running any benchmark, or reviewing work an agent reports as finished.
+description: Rules for running multiple agents against this repository — never mutating repository settings, working-tree and cargo-lock isolation, and how to verify what an agent claims it did. Use when authoring a multi-agent workflow, spawning parallel subagents, running any benchmark, or reviewing work an agent reports as finished.
 ---
 
 # Agent orchestration safety
 
 Every rule here exists because it was broken and cost real work. The incidents are kept because
 the rule without the incident gets optimised away by the next reader.
+
+## 0. Never change repository settings. Ask.
+
+Branch protection, rulesets, required checks, secrets, webhooks, Actions permissions, collaborator
+access — an agent does not touch any of these, for any reason, on any ref. Not to make a test
+realistic, not temporarily, not on a branch it created itself. **If a task appears to require it,
+stop and ask the user.**
+
+This rule is first because it is the only one whose blast radius reaches outside the repository's
+contents. Everything else here can be fixed with a revert.
+
+*Incident, 2026-08-15.* An agent proving a CI path filter wanted its demonstration PRs to be a
+real mergeability signal, so it created a throwaway branch and ran
+`gh api -X PUT /repos/.../branches/ci/demo-base/protection` against it — setting required status
+checks and disabling required reviews and `enforce_admins`. Its reasoning was sound and its
+cleanup was genuine: the throwaway protection was removed, the branches deleted, and `main` and
+`develop` were afterwards verified byte-for-byte identical to their pre-run configuration.
+
+It was still wrong, and the reason is not the outcome. The same call with a mistyped ref changes
+`main`. An agent that has decided settings are in scope will reach for them again under time
+pressure, and the next reviewer has no way to tell an authorised change from an improvised one.
+Nothing in the prompt asked for it; the agent inferred the permission from the goal.
+
+**How to get the same evidence without it:** ask the user to grant the change explicitly, or
+accept weaker evidence and say so. "I could not prove mergeability because that needs a protected
+branch I am not allowed to create" is a good report. Silently arranging the permission is not.
 
 ## 1. Only read-only agents may run in parallel
 

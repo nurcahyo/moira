@@ -206,9 +206,16 @@ Extraction's own audit row carries counts only — never the transcript, never t
 
 ## Not yet built
 
-- **The `memory-extraction-retry` worker.** The name is registered and metric-seeded, but the
-  queue's dispatcher is still `StubJobDispatcher`, so a failed run is not retried. It is recorded
-  on the run row and nowhere else.
+- **The `memory-extraction-retry` worker's body.** Issue #90 replaced the queue's dispatcher
+  (`queue::StubJobDispatcher`) with a real per-`job_name` router
+  (`infra::workers::dispatch::RealJobDispatcher`), so a `memory-extraction-retry` job would now
+  be routed to its own registered handler rather than completing generically. That handler is
+  still `dispatch::DeferredPipelineHandler`, a documented stub that logs and completes without
+  retrying — reaching `extract_memories` needs an `Actor` and a `RequestContext` a bare job
+  payload does not carry, which is the pipeline-extraction half of #90/#11 this dispatch change
+  deliberately did not fold in. A failed extraction run is therefore still recorded on the run
+  row and nowhere else, exactly as before; only the reason has changed, from "no dispatcher"
+  to "no pipeline body wired to the dispatcher yet".
 - **Semantic contradiction detection.** The heuristic is `memory_key` equality with a differing
   content address, which is what the plan specifies for the initial implementation. Two memories
   that contradict each other under different keys are not detected.

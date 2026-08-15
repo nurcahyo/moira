@@ -118,7 +118,7 @@ choosing shape (a).
 ## Storing the subscription token as an `oauth2` credential
 
 Separately from the sidecar's own (placeholder) credential above, the console's
-`/settings/llm` page also has a **"Connect Claude subscription"** panel. It
+`/settings/llm` page also has a **"Connect a Claude credential"** panel. It
 takes a long-lived token — the output of `claude setup-token` — and stores it
 through Moira's **existing** `POST /api/v1/admin/provider-credentials` endpoint
 as `credential_type: "oauth2"`, attached to a dedicated `anthropic`-type
@@ -128,6 +128,95 @@ find-or-create, matching `plans/12-feature-expansion-brainstorm.md` §1's design
 `credential_type = 'oauth2'` vs `'api_key'`"*). Re-submitting a fresh token
 rotates the existing row in place via `POST .../rotate` rather than creating a
 duplicate.
+
+### Three ways the panel gets that token, and one more credential shape
+
+The panel offers three acquisition modes for the `oauth2` row above, plus a
+separate field for the one credential shape that is fully sanctioned today:
+
+- **Mode A — CLI-assisted (primary), a two-phase async job (issue #269).**
+  `claude setup-token` is INTERACTIVE — it opens a browser, starts a loopback
+  listener, and waits for a human to finish an OAuth login, which takes
+  minutes. An earlier version of this mode ran it through a single bounded
+  `execFile` call with a 20-second timeout; that reliably killed the CLI
+  mid-login and returned an opaque 409. It is now two console-only routes,
+  both in `lib/claude-cli.ts`'s in-process job registry:
+  - `POST /api/settings/llm/claude-subscription/acquire/start` spawns
+    `claude setup-token` on the CONSOLE'S OWN HOST, DETACHED from the
+    request, and returns `{ job_id, authorization_url }` immediately — it
+    never waits for the child.
+  - `GET /api/settings/llm/claude-subscription/acquire/status?job=…` polls
+    the job. `running` while the child is alive; on `succeeded`, the FIRST
+    poll to observe it stores the token through the exact same
+    `connectClaudeSubscription` chain the paste mode below uses (never
+    sending the raw token to the browser, and never storing it twice); on
+    `failed`, a keyed, actionable message — including, once the job's
+    multi-minute budget is exhausted, one that names the paste fallback
+    (Mode C) by rule.
+
+  **Known limitation, found while building this (not merely theorized):**
+  `claude setup-token`'s interactive UI is built on Ink and renders NOTHING
+  over a plain pipe — verified locally by piping its stdin from `/dev/null`
+  and capturing stdout+stderr for a full 10 seconds with no timeout at all:
+  0 bytes on both streams. The SAME command under a pseudo-terminal (macOS
+  `script -q <file> claude setup-token`) renders a spinner and an
+  authorization URL. So today, with the shipped (plain-pipe) executor,
+  `authorization_url` stays `null` for a real job's whole life and every real
+  job ends in the timeout failure — never `succeeded`. Making the URL
+  actually appear would need a per-spawn pseudo-terminal, which Node's
+  `child_process` cannot allocate on its own; the standard fix is the native
+  `node-pty` package. That is a new native dependency shipped into a
+  distroless, Trivy-gated production image (`console/Dockerfile`) for a mode
+  this document already scopes as local/dev-oriented — a call left to the
+  owner rather than made unilaterally by whoever fixed the timeout. The
+  `ProcessSpawner` seam in `lib/claude-cli.ts` is where a pty-capable
+  executor would plug in; nothing in the job registry or either route would
+  need to change.
+
+  This is command execution on the console host either way, so it stays
+  gated behind an opt-in environment variable,
+  `CONSOLE_ALLOW_LOCAL_CLI_CREDENTIALS` (default `false`, see `lib/env.ts`),
+  and it is single-operator by nature: the CLI's signed-in session on that
+  host belongs to whoever ran `claude login` there. Treat it as
+  local/dev-oriented, not a fit for a console host shared across operators.
+  There is deliberately **no browser OAuth flow** feeding this mode or any
+  other — see "Why not a browser PKCE flow" below.
+
+  **Also investigated and found to not exist:** a documented, non-private way
+  to detect an already-authenticated local CLI session and read its credential
+  directly, which would avoid the browser round trip entirely. `claude auth
+  status` (documented, non-interactive) reports login state — email, org,
+  subscription plan — but never a token, and `claude setup-token --help`
+  lists no non-interactive flag. The only way to read a reusable credential
+  without going through `setup-token` would be the CLI's own local credential
+  store, which is exactly the "reverse-engineered" shape this workstream
+  rules out.
+- **Mode B — an official Anthropic Console API key.** A single field on the
+  same panel stores an `sk-ant-…` key as `credential_type: "api_key"`, on a
+  SEPARATE dedicated provider row (`display_name: "Anthropic (API key)"`) —
+  never the subscription row above. This is the one mode that is fully
+  sanctioned and useful against the Messages API TODAY:
+  `RuntimeFactory`'s `ProviderType::Anthropic` arm already accepts an
+  `api_key` credential (line 112, cited above); wiring a model and a routing
+  policy on top of the row this creates, on the same `/settings/llm` page, is
+  all that stands between this row and real completions.
+- **Mode C — paste (fallback).** The original shape: paste `claude
+  setup-token`'s output by hand. Always available, and the only mode that asks
+  nothing of the console host or its configuration.
+
+### Why not a browser PKCE flow
+
+Anthropic publishes no third-party OAuth client id for Claude. The only
+client id in existence is Claude Code's own, and driving it from a different
+product is client impersonation — the exact behavior Anthropic began blocking
+at the API layer in ~Jan 2026 (see the 2026 policy timeline in
+`plans/12-feature-expansion-brainstorm.md` §1). So Mode A does not open
+`claude.ai/oauth/authorize` in a browser popup and does not hardcode Claude
+Code's client id: it runs the REAL, already-authenticated `claude` CLI, which
+performs its own authentication the sanctioned way. If Anthropic ever
+publishes a registration process for third-party OAuth clients, a browser PKCE
+mode becomes possible; until then, building one means impersonating a client
+id this console was never issued.
 
 **This credential is storage only as of this change.** It is deliberately not
 wired to any `provider_models` or `routing_policies` row, so it is never
@@ -139,9 +228,13 @@ today rather than being silently accepted. What it *does* do is satisfy the
 "OAuth tokens live encrypted in the database" requirement and give the two
 future consumers a row to read once they exist:
 
-- the `oauth-token-refresh` `JobDispatcher` — **blocked on issue #90** (no real
-  `JobDispatcher` exists in the codebase yet; see
-  `plans/12-feature-expansion-brainstorm.md` §1's current-state note), and
+- the `oauth-token-refresh` worker — issue #90 landed the real, per-`job_name`
+  `JobDispatcher` (`infra::workers::dispatch::RealJobDispatcher`) and left
+  `oauth-token-refresh` an explicit registration seam
+  (`dispatch::default_dispatcher`'s doc comment names the one line it takes),
+  but no handler is registered yet: the OAuth refresh logic itself is still
+  unbuilt (see `plans/12-feature-expansion-brainstorm.md` §1's current-state
+  note), and
 - a future native-runner execution backend (option (b) in the table above), if
   the sidecar's operational cost or stability ever makes that the better
   choice.
@@ -222,7 +315,10 @@ readiness signal.
 - `docs/provider-credential-management.md` — the credential endpoints this
   flow calls; no new Moira endpoint was added for it.
 - `docs/project-structure.md` and `docs/console-architecture.md` — where the
-  console-side pieces (`lib/claude-subscription.ts`,
+  console-side pieces (`lib/claude-subscription.ts`, `lib/claude-cli.ts`,
   `modules/llm/ConnectClaudeSubscriptionPanel.tsx`,
-  `app/api/settings/llm/claude-subscription/route.ts`) sit relative to the rest
-  of the console.
+  `app/api/settings/llm/claude-subscription/route.ts`,
+  `app/api/settings/llm/claude-subscription/acquire/start/route.ts`,
+  `app/api/settings/llm/claude-subscription/acquire/status/route.ts`,
+  `app/api/settings/llm/claude-api-key/route.ts`) sit relative to the rest of
+  the console.

@@ -889,11 +889,26 @@ async fn the_streaming_arm_carries_the_same_agent_profile_fields_to_the_wire() {
 
 /// **Case 5 — `tool_policy` is not forwarded, and this is not a replacement for F48's guard.**
 ///
-/// `build_completion_request` hardcodes `tools: Vec::new()`, and the public plane refuses
-/// caller-declared tools outright. The profile in this fixture *does* declare a tool, so this
-/// case observes the one input a tool-calling implementation would read
-/// (`AgentProfileRecord::tool_policy`) and asserts nothing derived from it reached the
-/// provider.
+/// The profile in this fixture *does* declare a tool under `tool_policy`, so this case
+/// observes the one input a tool-calling implementation would reach for first and asserts
+/// nothing derived from it reached the provider.
+///
+/// # Issue #84 changed the surrounding behaviour and deliberately left this case standing
+///
+/// Tool calling is now implemented: an agent profile's `skill_refs`, resolved against
+/// enabled `skills` rows, do populate `CompletionRequest.tools`. Plan 12 risk R16 predicted
+/// that wiring real tool content would mean touching this pinned guard deliberately, and
+/// the deliberate answer was to **narrow what it claims rather than delete it**. It no
+/// longer says "Moira never sends tools"; it says *`tool_policy` is not what sends them* —
+/// which is still true, still load-bearing, and still the cheapest wrong implementation
+/// anyone might reach for, since `tool_policy` is an unspecified placeholder column from
+/// migration 0005 with no schema and no validation behind it.
+///
+/// The positive half lives in `tests/skill_tool_loop.rs`:
+/// `an_enabled_skill_is_advertised_called_and_round_tripped_into_the_answer` observes the
+/// same provider wire body and asserts the skill's tool *is* advertised while nothing named
+/// by `tool_policy` appears beside it. The two cases are a pair; either alone is satisfied
+/// by an implementation that reads the wrong field.
 ///
 /// **Read this before deleting `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body`
 /// in `src/application/execution.rs`.** That unit guard and this case fail together under the
@@ -903,9 +918,11 @@ async fn the_streaming_arm_carries_the_same_agent_profile_fields_to_the_wire() {
 /// * F48's guard says *and therefore `rig-core` silently dropped `response_format`*, because
 ///   `should_apply_response_format` also requires `tools.is_empty() || history_has_tool_result`.
 ///
-/// No case in this file sends an `output_schema`, so none of them can observe the drop. Whoever
-/// enables tool calling will make this case red and be tempted to update it; F48's guard is the
-/// one that tells them what else just broke.
+/// No case in this file sends an `output_schema`, so none of them can observe the drop —
+/// which is exactly why `execute_inner` now refuses `output_schema` together with skills
+/// outright, and why F48's guard gained a sibling
+/// (`resolved_skill_refs_do_reach_the_wire_and_take_the_schema_with_them`) that demonstrates
+/// the drop on Rig's own encoder.
 #[tokio::test]
 async fn an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire() {
     let Some(case) = Case::new(
@@ -931,13 +948,17 @@ async fn an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire()
          calling means deciding what happens to structured output on turn 1 first — see F48 in \
          plans/reports/EXECUTION-LEDGER.md and the guard named in this test's comment: {wire}"
     );
+    // This profile has no `skill_refs` — the only input that may put tools on the wire
+    // since issue #84 — so the absence below is a statement about `tool_policy`, not about
+    // Moira being incapable of sending tools. `tests/skill_tool_loop.rs` holds the case
+    // where a profile *does* carry `skill_refs` and this key is present.
     assert!(
         wire.get("tools").is_none(),
-        "Moira sends no tools in this phase: {wire}"
+        "a profile whose only tool-shaped field is tool_policy must send no tools: {wire}"
     );
     assert!(
         wire.get("tool_choice").is_none(),
-        "Moira sends no tool_choice in this phase: {wire}"
+        "Moira sends no tool_choice: it leaves the provider default (auto) in place: {wire}"
     );
 
     case.shutdown().await;

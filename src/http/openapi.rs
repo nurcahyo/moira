@@ -69,6 +69,7 @@ use crate::{
         (name = "admin-routing-policies", description = "Routing policy administration"),
         (name = "admin-agent-profiles", description = "Agent profile administration"),
         (name = "admin-skills", description = "Skill (declarative tool/guard) administration"),
+        (name = "admin-graph", description = "Derived relationship graph over the agent-platform and provider/model registries"),
         (name = "admin-runtime", description = "Runtime policy and diagnostics"),
         (name = "admin-rag", description = "RAG collection and document administration")
     )
@@ -180,10 +181,12 @@ pub(crate) fn finalize_document(document: &mut OpenApiDocument) {
         .into_iter()
         .flatten()
         {
-            // Order matters: the `504` is added first so `document_request_id` then stamps
-            // the correlation header onto it like every other response. Reversing these two
-            // would ship one response object in the whole document without `X-Request-Id`.
+            // Order matters: every response this function *adds* must be added before
+            // `document_request_id` runs, because that is what stamps the `X-Request-Id`
+            // correlation header onto each response object. A response inserted after it would
+            // be the one response in the whole document missing the header.
             document_gateway_timeout(operation);
+            document_auth_verification_overload(operation);
             document_request_id(operation);
         }
     }
@@ -236,6 +239,87 @@ fn document_gateway_timeout(operation: &mut Operation) {
         RefOr::T(
             ResponseBuilder::new()
                 .description(GATEWAY_TIMEOUT_DESCRIPTION)
+                .content(
+                    "application/json",
+                    ContentBuilder::new()
+                        .schema(Some(Ref::from_schema_name("ErrorResponse")))
+                        .build(),
+                )
+                .build(),
+        ),
+    );
+}
+
+/// The two security schemes whose credential is checked with Argon2id.
+///
+/// `bearerAuth` is deliberately absent: a trusted JWT is verified against a cached JWKS, which
+/// touches no password hash and takes no permit from the gate. An operation offering *only*
+/// `bearerAuth` therefore cannot raise this status, and saying it can would be a lie a generated
+/// client has to write a handler for.
+const ARGON2_SECURITY_SCHEMES: &[&str] = &["systemKeyAuth", "consumerKeyAuth"];
+
+/// Description of the coded `503`, naming the code a caller actually branches on.
+///
+/// Says explicitly that the credential was **not** checked, because the tempting reading of a
+/// `503` on an authenticating route — "my key is bad and the service is confused about it" — is
+/// exactly wrong and sends the caller to rotate a perfectly good key.
+const AUTH_VERIFICATION_OVERLOADED_DESCRIPTION: &str = "The instance is at capacity for Argon2id credential checks and refused this request before \
+     verifying the presented key (`auth_verification_overloaded`). The credential itself was \
+     neither accepted nor rejected, so this is not an authentication failure: retry after a short \
+     delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of \
+     the `api_keys.verification_concurrency` permits.";
+
+/// Issue #176: every API-key-authenticated operation gained a reachable `503`.
+///
+/// **Why here.** `.agents/skills/moira-openapi/SKILL.md` puts cross-cutting enrichment in
+/// `finalize_document`, and this is cross-cutting by construction: the gate lives inside
+/// `ApiKeyHasher`, which every route reaches through `public_actor` or `admin_actor`, so there is
+/// no per-route code to annotate. Same shape as `document_gateway_timeout` above, down to the
+/// "only if the operation does not already say something" guard.
+///
+/// **Why not document-wide, unlike the `504`.** The `504` is genuinely universal — `TimeoutLayer`
+/// wraps every route group. This one is not. `GET /health/live`, `GET /docs` and `GET /metrics`
+/// authenticate nothing and take no permit, and declaring a `503` on the liveness probe would be
+/// actively misleading in a change whose entire purpose is that health probes keep answering
+/// while authenticated traffic is queued. So the rule is reachability, read off the operation's
+/// own `security` block: an API-key scheme means the request can reach `ApiKeyHasher::verify`.
+///
+/// The two unauthenticated routes that *do* run Argon2 — the invite preview and redeem, which
+/// look up a token by prefix and then verify it — need no special case here: both already declare
+/// a `503`/`5XX` and are skipped by the guard below like every other admin operation.
+///
+/// `SecurityRequirement`'s map is private and it exposes no accessor, so membership is read
+/// through its `Serialize` impl. This runs once per process at router build, not per request.
+fn document_auth_verification_overload(operation: &mut Operation) {
+    let reaches_argon2 = operation.security.as_ref().is_some_and(|requirements| {
+        requirements.iter().any(|requirement| {
+            serde_json::to_value(requirement)
+                .ok()
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|schemes| {
+                    schemes
+                        .keys()
+                        .any(|scheme| ARGON2_SECURITY_SCHEMES.contains(&scheme.as_str()))
+                })
+        })
+    });
+    if !reaches_argon2 {
+        return;
+    }
+
+    let responses = &mut operation.responses.responses;
+    if responses.contains_key("503")
+        || responses.contains_key("5XX")
+        || responses.contains_key("default")
+    {
+        return;
+    }
+    responses.insert(
+        "503".to_string(),
+        RefOr::T(
+            ResponseBuilder::new()
+                .description(AUTH_VERIFICATION_OVERLOADED_DESCRIPTION)
                 .content(
                     "application/json",
                     ContentBuilder::new()

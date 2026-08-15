@@ -10,6 +10,8 @@
 //!
 //! Evals and flows CRUD are a documented follow-up; their tables and domain types already exist.
 
+use std::{collections::HashSet, sync::Arc};
+
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Serialize, de::DeserializeOwned};
@@ -20,13 +22,19 @@ use crate::{
     app::AppState,
     application::{RequestContext, admin::actor_fingerprint},
     domain::{
-        AuditLogInsert, AuditResult, CursorScope, IdempotencyRecord, ListCursor, ListResponse,
+        AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
+        AgentFlowStepCreateRequest, AuditLogInsert, AuditResult, CursorScope,
+        EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest,
+        EvalSuitePatchRequest, EvalSuiteRecord, IdempotencyRecord, ListCursor, ListResponse,
         Pagination, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
         SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
-        SkillImportResponse, SkillPatchRequest, SkillRecord,
+        SkillImportResponse, SkillPatchRequest, SkillRecord, credential_binding_permits_host,
     },
     error::AppError,
-    infra::repositories::{AdminRepository, PgAdminRepository, PgAgentPlatformRepository},
+    infra::repositories::{
+        AdminRepository, PgAdminRepository, PgAgentPlatformRepository, PgRuntimeRepository,
+        RuntimeRepository,
+    },
     orchestration::{OpenApiImportError, parse_openapi_document},
     security::{
         Actor, OutboundUrlDenial, OutboundUrlPolicy, SystemResolver, validate_outbound_url,
@@ -39,6 +47,20 @@ const SKILLS_SCOPE: CursorScope = CursorScope::new("admin.skills");
 
 /// Keyset cursor scope for `GET /api/v1/admin/skill-executors`.
 const EXECUTORS_SCOPE: CursorScope = CursorScope::new("admin.skill_executors");
+
+/// Keyset cursor scopes for the F2 evals/flows CRUD surface (issue #214, plan 12 §3). Each
+/// nested list (cases, eval runs, flow runs) shares one scope across every parent id, the
+/// same convention `rag_documents` uses for `GET .../rag-collections/{id}/documents` — the
+/// parent id narrows the SQL `WHERE`, not the cursor's scope label.
+const EVAL_SUITES_SCOPE: CursorScope = CursorScope::new("admin.eval_suites");
+const EVAL_CASES_SCOPE: CursorScope = CursorScope::new("admin.eval_cases");
+const EVAL_RUNS_SCOPE: CursorScope = CursorScope::new("admin.eval_runs");
+const FLOWS_SCOPE: CursorScope = CursorScope::new("admin.flows");
+const FLOW_RUNS_SCOPE: CursorScope = CursorScope::new("admin.flow_runs");
+
+/// Guard against an unbounded step array on a single flow — same role `MAX_BULK_ENABLE`
+/// plays for skills.
+const MAX_FLOW_STEPS: usize = 100;
 
 /// Largest skill-id batch a single bulk-enable accepts. A guard against an unbounded array, in
 /// the spirit of the 300-operation import cap (§5 decision 23).
@@ -60,6 +82,11 @@ pub struct AgentPlatformService<'a> {
     state: &'a AppState,
     repo: PgAgentPlatformRepository,
     admin_repo: PgAdminRepository,
+    /// Held as `dyn RuntimeRepository`, matching `RuntimeAdminService`'s own field, for
+    /// exactly one read: confirming a flow step's `agent_profile_id` names a live row before
+    /// the step is stored (fail-closed on a missing agent profile, product decisions
+    /// 2026-08-06).
+    runtime_repo: Arc<dyn RuntimeRepository>,
 }
 
 impl<'a> AgentPlatformService<'a> {
@@ -68,7 +95,8 @@ impl<'a> AgentPlatformService<'a> {
         Ok(Self {
             state,
             repo: PgAgentPlatformRepository::new(pool.clone()),
-            admin_repo: PgAdminRepository::new(pool),
+            admin_repo: PgAdminRepository::new(pool.clone()),
+            runtime_repo: Arc::new(PgRuntimeRepository::new(pool)),
         })
     }
 
@@ -344,6 +372,56 @@ impl<'a> AgentPlatformService<'a> {
     /// `request.url_template` is set, the new URL is SSRF-validated and its host replaces
     /// `allowed_host` server-side; `request.url_template` alone can never set `allowed_host`
     /// to a value the URL does not actually resolve to.
+    ///
+    /// # A credential may only be bound to its own provider's host
+    ///
+    /// Passing the SSRF guard says the destination is not *internal*; it says nothing about
+    /// whether this deployment's secrets are allowed to go there, and
+    /// `https://collector.attacker.example` passes it. Since the bound credential is
+    /// decrypted at call time and sent as `Authorization: Bearer <plaintext>`, an
+    /// existence-only check on `credential_id` made `moira:skills:write` equivalent to
+    /// reading every provider secret in the deployment (issue #253 finding 1). So the
+    /// binding must satisfy
+    /// [`credential_binding_permits_host`](crate::domain::credential_binding_permits_host):
+    /// the credential's provider must declare the executor's `allowed_host` as its
+    /// `base_url` host.
+    ///
+    /// The pair is checked **as it will be after this patch**, not as it arrives, because
+    /// either half alone is enough to move a secret: binding a credential to an existing
+    /// hostile host, and moving an existing credential's host to a hostile one, are the same
+    /// attack from two directions.
+    ///
+    /// # …but a row that already fails the rule stays editable
+    ///
+    /// Round one of this fix re-validated on *every* patch, including one that touched
+    /// neither half. That made a row stored before the rule existed un-patchable for an
+    /// unrelated `timeout_ms` or `response_schema` edit, which is not a security property —
+    /// it is an operator being told to fix something the same endpoint refuses to let them
+    /// fix. Worse, the un-patchable row keeps running: the execution path refuses to *send*
+    /// its credential (see `application::execution::skill_credential`), so the skill is
+    /// already dead, and the write refusal only prevented cleanup.
+    ///
+    /// So the rule is **do not make it worse**, which is the property that actually keeps
+    /// secrets where they belong:
+    ///
+    /// | pre-patch pair | post-patch pair | outcome |
+    /// |---|---|---|
+    /// | any | entitled | allowed |
+    /// | entitled | not entitled | **refused** — a live binding is being moved somewhere it may not go |
+    /// | not entitled | not entitled, **and identical** to the pre-patch pair | allowed — no secret moves, and the row becomes cleanable |
+    /// | not entitled | not entitled, and *different* | **refused** — a broken row is not a licence to point it somewhere new |
+    ///
+    /// The third row is the recovery path and it is narrow on purpose: the binding must be
+    /// byte-for-byte unchanged. Every other field is free. The genuine remedies for such a
+    /// row are all still available and all audited — give the provider a `base_url` naming
+    /// the executor's host, repoint the executor at an entitled credential, or
+    /// [`delete_executor`](Self::delete_executor). `docs/agent-platform.md` carries the
+    /// inventory query for finding them.
+    ///
+    /// Reading the current row outside the write transaction is safe under this resource's
+    /// existing optimistic-concurrency contract: any concurrent change moves `updated_at`,
+    /// and the transaction then rejects the caller's now-stale `expected_updated_at` with a
+    /// 409 before the patch lands.
     pub async fn patch_executor(
         &self,
         actor: &Actor,
@@ -356,12 +434,6 @@ impl<'a> AgentPlatformService<'a> {
         if let Some(timeout_ms) = request.timeout_ms {
             validate_executor_timeout_ms(timeout_ms)?;
         }
-        if let Some(credential_id) = request.credential_id {
-            // Existence-only check: confirms the reference is live before it is stored.
-            // `provider_credentials` owns its own secret handling — this never reads a
-            // secret.
-            self.admin_repo.get_credential(credential_id).await?;
-        }
         let (new_url_template, new_allowed_host) = match &request.url_template {
             Some(url_template) => {
                 let validated_url = validate_skill_url(url_template).await?;
@@ -373,6 +445,33 @@ impl<'a> AgentPlatformService<'a> {
             }
             None => (None, None),
         };
+
+        let current = self.repo.get_executor(skill_id).await?;
+        // An omitted field means "leave unchanged" on this resource (see
+        // `SkillHttpExecutorPatchRequest`), so the effective pair is the patch's value where
+        // it has one and the stored value otherwise.
+        let effective_host = new_allowed_host
+            .clone()
+            .unwrap_or_else(|| current.allowed_host.clone());
+        let effective_credential = request.credential_id.or(current.credential_id);
+        // The binding is untouched when neither half differs from what is already stored.
+        // Compared on the *effective* values rather than on "was the field present in the
+        // request", so a console that PATCHes the whole object back — re-sending the identical
+        // credential id and the identical URL — still counts as untouched.
+        let binding_unchanged =
+            effective_credential == current.credential_id && effective_host == current.allowed_host;
+        // A patch that does not move the binding is not a bind: the post-patch pair *is* the
+        // pre-patch pair, so it can expose nothing the stored row does not already expose, and
+        // the existence check is skipped along with the entitlement check — otherwise a row
+        // whose credential was since deleted would 404 on an unrelated edit and stay
+        // uncleanable, which is the same trap in a different colour.
+        if let Some(credential_id) = effective_credential
+            && !binding_unchanged
+        {
+            self.require_credential_entitled_to_host(credential_id, &effective_host)
+                .await?;
+        }
+
         self.repo
             .patch_executor(
                 skill_id,
@@ -390,6 +489,42 @@ impl<'a> AgentPlatformService<'a> {
                 ),
             )
             .await
+    }
+
+    /// Confirms `credential_id` names a live row **and** that its provider is entitled to
+    /// receive that secret at `allowed_host`.
+    ///
+    /// Two reads rather than one join: both are by primary key on tables an admin write
+    /// already touches, and keeping the entitlement decision in the service layer is what
+    /// lets it share one pure rule with the execution path
+    /// (`application::execution::skill_credential`) instead of forking into two SQL
+    /// predicates that can drift.
+    ///
+    /// The refusal names neither the provider nor its `base_url`: this endpoint is reachable
+    /// with `moira:skills:write` alone, and a message that confirmed where a given credential
+    /// is allowed to talk would turn the refusal into a way to enumerate the provider table.
+    async fn require_credential_entitled_to_host(
+        &self,
+        credential_id: Uuid,
+        allowed_host: &str,
+    ) -> Result<(), AppError> {
+        // Existence check, unchanged: `provider_credentials` owns its own secret handling and
+        // this never reads a secret.
+        let credential = self.admin_repo.get_credential(credential_id).await?;
+        let provider = self.admin_repo.get_provider(credential.provider_id).await?;
+        if credential_binding_permits_host(provider.base_url.as_deref(), allowed_host) {
+            return Ok(());
+        }
+        tracing::warn!(
+            %credential_id,
+            allowed_host,
+            "refused to bind a provider credential to a skill executor whose host its \
+             provider does not declare as its base_url"
+        );
+        Err(AppError::unprocessable(
+            "skill_credential_host_mismatch",
+            "The referenced credential's provider does not serve this executor's host.",
+        ))
     }
 
     pub async fn delete_executor(
@@ -414,6 +549,394 @@ impl<'a> AgentPlatformService<'a> {
                 ),
             )
             .await
+    }
+
+    // =====================================================================================
+    // Eval suites (issue #214, plan 12 §3 — the deferred CRUD half of PR #227's schema).
+    // =====================================================================================
+
+    pub async fn create_eval_suite(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        request: EvalSuiteCreateRequest,
+    ) -> Result<EvalSuiteRecord, AppError> {
+        self.state.authz.require(actor, "moira:evals:write")?;
+        if let Some(replay) = self
+            .idempotency_replay(ctx, actor, "eval_suite.create", &request)
+            .await?
+        {
+            return Ok(replay);
+        }
+        validate_key("suite_key", &request.suite_key)?;
+        validate_display_name(&request.display_name)?;
+        validate_metadata(&request.metadata)?;
+        let id = Uuid::now_v7();
+        let record = self
+            .repo
+            .create_eval_suite(
+                id,
+                &request,
+                self.audit(
+                    actor,
+                    ctx,
+                    "eval_suite.create",
+                    "eval_suite",
+                    Some(id.to_string()),
+                    json!({ "suite_key": &request.suite_key }),
+                ),
+            )
+            .await?;
+        self.record_idempotency(ctx, actor, "eval_suite.create", &request, &record)
+            .await?;
+        Ok(record)
+    }
+
+    pub async fn list_eval_suites(
+        &self,
+        actor: &Actor,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<EvalSuiteRecord>, AppError> {
+        self.state.authz.require(actor, "moira:evals:read")?;
+        let cursor = ListCursor::decode_optional(cursor, EVAL_SUITES_SCOPE)?;
+        let rows = self.repo.list_eval_suites(cursor, limit).await?;
+        Ok(paginate_by_created_at(
+            rows,
+            limit,
+            EVAL_SUITES_SCOPE,
+            |r| (r.created_at, r.id),
+        ))
+    }
+
+    pub async fn get_eval_suite(
+        &self,
+        actor: &Actor,
+        id: Uuid,
+    ) -> Result<EvalSuiteRecord, AppError> {
+        self.state.authz.require(actor, "moira:evals:read")?;
+        self.repo.get_eval_suite(id).await
+    }
+
+    pub async fn patch_eval_suite(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        id: Uuid,
+        expected_version: i64,
+        request: EvalSuitePatchRequest,
+    ) -> Result<EvalSuiteRecord, AppError> {
+        self.state.authz.require(actor, "moira:evals:write")?;
+        if let Some(display_name) = &request.display_name {
+            validate_display_name(display_name)?;
+        }
+        if let Some(metadata) = &request.metadata {
+            validate_metadata(metadata)?;
+        }
+        self.repo
+            .patch_eval_suite(
+                id,
+                expected_version,
+                &request,
+                self.audit(
+                    actor,
+                    ctx,
+                    "eval_suite.update",
+                    "eval_suite",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
+    pub async fn delete_eval_suite(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        self.state.authz.require(actor, "moira:evals:delete")?;
+        self.repo
+            .soft_delete_eval_suite(
+                id,
+                expected_version,
+                self.audit(
+                    actor,
+                    ctx,
+                    "eval_suite.delete",
+                    "eval_suite",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
+    // =====================================================================================
+    // Eval cases — a child of one suite; no version/PATCH surface (migration header).
+    // =====================================================================================
+
+    pub async fn create_eval_case(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        suite_id: Uuid,
+        request: EvalCaseCreateRequest,
+    ) -> Result<EvalCaseRecord, AppError> {
+        self.state.authz.require(actor, "moira:evals:write")?;
+        validate_json_present("input", &request.input)?;
+        validate_json_present("expected", &request.expected)?;
+        validate_metadata(&request.metadata)?;
+        // Existence-only check: confirms the suite is live before a case is attached to it,
+        // the same posture `patch_executor`'s `credential_id` check takes.
+        self.repo.get_eval_suite(suite_id).await?;
+        let id = Uuid::now_v7();
+        self.repo
+            .create_eval_case(
+                id,
+                suite_id,
+                &request,
+                self.audit(
+                    actor,
+                    ctx,
+                    "eval_case.create",
+                    "eval_case",
+                    Some(id.to_string()),
+                    json!({ "suite_id": suite_id }),
+                ),
+            )
+            .await
+    }
+
+    pub async fn list_eval_cases(
+        &self,
+        actor: &Actor,
+        suite_id: Uuid,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<EvalCaseRecord>, AppError> {
+        self.state.authz.require(actor, "moira:evals:read")?;
+        let cursor = ListCursor::decode_optional(cursor, EVAL_CASES_SCOPE)?;
+        let rows = self.repo.list_eval_cases(suite_id, cursor, limit).await?;
+        Ok(paginate_by_created_at(rows, limit, EVAL_CASES_SCOPE, |r| {
+            (r.created_at, r.id)
+        }))
+    }
+
+    pub async fn delete_eval_case(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        suite_id: Uuid,
+        case_id: Uuid,
+    ) -> Result<(), AppError> {
+        self.state.authz.require(actor, "moira:evals:delete")?;
+        self.repo
+            .delete_eval_case(
+                suite_id,
+                case_id,
+                self.audit(
+                    actor,
+                    ctx,
+                    "eval_case.delete",
+                    "eval_case",
+                    Some(case_id.to_string()),
+                    json!({ "suite_id": suite_id }),
+                ),
+            )
+            .await
+    }
+
+    // =====================================================================================
+    // Eval runs — read-only. `eval_runs` is produced by execution, never writable through
+    // this admin surface.
+    // =====================================================================================
+
+    pub async fn list_eval_runs(
+        &self,
+        actor: &Actor,
+        suite_id: Uuid,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<EvalRunRecord>, AppError> {
+        self.state.authz.require(actor, "moira:evals:read")?;
+        let cursor = ListCursor::decode_optional(cursor, EVAL_RUNS_SCOPE)?;
+        let rows = self.repo.list_eval_runs(suite_id, cursor, limit).await?;
+        Ok(paginate_by_created_at(rows, limit, EVAL_RUNS_SCOPE, |r| {
+            (r.created_at, r.id)
+        }))
+    }
+
+    // =====================================================================================
+    // Flows (issue #214, plan 12 §3). Steps travel inside the flow's own body — see
+    // `domain::AgentFlowRecord`'s doc comment — so there is no separate steps CRUD here.
+    // =====================================================================================
+
+    pub async fn create_flow(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        request: AgentFlowCreateRequest,
+    ) -> Result<AgentFlowRecord, AppError> {
+        self.state.authz.require(actor, "moira:flows:write")?;
+        if let Some(replay) = self
+            .idempotency_replay(ctx, actor, "flow.create", &request)
+            .await?
+        {
+            return Ok(replay);
+        }
+        validate_key("flow_key", &request.flow_key)?;
+        validate_display_name(&request.display_name)?;
+        validate_metadata(&request.metadata)?;
+        validate_flow_steps(&request.steps)?;
+        self.ensure_steps_reference_existing_agents(&request.steps)
+            .await?;
+        let id = Uuid::now_v7();
+        let record = self
+            .repo
+            .create_flow(
+                id,
+                &request,
+                self.audit(
+                    actor,
+                    ctx,
+                    "flow.create",
+                    "flow",
+                    Some(id.to_string()),
+                    json!({ "flow_key": &request.flow_key, "step_count": request.steps.len() }),
+                ),
+            )
+            .await?;
+        self.record_idempotency(ctx, actor, "flow.create", &request, &record)
+            .await?;
+        Ok(record)
+    }
+
+    pub async fn list_flows(
+        &self,
+        actor: &Actor,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<AgentFlowRecord>, AppError> {
+        self.state.authz.require(actor, "moira:flows:read")?;
+        let cursor = ListCursor::decode_optional(cursor, FLOWS_SCOPE)?;
+        let rows = self.repo.list_flows(cursor, limit).await?;
+        Ok(paginate_by_created_at(rows, limit, FLOWS_SCOPE, |r| {
+            (r.created_at, r.id)
+        }))
+    }
+
+    pub async fn get_flow(&self, actor: &Actor, id: Uuid) -> Result<AgentFlowRecord, AppError> {
+        self.state.authz.require(actor, "moira:flows:read")?;
+        self.repo.get_flow(id).await
+    }
+
+    pub async fn patch_flow(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        id: Uuid,
+        expected_version: i64,
+        request: AgentFlowPatchRequest,
+    ) -> Result<AgentFlowRecord, AppError> {
+        self.state.authz.require(actor, "moira:flows:write")?;
+        if let Some(display_name) = &request.display_name {
+            validate_display_name(display_name)?;
+        }
+        if let Some(metadata) = &request.metadata {
+            validate_metadata(metadata)?;
+        }
+        if let Some(steps) = &request.steps {
+            validate_flow_steps(steps)?;
+            self.ensure_steps_reference_existing_agents(steps).await?;
+        }
+        self.repo
+            .patch_flow(
+                id,
+                expected_version,
+                &request,
+                self.audit(
+                    actor,
+                    ctx,
+                    "flow.update",
+                    "flow",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
+    pub async fn delete_flow(
+        &self,
+        actor: &Actor,
+        ctx: &RequestContext,
+        id: Uuid,
+        expected_version: i64,
+    ) -> Result<(), AppError> {
+        self.state.authz.require(actor, "moira:flows:delete")?;
+        self.repo
+            .soft_delete_flow(
+                id,
+                expected_version,
+                self.audit(
+                    actor,
+                    ctx,
+                    "flow.delete",
+                    "flow",
+                    Some(id.to_string()),
+                    json!({}),
+                ),
+            )
+            .await
+    }
+
+    // =====================================================================================
+    // Flow runs — read-only. `agent_flow_runs` is produced by the (not-yet-built) flow
+    // orchestrator (#84 follow-up); there is no execution endpoint in this MVP.
+    // =====================================================================================
+
+    pub async fn list_flow_runs(
+        &self,
+        actor: &Actor,
+        flow_id: Uuid,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<ListResponse<AgentFlowRunRecord>, AppError> {
+        self.state.authz.require(actor, "moira:flows:read")?;
+        let cursor = ListCursor::decode_optional(cursor, FLOW_RUNS_SCOPE)?;
+        let rows = self.repo.list_flow_runs(flow_id, cursor, limit).await?;
+        Ok(paginate_by_created_at(rows, limit, FLOW_RUNS_SCOPE, |r| {
+            (r.created_at, r.id)
+        }))
+    }
+
+    /// Fail-closed on a missing agent profile (product decisions 2026-08-06): every distinct
+    /// `agent_profile_id` named by `steps` must be a live `agent_profiles` row before the
+    /// flow (or its patched step list) is written. Deduplicated so a flow that legitimately
+    /// reuses one agent across several steps checks it once, not once per step.
+    async fn ensure_steps_reference_existing_agents(
+        &self,
+        steps: &[AgentFlowStepCreateRequest],
+    ) -> Result<(), AppError> {
+        let mut checked = HashSet::new();
+        for step in steps {
+            if !checked.insert(step.agent_profile_id) {
+                continue;
+            }
+            self.runtime_repo
+                .get_agent_profile(step.agent_profile_id)
+                .await
+                .map_err(|_| {
+                    AppError::BadRequest(format!(
+                        "flow step '{}' references a missing agent profile {}",
+                        step.step_key, step.agent_profile_id
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Builds this service's audit row; the repository writes it inside the write's own
@@ -581,6 +1104,37 @@ fn paginate_executors(
     }
 }
 
+/// Generic twin of [`paginate`]/[`paginate_executors`] for every F2 record type (eval suites,
+/// eval cases, eval runs, flows, flow runs) — one function rather than five near-identical
+/// copies, since all five share the `(created_at, id)` keyset. Mirrors
+/// `runtime_admin::paginate_by_created_at` exactly.
+fn paginate_by_created_at<T>(
+    mut rows: Vec<T>,
+    limit: i64,
+    scope: CursorScope,
+    key: impl Fn(&T) -> (DateTime<Utc>, Uuid),
+) -> ListResponse<T> {
+    let has_more = (rows.len() as i64) > limit;
+    if has_more {
+        rows.truncate(limit.max(0) as usize);
+    }
+    let next_cursor = if has_more {
+        rows.last().map(|record| {
+            let (ts, id) = key(record);
+            ListCursor::new(ts, id).encode(scope)
+        })
+    } else {
+        None
+    };
+    ListResponse {
+        data: rows,
+        pagination: Pagination {
+            next_cursor,
+            has_more,
+        },
+    }
+}
+
 /// Maps a pure parse failure from `orchestration::openapi_import` onto the two catalogued
 /// codes the wire contract promises: `import_cap_exceeded` carries the true operation count
 /// in `details` (never silently truncated, §5 decision 23); every other parse failure is the
@@ -697,6 +1251,53 @@ fn validate_json_object(label: &str, value: &Value) -> Result<(), AppError> {
     }
 }
 
+/// An eval case's `input`/`expected` are required JSON documents — the wire type is `Value`
+/// rather than `Option<Value>` so the key must be present, but a present-and-`null` value
+/// (`"input": null`) still deserializes cleanly, so this rejects it explicitly rather than
+/// letting a case with no real fixture reach the database.
+fn validate_json_present(label: &str, value: &Value) -> Result<(), AppError> {
+    if value.is_null() {
+        Err(AppError::BadRequest(format!("{label} must not be null")))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates one flow's step array before it ever reaches the repository: format and
+/// uniqueness are checked here so a bad request is a clean 400, not a unique-constraint
+/// violation surfacing as a 500. Referential validation (does `agent_profile_id` exist) is a
+/// separate, `async` check — see `AgentPlatformService::ensure_steps_reference_existing_agents`.
+fn validate_flow_steps(steps: &[AgentFlowStepCreateRequest]) -> Result<(), AppError> {
+    if steps.len() > MAX_FLOW_STEPS {
+        return Err(AppError::BadRequest(format!(
+            "a flow may define at most {MAX_FLOW_STEPS} steps"
+        )));
+    }
+    let mut keys = HashSet::new();
+    let mut orders = HashSet::new();
+    for step in steps {
+        validate_key("step_key", &step.step_key)?;
+        validate_json_object("input_mapping", &step.input_mapping)?;
+        validate_metadata(&step.metadata)?;
+        if step.step_order < 0 {
+            return Err(AppError::BadRequest("step_order must be >= 0".to_string()));
+        }
+        if !keys.insert(step.step_key.clone()) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate step_key '{}' within one flow",
+                step.step_key
+            )));
+        }
+        if !orders.insert(step.step_order) {
+            return Err(AppError::BadRequest(format!(
+                "duplicate step_order {} within one flow",
+                step.step_order
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_tags(tags: &[String]) -> Result<(), AppError> {
     if tags.len() > 64 {
         return Err(AppError::BadRequest(
@@ -760,6 +1361,21 @@ mod skill_import_tests {
             OpenApiImportError::MissingServerUrl,
             OpenApiImportError::InvalidServerUrl("not a url".to_string()),
             OpenApiImportError::NoOperations,
+            // The three byte-budget refusals are 400s on the same generic code: they are a
+            // property of the submitted document, and the message carries the numbers.
+            OpenApiImportError::DocumentTooLarge {
+                bytes: 3_000_000,
+                cap: 524_288,
+            },
+            OpenApiImportError::OperationSchemaTooLarge {
+                skill_key: "op0".to_string(),
+                bytes: 200_000,
+                cap: 65_536,
+            },
+            OpenApiImportError::TotalSchemaTooLarge {
+                bytes: 90_000_000,
+                cap: 2_097_152,
+            },
         ] {
             let error = import_parse_error_to_app_error(failure);
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
@@ -810,5 +1426,113 @@ mod skill_import_tests {
         assert!(validate_executor_timeout_ms(MAX_EXECUTOR_TIMEOUT_MS + 1).is_err());
         assert!(validate_executor_timeout_ms(MAX_EXECUTOR_TIMEOUT_MS).is_ok());
         assert!(validate_executor_timeout_ms(1).is_ok());
+    }
+}
+
+/// Pure unit coverage for the F2 (issue #214, plan 12 §3) evals/flows validators — no
+/// database needed, following the same split `skill_import_tests` uses for pure logic versus
+/// `tests/agent_platform.rs`'s end-to-end Postgres coverage.
+#[cfg(test)]
+mod f2_validation_tests {
+    use super::*;
+
+    fn sample_step(step_key: &str, step_order: i32) -> AgentFlowStepCreateRequest {
+        AgentFlowStepCreateRequest {
+            step_key: step_key.to_string(),
+            step_order,
+            agent_profile_id: Uuid::now_v7(),
+            on_failure: crate::domain::FlowStepOnFailure::Abort,
+            input_mapping: json!({}),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn validate_flow_steps_accepts_an_empty_or_well_formed_list() {
+        assert!(validate_flow_steps(&[]).is_ok());
+        assert!(validate_flow_steps(&[sample_step("first", 0), sample_step("second", 1)]).is_ok());
+    }
+
+    #[test]
+    fn validate_flow_steps_rejects_a_duplicate_step_key() {
+        let error = validate_flow_steps(&[sample_step("same", 0), sample_step("same", 1)])
+            .expect_err("duplicate step_key must be rejected");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_flow_steps_rejects_a_duplicate_step_order() {
+        let error = validate_flow_steps(&[sample_step("a", 0), sample_step("b", 0)])
+            .expect_err("duplicate step_order must be rejected");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_flow_steps_rejects_a_negative_step_order() {
+        assert!(validate_flow_steps(&[sample_step("a", -1)]).is_err());
+    }
+
+    #[test]
+    fn validate_flow_steps_rejects_a_malformed_step_key() {
+        assert!(validate_flow_steps(&[sample_step("Not A Valid Key!", 0)]).is_err());
+    }
+
+    #[test]
+    fn validate_flow_steps_rejects_more_than_the_cap() {
+        let steps: Vec<_> = (0..=MAX_FLOW_STEPS as i32)
+            .map(|order| sample_step(&format!("step-{order}"), order))
+            .collect();
+        assert!(validate_flow_steps(&steps).is_err());
+    }
+
+    #[test]
+    fn validate_flow_steps_accepts_exactly_the_cap() {
+        let steps: Vec<_> = (0..MAX_FLOW_STEPS as i32)
+            .map(|order| sample_step(&format!("step-{order}"), order))
+            .collect();
+        assert!(validate_flow_steps(&steps).is_ok());
+    }
+
+    #[test]
+    fn validate_json_present_rejects_null_and_accepts_everything_else() {
+        assert!(validate_json_present("input", &Value::Null).is_err());
+        assert!(validate_json_present("input", &json!({})).is_ok());
+        assert!(validate_json_present("input", &json!("a string")).is_ok());
+        assert!(validate_json_present("input", &json!(0)).is_ok());
+    }
+
+    #[test]
+    fn grading_kind_round_trips_through_the_db_encoding() {
+        use crate::domain::GradingKind;
+        use crate::infra::pg_rows::{grading_kind_from_db, grading_kind_to_db};
+
+        for kind in [
+            GradingKind::ExactMatch,
+            GradingKind::Contains,
+            GradingKind::SchemaValid,
+        ] {
+            let encoded = grading_kind_to_db(&kind).to_string();
+            assert_eq!(grading_kind_from_db(encoded).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn flow_step_on_failure_round_trips_through_the_db_encoding() {
+        use crate::domain::FlowStepOnFailure;
+        use crate::infra::pg_rows::{flow_step_on_failure_from_db, flow_step_on_failure_to_db};
+
+        for value in [FlowStepOnFailure::Abort, FlowStepOnFailure::Continue] {
+            let encoded = flow_step_on_failure_to_db(&value).to_string();
+            assert_eq!(flow_step_on_failure_from_db(encoded).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn unknown_grading_kind_from_db_is_a_classification_error_not_a_panic() {
+        use crate::infra::pg_rows::grading_kind_from_db;
+
+        let error = grading_kind_from_db("llm_judge".to_string())
+            .expect_err("llm_judge is deliberately absent from the MVP grading set");
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

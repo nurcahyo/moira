@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod mock_control_plane;
 pub mod mock_openai;
 
 use std::{

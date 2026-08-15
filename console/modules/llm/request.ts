@@ -130,3 +130,8 @@ export function postJson<T>(
 export function sendDelete<T>(url: string, fetchImpl?: typeof fetch): Promise<LlmResult<T>> {
   return sendLlmRequest<T>(url, { method: "DELETE" }, fetchImpl);
 }
+
+/** A bare `GET` — used to poll a Mode A acquisition job's status. */
+export function sendGet<T>(url: string, fetchImpl?: typeof fetch): Promise<LlmResult<T>> {
+  return sendLlmRequest<T>(url, { method: "GET" }, fetchImpl);
+}

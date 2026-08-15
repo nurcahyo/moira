@@ -6,7 +6,7 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::error::AppError;
+use crate::{error::AppError, security::DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
@@ -48,6 +48,8 @@ pub struct Settings {
     pub telemetry: TelemetrySettings,
     #[serde(default)]
     pub rag: RagSettings,
+    #[serde(default)]
+    pub skill_execution: SkillExecutionSettings,
 }
 
 /// Bounds on RAG document ingestion (plan 11, Sub-Phase A).
@@ -301,6 +303,25 @@ pub struct ApiKeySettings {
     pub pepper_version: String,
     pub allow_insecure_dev_pepper: bool,
     pub prefix_length: usize,
+    /// Concurrent Argon2id operations this process will run (issue #176).
+    ///
+    /// `None` — the shipped default — derives it from
+    /// `std::thread::available_parallelism()`, clamped to
+    /// `[1, MAX_DERIVED_VERIFICATION_CONCURRENCY]`. That is the right default because Argon2id at
+    /// `p=1` is single-threaded per call: concurrency past the core count buys no throughput and
+    /// costs 19 MiB of resident memory per extra permit.
+    ///
+    /// It is a **memory budget** as well as a concurrency one — peak arena is this value times
+    /// `ARGON2_ARENA_BYTES` — so `Settings::validate` refuses anything above
+    /// `MAX_VERIFICATION_CONCURRENCY`. Raise it together with `resources.limits.cpu`, never alone.
+    pub verification_concurrency: Option<usize>,
+    /// How long a request waits for a verification permit before being refused with a
+    /// `503 auth_verification_overloaded`.
+    ///
+    /// Zero would mean "shed instantly", which reads like the house pattern
+    /// (`ConcurrencyController::acquire`) and is wrong for a permit held tens of milliseconds —
+    /// see `DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS`. It is refused rather than treated as a mode.
+    pub verification_queue_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for ApiKeySettings {
@@ -313,6 +334,14 @@ impl std::fmt::Debug for ApiKeySettings {
             .field("pepper_version", &self.pepper_version)
             .field("allow_insecure_dev_pepper", &self.allow_insecure_dev_pepper)
             .field("prefix_length", &self.prefix_length)
+            // Neither is a secret, and both are rendered: an operator diagnosing an
+            // `auth_verification_overloaded` needs the bound and the timeout, and a hand-written
+            // `Debug` that silently drops new fields is how a redaction becomes a blind spot.
+            .field("verification_concurrency", &self.verification_concurrency)
+            .field(
+                "verification_queue_timeout_ms",
+                &self.verification_queue_timeout_ms,
+            )
             .finish()
     }
 }
@@ -436,6 +465,28 @@ impl std::fmt::Debug for IdempotencySettings {
 pub struct ProviderSecuritySettings {
     pub allow_private_provider_urls: bool,
     pub allow_http_provider_urls: bool,
+    /// Explicit ToS risk-acceptance opt-in for `ProviderType::ChatgptOauth` (issue #216) —
+    /// rig-core 0.40's native `rig_core::providers::chatgpt` client against
+    /// `chatgpt.com/backend-api/codex`. **Default `false`, and that is the whole point of this
+    /// field, not a starting point meant to be flipped on casually.**
+    ///
+    /// ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no
+    /// carve-out for third-party, multi-tenant use analogous to Anthropic's reinstated
+    /// third-party agent usage (`docs/chatgpt-subscription-spike.md`). Turning this on is a
+    /// deployment operator's own explicit acceptance of that risk for their own subscription —
+    /// it is not a sanctioned integration path, and nothing this flag gates softens that framing
+    /// (see `orchestration::runtime_factory::require_chatgpt_subscription_opt_in`).
+    ///
+    /// **Unlike [`Self::allow_private_provider_urls`] / [`Self::allow_http_provider_urls`], this
+    /// is not rejected in production by [`Settings::validate_production`].** An operator's own
+    /// ChatGPT subscription is exactly as usable, and exactly as risky, in production as
+    /// anywhere else — refusing it there would not make the underlying ToS question go away,
+    /// only hide who made the call. What production gets instead is the same thing every other
+    /// deliberate risk acceptance in this file gets: a loud, unconditional startup `WARN`
+    /// (`main.rs::run`) whenever this is `true`, in every environment, including production —
+    /// not folded into [`Settings::unsafe_development_features`], which reports nothing at all
+    /// in production by design.
+    pub allow_chatgpt_subscription: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -468,6 +519,62 @@ pub struct RuntimeSettings {
     pub runtime_cache_max_entries: usize,
     pub runtime_cache_ttl_seconds: u64,
     pub internal_stream_queue_capacity: usize,
+}
+
+/// How an agent profile's enabled `skill_refs` are executed as rig tools (issue #84,
+/// plan 12 §5).
+///
+/// A section of its own rather than more fields on [`RuntimeSettings`]: every knob here
+/// bounds a call Moira makes to a **third-party HTTP endpoint an operator imported**, which
+/// is a different trust surface from the provider calls `runtime` bounds. Grouping them
+/// keeps the one dev-only escape hatch (`allow_insecure_dev_urls`) next to the limits it
+/// relaxes rather than buried among unrelated timeouts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SkillExecutionSettings {
+    /// Total **model calls** one tool-bearing execution may make, matching Rig's own
+    /// turn-budget semantics (`.agents/skills/moira-rig-tools/SKILL.md`). One tool call
+    /// plus a final answer needs at least 2, so a budget of 1 with tools attached is a
+    /// guaranteed failure — which is exactly why this is an explicit setting rather than
+    /// an implicit default buried in the loop.
+    pub maximum_tool_turns: usize,
+    /// Ceiling on how many skill tools one request may advertise. The sibling of
+    /// `public_api.maximum_tool_count`, which caps *caller-declared* tools; this one caps
+    /// what an agent profile's `skill_refs` can put on the wire.
+    pub maximum_advertised_tools: usize,
+    /// Ceiling on the response body a skill tool feeds back to the model. A skill target
+    /// is a third-party endpoint: without a bound, one reply can consume the whole context
+    /// budget (`docs/context-budgeting.md`) or the execution's remaining deadline.
+    ///
+    /// It is also a **memory** ceiling: `HttpSkillTool` reads the body as a stream and stops
+    /// at this many bytes rather than buffering the whole reply and slicing it afterwards, so
+    /// the figure here is the most one in-flight skill call can put on the heap.
+    pub maximum_response_bytes: usize,
+    /// Budget for resolving a skill target hostname during the execution-time SSRF check.
+    pub dns_timeout_ms: u64,
+    /// Dev-only escape hatch permitting `http://` and private/loopback skill target URLs.
+    /// MUST stay `false` outside development; `Settings::validate` hard-fails production
+    /// when it is `true`, exactly as it does for
+    /// `public_api.image_urls.allow_insecure_dev_urls`.
+    ///
+    /// **Import never honours this** (`AgentPlatformService::validate_skill_url` hardcodes
+    /// `allow_insecure: false`): a spec pointing at private space is refused at write time
+    /// in every environment. This flag only relaxes the *execution-time* re-check, so the
+    /// single way to reach a loopback skill target is to write the row past the admin
+    /// plane — which is what the end-to-end tests do deliberately.
+    pub allow_insecure_dev_urls: bool,
+}
+
+impl Default for SkillExecutionSettings {
+    fn default() -> Self {
+        Self {
+            maximum_tool_turns: 4,
+            maximum_advertised_tools: 32,
+            maximum_response_bytes: 64 * 1024,
+            dns_timeout_ms: 5_000,
+            allow_insecure_dev_urls: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -687,6 +794,51 @@ pub struct WorkerSettings {
     /// symptom is unrelated latency. Refusing at a known depth converts that into
     /// an error with a name.
     pub queue_max_pending_jobs: i64,
+    /// How often each replica checks whether the periodic maintenance jobs
+    /// (`latency-stats-aggregation`, `oauth-token-refresh`, `provider-health-check`)
+    /// need a fresh queue row.
+    ///
+    /// These three job names have no leader-gated producer (unlike the retention
+    /// sweep) and no caller that enqueues them on demand (unlike a future
+    /// request-triggered job) — they are periodic maintenance with nothing to
+    /// enqueue *for*. Every replica ticks this interval and enqueues a row only
+    /// when [`WorkerRegistry::is_configured`] says the name is on **and** no
+    /// `pending`/`running` row for that name already exists
+    /// (`WorkerJobRepository::enqueue_if_idle`), so duplicate rows across replicas
+    /// are a rare race rather than the steady state. Every handler these three
+    /// names dispatch to is safe under that rare duplicate: aggregation
+    /// recomputes idempotently, a health probe is additive by design, and the
+    /// refresh handler uses `provider_credentials.version` as an optimistic lock
+    /// (`src/infra/workers/oauth_refresh.rs`). This is deliberately **not**
+    /// leader-gated like the retention sweep — see that module's doc comment for
+    /// why a perfectly-exclusive singleton was worth building there and is not
+    /// worth building here.
+    pub maintenance_enqueue_interval_seconds: u64,
+    /// How many hours of `execution_attempts` history `latency-stats-aggregation`
+    /// scans to find which provider/model pairs have recent traffic worth
+    /// aggregating. Bounds the "which pairs are active" query; the "last N"
+    /// sample itself is bounded separately by [`Self::latency_stats_sample_size`].
+    pub latency_stats_lookback_hours: i64,
+    /// `N` in "naive last-N" (plan 12 §2, consolidated decision 7): how many of
+    /// the most recent successful attempts per provider/model pair feed the
+    /// p50/p95 computation.
+    pub latency_stats_sample_size: i64,
+    /// How far ahead of `provider_credentials.expires_at` `oauth-token-refresh`
+    /// treats a credential as due. Wide enough that a job which only runs every
+    /// [`Self::maintenance_enqueue_interval_seconds`] still catches an expiry
+    /// before it lapses.
+    pub oauth_refresh_lead_seconds: i64,
+    /// Per-provider timeout for `provider-health-check`'s reachability probe.
+    /// Short by design — a slow provider is exactly what "degraded" exists to
+    /// report, and a probe that itself blocks for the request timeout would make
+    /// one unreachable provider stall every other provider's probe in the same
+    /// job run.
+    pub provider_health_probe_timeout_ms: u64,
+    /// How long a `provider_health_snapshots` row survives before
+    /// `provider-health-check` prunes it. The rolling window `GET
+    /// /api/v1/admin/providers/health` reports never looks further back than
+    /// this, so raising it widens the window and raises table growth together.
+    pub provider_health_snapshot_retention_hours: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -747,6 +899,11 @@ impl Settings {
         // And again: an API-key prefix shorter than its own namespace plus a usable
         // random tail is not a tuning choice either.
         self.validate_api_key_prefix(&mut violations);
+
+        // And again, for the other half of the same struct: the Argon2 gate's bound is a
+        // resident-memory budget and its timeout is an availability decision, so neither is
+        // clamped into something the operator did not ask for.
+        self.validate_api_key_verification_gate(&mut violations);
 
         // And again: a stale-JWKS ceiling below the freshness window is a bound that cannot
         // be enforced, because the fresh read path never consults it.
@@ -826,6 +983,9 @@ impl Settings {
         }
         if self.public_api.image_urls.allow_insecure_dev_urls {
             features.push("insecure_image_urls");
+        }
+        if self.skill_execution.allow_insecure_dev_urls {
+            features.push("insecure_skill_urls");
         }
         if self.provider_security.allow_http_provider_urls {
             features.push("http_provider_urls");
@@ -1051,6 +1211,50 @@ impl Settings {
         }
     }
 
+    /// The Argon2id gate's two knobs, checked in every environment (issue #176).
+    ///
+    /// Both are **refused, not clamped**, on the reasoning `validate_api_key_prefix` records
+    /// directly above: a clamp makes a misconfiguration invisible, and these two decide how much
+    /// resident memory the authentication path may hold and how long a caller waits before a
+    /// `503`. Getting either silently is worse than not starting.
+    ///
+    /// The ceiling is a memory budget, not a taste: `MAX_VERIFICATION_CONCURRENCY` times
+    /// `ARGON2_ARENA_BYTES` is 1,216 MiB, already 59% of the chart's `resources.limits.memory:
+    /// 2Gi`. Above it an operator is configuring an OOMKill, and Rust aborts on allocation
+    /// failure rather than unwinding, so there would be no degraded mode to fall back to.
+    fn validate_api_key_verification_gate(&self, violations: &mut Vec<String>) {
+        use crate::security::{ARGON2_ARENA_BYTES, MAX_VERIFICATION_CONCURRENCY};
+
+        match self.api_keys.verification_concurrency {
+            Some(0) => violations.push(
+                "api_keys.verification_concurrency must be at least 1, or no request can ever \
+                 obtain an Argon2 permit and every authenticated call waits out its queue timeout \
+                 and fails with auth_verification_overloaded"
+                    .to_string(),
+            ),
+            Some(concurrency) if concurrency > MAX_VERIFICATION_CONCURRENCY => {
+                violations.push(format!(
+                    "api_keys.verification_concurrency ({concurrency}) must be at most \
+                     {MAX_VERIFICATION_CONCURRENCY}: each concurrent Argon2id operation holds a \
+                     {} MiB arena resident, so {concurrency} of them peak at {} MiB against the \
+                     2 GiB the shipped chart limits this container to",
+                    ARGON2_ARENA_BYTES / (1024 * 1024),
+                    concurrency * ARGON2_ARENA_BYTES / (1024 * 1024),
+                ));
+            }
+            _ => {}
+        }
+
+        if self.api_keys.verification_queue_timeout_ms == 0 {
+            violations.push(
+                "api_keys.verification_queue_timeout_ms must be at least 1: a zero timeout sheds \
+                 the moment the gate is full, which returns 503 to a well-behaved caller's \
+                 two-request burst on a two-core box"
+                    .to_string(),
+            );
+        }
+    }
+
     /// Structural invariants of the admission lease, checked in every environment.
     ///
     /// `lease_expiry_seconds <= lease_heartbeat_seconds` is the one that matters:
@@ -1148,6 +1352,11 @@ impl Settings {
             violations.push(
                 "public_api.image_urls.allow_insecure_dev_urls must be false in production"
                     .to_string(),
+            );
+        }
+        if self.skill_execution.allow_insecure_dev_urls {
+            violations.push(
+                "skill_execution.allow_insecure_dev_urls must be false in production".to_string(),
             );
         }
         if self.workers.enabled {
@@ -1583,6 +1792,8 @@ impl Default for ApiKeySettings {
             pepper_version: "dev-local".to_string(),
             allow_insecure_dev_pepper: true,
             prefix_length: 20,
+            verification_concurrency: None,
+            verification_queue_timeout_ms: DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS,
         }
     }
 }
@@ -1725,6 +1936,20 @@ impl Default for WorkerSettings {
             // 10k pending rows is roughly where the claim's `(status, run_at)`
             // index scan stops being free on commodity hardware.
             queue_max_pending_jobs: 10_000,
+            // 1 minute: frequent enough that a `provider-health-check` reader sees
+            // a window that is never more than a couple of minutes stale, cheap
+            // enough (one `exists` check per configured name) to run on every
+            // replica without a second thought.
+            maintenance_enqueue_interval_seconds: 60,
+            latency_stats_lookback_hours: 24,
+            latency_stats_sample_size: 50,
+            // 15 minutes. Wide relative to the 1-minute maintenance-enqueue
+            // cadence, so a token is refreshed several polls before it would
+            // actually lapse rather than on the one poll that happens to land
+            // first.
+            oauth_refresh_lead_seconds: 900,
+            provider_health_probe_timeout_ms: 3_000,
+            provider_health_snapshot_retention_hours: 24,
         }
     }
 }
@@ -2121,8 +2346,9 @@ mod tests {
     ///
     /// It also pins **refusal, not clamping**: the shipped default must pass, and one below
     /// the floor must produce a startup error, in every environment.
-    #[test]
-    fn the_api_key_prefix_floor_is_the_point_where_a_namespace_stops_leaving_random_material() {
+    #[tokio::test]
+    async fn the_api_key_prefix_floor_is_the_point_where_a_namespace_stops_leaving_random_material()
+    {
         use crate::security::{
             ApiKeyHasher, KEY_NAMESPACES, MIN_API_KEY_PREFIX_LENGTH, MIN_RANDOM_PREFIX_CHARS,
         };
@@ -2138,7 +2364,10 @@ mod tests {
 
         // At the floor, even the *longest* namespace leaves the required random material.
         let at_floor = ApiKeyHasher::new(b"pepper".to_vec(), "v1", MIN_API_KEY_PREFIX_LENGTH);
-        let generated = at_floor.generate(longest).expect("generate at the floor");
+        let generated = at_floor
+            .generate(longest)
+            .await
+            .expect("generate at the floor");
         let random = generated
             .key_prefix
             .strip_prefix(&format!("{longest}_"))
@@ -2188,6 +2417,69 @@ mod tests {
             .to_string();
         assert!(
             error.contains("api_keys.prefix_length"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The Argon2 gate's knobs are refused, not clamped, and the ceiling is derived from the
+    /// container's memory limit rather than chosen (issue #176).
+    ///
+    /// Both boundaries are asserted, not just the rejected side: `MAX_VERIFICATION_CONCURRENCY`
+    /// itself has to be an *accepted* value or it is not the ceiling, which is the mutation that
+    /// survived the equivalent prefix-length test until it checked both sides.
+    #[test]
+    fn the_argon2_verification_gate_settings_are_refused_rather_than_clamped() {
+        use crate::security::{ARGON2_ARENA_BYTES, MAX_VERIFICATION_CONCURRENCY};
+
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.deployment.environment,
+            DeploymentEnvironment::Development,
+            "the check must fire outside production, so this must not be a production default"
+        );
+        assert_eq!(
+            settings.api_keys.verification_concurrency, None,
+            "the shipped default must derive the bound from the core count, not pin a number"
+        );
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the shipped api_keys gate settings must validate");
+
+        settings.api_keys.verification_concurrency = Some(MAX_VERIFICATION_CONCURRENCY);
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the ceiling itself must be an accepted configuration");
+
+        settings.api_keys.verification_concurrency = Some(0);
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero bound must be refused: nothing could ever acquire a permit")
+            .to_string();
+        assert!(
+            error.contains("api_keys.verification_concurrency"),
+            "unexpected error: {error}"
+        );
+
+        settings.api_keys.verification_concurrency = Some(MAX_VERIFICATION_CONCURRENCY + 1);
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a bound above the memory ceiling must be refused")
+            .to_string();
+        // The message has to carry the arithmetic, because "64" on its own tells an operator
+        // nothing about *why* their 128 was refused.
+        assert!(
+            error.contains(&format!("{} MiB arena", ARGON2_ARENA_BYTES / (1024 * 1024))),
+            "the refusal must name the per-operation arena: {error}"
+        );
+
+        settings.api_keys.verification_concurrency = None;
+        settings.api_keys.verification_queue_timeout_ms = 0;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero queue timeout must be refused")
+            .to_string();
+        assert!(
+            error.contains("api_keys.verification_queue_timeout_ms"),
             "unexpected error: {error}"
         );
     }

@@ -157,6 +157,32 @@ const EXEMPT_DTO_FIELDS = [
   "setup_token",
   "maximum_input_tokens",
   "maximum_output_tokens",
+  // Issue #237 / plan 12 §5. A `provider_credentials` ROW REFERENCE, not a
+  // secret value — `SkillHttpExecutorRecord`/`SkillHttpExecutorPatchRequest`
+  // never carry the credential's contents, only the id of the row that holds
+  // it, matched by name against `SECRET_DTO_FIELD_PATTERN`'s `credential`
+  // alternative even though nothing about an id is a credential itself. Same
+  // trade as the two above: `lib/llm-view.ts`'s `LlmKeyRowView` already treats
+  // the LLM surface's own credential rows the same way.
+  "credential_id",
+  // Plan 12 §6. An integer token BUDGET on `AgentProfileRecord`, the same shape
+  // as `maximum_input_tokens`/`maximum_output_tokens` above — matched by the
+  // pattern's `token` alternative with no credential meaning under any reading.
+  "max_tokens",
+  // Issue #261 (the playground). `max_output_tokens` (`PublicResponseRequest`)
+  // is the same integer token BUDGET as `max_tokens`/`maximum_output_tokens`
+  // above, just spelled differently on this schema. `cached_input_tokens`,
+  // `input_tokens`, `output_tokens`, `reasoning_tokens` and `total_tokens`
+  // (`PublicUsageSummary` and the distinct-but-field-identical `UsageSummary`
+  // — see that interface's own doc comment on why there are two) are all
+  // integer USAGE COUNTS a provider reports back, not credentials — the same
+  // trade as every entry above.
+  "max_output_tokens",
+  "cached_input_tokens",
+  "input_tokens",
+  "output_tokens",
+  "reasoning_tokens",
+  "total_tokens",
 ] as const;
 
 describe("credential-carrying modules are marked and contained", () => {

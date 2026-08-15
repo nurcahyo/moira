@@ -76,6 +76,23 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:skills:read",
     "moira:skills:write",
     "moira:skills:delete",
+    // Issue #214 (plan 12 §3) F2 — the deferred remainder of workstream F: eval suites
+    // (+ their nested cases and read-only runs) and flows (+ their embedded steps and
+    // read-only runs). Named against the `moira:skills:{read,write,delete}` precedent
+    // immediately above: one scope triple per registry, `write` covers create and patch,
+    // `delete` the soft delete. `read`/`write`/`delete` each also gate the nested child
+    // surface (cases under an eval suite; a flow's steps travel inside its own body) rather
+    // than minting a second scope triple per child table.
+    "moira:evals:read",
+    "moira:evals:write",
+    "moira:evals:delete",
+    "moira:flows:read",
+    "moira:flows:write",
+    "moira:flows:delete",
+    // Issue #234 (plan 12 §4) — the derived, read-only relationship graph. One scope, no
+    // `:write`/`:delete` siblings: the endpoint has no write side to gate. Implied by
+    // `moira:admin` like every scope in this list.
+    "moira:graph:read",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
     // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin

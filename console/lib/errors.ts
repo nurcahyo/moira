@@ -393,3 +393,27 @@ export class MoiraRequestError extends Error {
 export function isMoiraRequestError(value: unknown): value is MoiraRequestError {
   return value instanceof MoiraRequestError;
 }
+
+/**
+ * Read one paginated list defensively: `null` on any `MoiraRequestError`
+ * (a non-fatal picker/secondary read, same posture as `/flows`'s
+ * agent-profile load), rethrown otherwise.
+ *
+ * Lives here rather than inline in the calling server component because a
+ * generic arrow function's `Promise<...>` return-type annotation, written
+ * inside a `.tsx` file under `app/`, `components/` or `modules/`, trips
+ * `tests/support/copy-scan.ts`'s intentionally naive `JSX_TEXT` regex
+ * (`/>([^<>{}]+)</g`, which cannot distinguish a generic's `>` from a JSX
+ * tag's) — `lib/` is not one of that scanner's roots.
+ */
+export async function readListOrNull<T>(
+  load: () => Promise<{ readonly data: readonly T[] }>,
+): Promise<readonly T[] | null> {
+  try {
+    const page = await load();
+    return page.data;
+  } catch (error) {
+    if (!isMoiraRequestError(error)) throw error;
+    return null;
+  }
+}

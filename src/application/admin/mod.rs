@@ -179,6 +179,14 @@ impl<'a> AdminService<'a> {
         self.providers.get_provider(actor, id).await
     }
 
+    /// Issue #83's read surface: `GET /api/v1/admin/providers/health`.
+    pub async fn provider_health(
+        &self,
+        actor: &Actor,
+    ) -> Result<crate::domain::ProviderHealthResponse, AppError> {
+        self.providers.provider_health(actor).await
+    }
+
     pub async fn patch_provider(
         &self,
         actor: &Actor,

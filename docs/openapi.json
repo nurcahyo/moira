@@ -273,6 +273,304 @@
         ],
         "type": "string"
       },
+      "AgentFlowCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "flow_key": {
+            "type": "string"
+          },
+          "metadata": {},
+          "steps": {
+            "description": "The flow's steps, in the order they execute. May be empty — a flow can be authored\nbefore its steps are decided; it simply cannot run yet (there is no execution engine\nin this MVP regardless).",
+            "items": {
+              "$ref": "#/components/schemas/AgentFlowStepCreateRequest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "flow_key",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "AgentFlowPatchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "steps": {
+            "description": "`Some(steps)` atomically replaces the flow's entire ordered step list; `None` (the\nfield omitted) leaves the existing steps untouched — the same coalesce convention\nevery other patch request in this module follows for its scalar fields.",
+            "items": {
+              "$ref": "#/components/schemas/AgentFlowStepCreateRequest"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "AgentFlowRecord": {
+        "description": "A flow's steps are managed as an ordered array inside this record rather than through a\nseparate `agent_flow_steps` sub-resource (decision 13: simplest contract, matches the\nsequential-only MVP) — `create`/`patch` accept the whole ordered list in the request body\nand this record echoes the current list back, so a client never has to reconcile a\nseparately-paginated child collection with its parent.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "deleted_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "flow_key": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {},
+          "status": {
+            "$ref": "#/components/schemas/ResourceStatus"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/AgentFlowStepRecord"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "flow_key",
+          "display_name",
+          "status",
+          "metadata",
+          "created_at",
+          "updated_at",
+          "version",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "AgentFlowRunRecord": {
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "flow_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {},
+          "status": {
+            "$ref": "#/components/schemas/FlowRunStatus"
+          }
+        },
+        "required": [
+          "id",
+          "flow_id",
+          "status",
+          "metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AgentFlowRunResult": {
+        "description": "`POST /api/v1/admin/flows/{id}/run` response: the finalized flow run plus one step-run row\nper step attempted, in step order. Returned with `200` even when the run failed — a\nstep failure is data (the run's `status` is `failed` and the aborting step's\n`error_summary` names why), not an HTTP error.",
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/AgentFlowRunRecord"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/AgentFlowStepRunRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "run",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "AgentFlowStepCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_profile_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "input_mapping": {},
+          "metadata": {},
+          "on_failure": {
+            "$ref": "#/components/schemas/FlowStepOnFailure"
+          },
+          "step_key": {
+            "type": "string"
+          },
+          "step_order": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "step_key",
+          "step_order",
+          "agent_profile_id"
+        ],
+        "type": "object"
+      },
+      "AgentFlowStepRecord": {
+        "properties": {
+          "agent_profile_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "flow_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "input_mapping": {},
+          "metadata": {},
+          "on_failure": {
+            "$ref": "#/components/schemas/FlowStepOnFailure"
+          },
+          "step_key": {
+            "type": "string"
+          },
+          "step_order": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "flow_id",
+          "step_key",
+          "step_order",
+          "agent_profile_id",
+          "on_failure",
+          "input_mapping",
+          "metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AgentFlowStepRunRecord": {
+        "description": "One `agent_flow_step_runs` row — a single step's execution within a flow run (issue #214,\nplan 12 §3). Append-only, produced by the flow orchestrator, never authored through the\nadmin CRUD surface. `execution_id` correlates the step to the underlying pipeline execution\nso an operator can join it against `execution_attempts`/`usage_records`/audit rows;\n`error_summary` carries a sanitized failure reason (a message key, never a provider body)\non the step that aborted the run (decision 15).",
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flow_run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FlowStepRunStatus"
+          },
+          "step_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "flow_run_id",
+          "step_id",
+          "status",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "AgentProfileCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2749,6 +3047,246 @@
         ],
         "type": "object"
       },
+      "EvalCaseCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {},
+          "grading_kind": {
+            "$ref": "#/components/schemas/GradingKind"
+          },
+          "input": {},
+          "metadata": {}
+        },
+        "required": [
+          "input",
+          "expected",
+          "grading_kind"
+        ],
+        "type": "object"
+      },
+      "EvalCaseRecord": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "expected": {},
+          "grading_kind": {
+            "$ref": "#/components/schemas/GradingKind"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "input": {},
+          "metadata": {},
+          "suite_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "suite_id",
+          "input",
+          "expected",
+          "grading_kind",
+          "metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "EvalRunRecord": {
+        "properties": {
+          "agent_profile_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {},
+          "results": {},
+          "score": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EvalRunStatus"
+          },
+          "suite_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger_kind": {
+            "$ref": "#/components/schemas/EvalTriggerKind"
+          }
+        },
+        "required": [
+          "id",
+          "trigger_kind",
+          "status",
+          "results",
+          "metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "EvalRunRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/eval-suites/{id}/run` body. `agent_profile_id` names the target the\nsuite's cases are graded against; when omitted it falls back to the suite's\n`metadata.target_agent_profile_id`. If neither resolves, the run is refused with\n`eval_target_missing` — an eval with no subject cannot measure anything.",
+        "properties": {
+          "agent_profile_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "EvalRunStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "EvalSuiteCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "metadata": {},
+          "suite_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "suite_key",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "EvalSuitePatchRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {}
+        },
+        "type": "object"
+      },
+      "EvalSuiteRecord": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "deleted_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "metadata": {},
+          "status": {
+            "$ref": "#/components/schemas/ResourceStatus"
+          },
+          "suite_key": {
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "suite_key",
+          "display_name",
+          "status",
+          "metadata",
+          "created_at",
+          "updated_at",
+          "version"
+        ],
+        "type": "object"
+      },
+      "EvalTriggerKind": {
+        "enum": [
+          "offline_manual",
+          "offline_ci",
+          "online_sampled"
+        ],
+        "type": "string"
+      },
       "ExecutionFailure": {
         "properties": {
           "class": {
@@ -2780,6 +3318,7 @@
           "route_forbidden",
           "agent_profile_not_found",
           "agent_profile_disabled",
+          "skill_unavailable",
           "model_not_found",
           "model_forbidden",
           "model_capability_mismatch",
@@ -2960,6 +3499,146 @@
           "cancelled"
         ],
         "type": "string"
+      },
+      "FlowRunRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/flows/{id}/run` body. The optional `input` seeds the first step's\nprompt; when omitted the first step runs with an empty prompt (a flow whose first step\nreads only from its agent profile's preamble is legitimate). A step may still declare\n`input_mapping` to draw from `run_input` or a literal instead of the previous step's\noutput — see `application::flow_eval_execution` for the passing convention.",
+        "properties": {
+          "input": {}
+        },
+        "type": "object"
+      },
+      "FlowRunStatus": {
+        "enum": [
+          "running",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "FlowStepOnFailure": {
+        "enum": [
+          "abort",
+          "continue"
+        ],
+        "type": "string"
+      },
+      "FlowStepRunStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "skipped"
+        ],
+        "type": "string"
+      },
+      "GradingKind": {
+        "description": "Cheap, MVP-safe grading kinds (§3). `llm_judge` is deliberately absent (decision 14).",
+        "enum": [
+          "exact_match",
+          "contains",
+          "schema_valid"
+        ],
+        "type": "string"
+      },
+      "GraphEdge": {
+        "description": "One edge in the derived graph. `from`/`to` are [`GraphNode::id`] values.",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GraphEdgeKind"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "GraphEdgeKind": {
+        "description": "The FK/ref an edge was derived from (plan 12 §4). Every edge is a straight read of an\nexisting column — no computed weight, no new join table.",
+        "enum": [
+          "agent_uses_skill",
+          "agent_uses_eval_suite",
+          "agent_reads_memory_scope",
+          "flow_contains_agent",
+          "agent_routes_to_model"
+        ],
+        "type": "string"
+      },
+      "GraphNode": {
+        "description": "One node in the derived graph. `id` is `\"<type>:<key>\"` (e.g. `\"agent:0199…\"`,\n`\"memory_scope:tenant_application\"`) — composite so an edge's `from`/`to` can never collide\nacross node types that would otherwise share a bare UUID namespace.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "description": "The owning row's lifecycle status, passed through as-is. Registries do not share one\nstatus vocabulary (skills are `draft`/`enabled`/`disabled`; most others are\n`active`/`disabled`/`deleted`), so this is intentionally a bare string rather than one\nshared enum. `None` for the synthetic `memory_scope` node type, which has no row of its\nown to carry a status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/GraphNodeType"
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "label"
+        ],
+        "type": "object"
+      },
+      "GraphNodeType": {
+        "description": "Which registry a [`GraphNode`] was derived from.",
+        "enum": [
+          "agent",
+          "skill",
+          "eval_suite",
+          "flow",
+          "provider",
+          "model",
+          "memory_scope"
+        ],
+        "type": "string"
+      },
+      "GraphResponse": {
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/GraphEdge"
+            },
+            "type": "array"
+          },
+          "generated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes",
+          "edges",
+          "generated_at"
+        ],
+        "type": "object"
       },
       "HealthResponse": {
         "properties": {
@@ -3209,6 +3888,133 @@
                 "expires_at",
                 "created_at",
                 "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_AgentFlowRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "A flow's steps are managed as an ordered array inside this record rather than through a\nseparate `agent_flow_steps` sub-resource (decision 13: simplest contract, matches the\nsequential-only MVP) — `create`/`patch` accept the whole ordered list in the request body\nand this record echoes the current list back, so a client never has to reconcile a\nseparately-paginated child collection with its parent.",
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "deleted_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "flow_key": {
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "metadata": {},
+                "status": {
+                  "$ref": "#/components/schemas/ResourceStatus"
+                },
+                "steps": {
+                  "items": {
+                    "$ref": "#/components/schemas/AgentFlowStepRecord"
+                  },
+                  "type": "array"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "flow_key",
+                "display_name",
+                "status",
+                "metadata",
+                "created_at",
+                "updated_at",
+                "version",
+                "steps"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_AgentFlowRunRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "completed_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "flow_id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "metadata": {},
+                "status": {
+                  "$ref": "#/components/schemas/FlowRunStatus"
+                }
+              },
+              "required": [
+                "id",
+                "flow_id",
+                "status",
+                "metadata",
+                "created_at"
               ],
               "type": "object"
             },
@@ -4029,6 +4835,201 @@
                 "masked_secret",
                 "status",
                 "priority",
+                "metadata",
+                "created_at",
+                "updated_at",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_EvalCaseRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "expected": {},
+                "grading_kind": {
+                  "$ref": "#/components/schemas/GradingKind"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "input": {},
+                "metadata": {},
+                "suite_id": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "suite_id",
+                "input",
+                "expected",
+                "grading_kind",
+                "metadata",
+                "created_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_EvalRunRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "agent_profile_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "completed_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "execution_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "metadata": {},
+                "results": {},
+                "score": {
+                  "format": "double",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/components/schemas/EvalRunStatus"
+                },
+                "suite_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "trigger_kind": {
+                  "$ref": "#/components/schemas/EvalTriggerKind"
+                }
+              },
+              "required": [
+                "id",
+                "trigger_kind",
+                "status",
+                "results",
+                "metadata",
+                "created_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_EvalSuiteRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "properties": {
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "deleted_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "metadata": {},
+                "status": {
+                  "$ref": "#/components/schemas/ResourceStatus"
+                },
+                "suite_key": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "suite_key",
+                "display_name",
+                "status",
                 "metadata",
                 "created_at",
                 "updated_at",
@@ -6039,6 +7040,95 @@
         ],
         "type": "object"
       },
+      "ProviderHealthEntry": {
+        "description": "One provider's rolling health window (issue #83), as `GET\n/api/v1/admin/providers/health` serves it.",
+        "properties": {
+          "average_latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "last_failure_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_probe_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "probes_successful": {
+            "description": "Probes that reached the provider at all — `healthy` or `degraded`, not `unhealthy`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "probes_total": {
+            "description": "Total reachability probes observed within the rolling window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "provider_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "provider_type": {
+            "$ref": "#/components/schemas/ProviderType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProviderHealthStatus"
+          }
+        },
+        "required": [
+          "provider_id",
+          "provider_type",
+          "display_name",
+          "status",
+          "probes_total",
+          "probes_successful"
+        ],
+        "type": "object"
+      },
+      "ProviderHealthResponse": {
+        "properties": {
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderHealthEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "providers"
+        ],
+        "type": "object"
+      },
+      "ProviderHealthStatus": {
+        "description": "The classification `src/infra/workers/provider_health_check.rs::classify_probe` produces,\nplus `Unknown` for a provider with no snapshot inside the rolling window at all (never\nprobed, or not probed recently enough to still be in window).",
+        "enum": [
+          "healthy",
+          "degraded",
+          "unhealthy",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "ProviderModelCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6375,7 +7465,8 @@
           "deep_seek",
           "azure_open_ai",
           "local",
-          "custom"
+          "custom",
+          "chatgpt_oauth"
         ],
         "type": "string"
       },
@@ -16638,6 +17729,2326 @@
         ]
       }
     },
+    "/api/v1/admin/eval-suites": {
+      "get": {
+        "operationId": "list_eval_suites",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_EvalSuiteRecord"
+                }
+              }
+            },
+            "description": "Paginated eval suites",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      },
+      "post": {
+        "operationId": "create_eval_suite",
+        "parameters": [
+          {
+            "description": "Optional replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalSuiteCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteRecord"
+                }
+              }
+            },
+            "description": "Eval suite created",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/eval-suites/{id}": {
+      "delete": {
+        "operationId": "delete_eval_suite",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Eval suite deleted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      },
+      "get": {
+        "operationId": "get_eval_suite",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteRecord"
+                }
+              }
+            },
+            "description": "Eval suite",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_eval_suite",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalSuitePatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteRecord"
+                }
+              }
+            },
+            "description": "Eval suite updated",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/eval-suites/{id}/cases": {
+      "get": {
+        "operationId": "list_eval_cases",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque `next_cursor` from a previous response for this same list.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows per page, clamped to 1..=200. Defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_EvalCaseRecord"
+                }
+              }
+            },
+            "description": "Paginated eval cases",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Lists one suite's cases. `cursor`/`limit` are declared inline, not as `params(PageQuery)`\n— the same reasoning `list_rag_documents` gives for its own nested list: `PageQuery`\ncarries two dozen filter fields this route does not honour.",
+        "tags": [
+          "admin-eval-suites"
+        ]
+      },
+      "post": {
+        "operationId": "create_eval_case",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalCaseCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalCaseRecord"
+                }
+              }
+            },
+            "description": "Eval case created",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/eval-suites/{id}/cases/{case_id}": {
+      "delete": {
+        "operationId": "delete_eval_case",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Eval case identifier",
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Eval case deleted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "`eval_cases` carries no `version`/`updated_at` (migration header), so this delete takes no\n`If-Match` — there is nothing to precondition against.",
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/eval-suites/{id}/run": {
+      "post": {
+        "operationId": "run_eval_suite",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Completed eval run with per-case pass/fail results",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Runs every case of a suite against a target agent profile through the normal execution\npipeline and grades the output (issue #214, plan 12 §3, the execution half). Offline,\ninline, `exact_match`/`contains`/`schema_valid` only (decision 14 — no LLM-judge). No\n`If-Match`: this appends a new `eval_runs` row, it does not mutate the versioned suite.",
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/eval-suites/{id}/runs": {
+      "get": {
+        "operationId": "list_eval_runs",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque `next_cursor` from a previous response for this same list.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows per page, clamped to 1..=200. Defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_EvalRunRecord"
+                }
+              }
+            },
+            "description": "Paginated eval runs",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Read-only: `eval_runs` rows are produced by execution (offline or online grading), never\nauthored through this admin surface.",
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
+    "/api/v1/admin/flows": {
+      "get": {
+        "operationId": "list_flows",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_AgentFlowRecord"
+                }
+              }
+            },
+            "description": "Paginated flows",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-flows"
+        ]
+      },
+      "post": {
+        "operationId": "create_flow",
+        "parameters": [
+          {
+            "description": "Optional replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentFlowCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentFlowRecord"
+                }
+              }
+            },
+            "description": "Flow created",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-flows"
+        ]
+      }
+    },
+    "/api/v1/admin/flows/{id}": {
+      "delete": {
+        "operationId": "delete_flow",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Flow deleted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-flows"
+        ]
+      },
+      "get": {
+        "operationId": "get_flow",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentFlowRecord"
+                }
+              }
+            },
+            "description": "Flow",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-flows"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_flow",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentFlowPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentFlowRecord"
+                }
+              }
+            },
+            "description": "Flow updated",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-flows"
+        ]
+      }
+    },
+    "/api/v1/admin/flows/{id}/run": {
+      "post": {
+        "operationId": "run_flow",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentFlowRunResult"
+                }
+              }
+            },
+            "description": "Finalized flow run with one step-run row per step attempted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Executes a flow's steps in order through the normal execution pipeline, fail-closed\n(issue #214, plan 12 §3, the execution half). Sequential-only (decision 13); a step\nfailure aborts the run and marks it `failed` (decision 15). Returns `200` with the\nfinalized run and its step-run rows even when the run failed — a step failure is data (the\nrun `status` and the aborting step's `error_summary`), not an HTTP error. No `If-Match`:\nthis appends new run rows, it does not mutate the versioned flow.",
+        "tags": [
+          "admin-flows"
+        ]
+      }
+    },
+    "/api/v1/admin/flows/{id}/runs": {
+      "get": {
+        "operationId": "list_flow_runs",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque `next_cursor` from a previous response for this same list.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Rows per page, clamped to 1..=200. Defaults to 50.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_AgentFlowRunRecord"
+                }
+              }
+            },
+            "description": "Paginated flow runs",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Read-only: `agent_flow_runs` rows are produced by the flow orchestrator, which does not\nexist yet (deferred to the #84 follow-up). There is no `POST .../flows/{id}/run` in this\nMVP — a flow can be fully authored but cannot be executed.",
+        "tags": [
+          "admin-flows"
+        ]
+      }
+    },
+    "/api/v1/admin/graph": {
+      "get": {
+        "operationId": "get_graph",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphResponse"
+                }
+              }
+            },
+            "description": "Derived relationship graph over the agent-platform and provider/model registries",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-graph"
+        ]
+      }
+    },
     "/api/v1/admin/jwt-issuers": {
       "get": {
         "operationId": "list_trusted_jwt_issuers",
@@ -19776,6 +23187,92 @@
               }
             },
             "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-providers"
+        ]
+      }
+    },
+    "/api/v1/admin/providers/health": {
+      "get": {
+        "operationId": "get_provider_health",
+        "parameters": [
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderHealthResponse"
+                }
+              }
+            },
+            "description": "Rolling reachability window for every enabled provider (issue #83)",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication or authorization error",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -26923,7 +30420,7 @@
                 }
               }
             },
-            "description": "Request, authentication, authorization, conflict, not-found, or SSRF-blocked-host error",
+            "description": "Request, authentication, authorization, conflict, not-found, SSRF-blocked-host, or credential-host-mismatch error (422 skill_credential_host_mismatch when the executor would end up carrying a credential whose provider does not serve its allowed_host)",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -28438,6 +31935,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -29696,6 +33211,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -29854,6 +33387,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -30532,6 +34083,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -31197,6 +34766,24 @@
               }
             }
           },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "504": {
             "content": {
               "application/json": {
@@ -31347,6 +34934,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -31576,6 +35181,24 @@
               }
             },
             "description": "Internal server error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The instance is at capacity for Argon2id credential checks and refused this request before verifying the presented key (`auth_verification_overloaded`). The credential itself was neither accepted nor rejected, so this is not an authentication failure: retry after a short delay. Raised once a request has waited `api_keys.verification_queue_timeout_ms` for one of the `api_keys.verification_concurrency` permits.",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",
@@ -32410,6 +36033,10 @@
     {
       "description": "Skill (declarative tool/guard) administration",
       "name": "admin-skills"
+    },
+    {
+      "description": "Derived relationship graph over the agent-platform and provider/model registries",
+      "name": "admin-graph"
     },
     {
       "description": "Runtime policy and diagnostics",

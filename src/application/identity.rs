@@ -296,7 +296,15 @@ impl<'a> AdminIdentityService<'a> {
         let value = normalize_invite_constraint(request.constraint, &request.value)?;
         let expires_at = Utc::now() + validated_invite_lifetime(request.expires_in_seconds)?;
 
-        let generated = self.state.key_hasher.generate(ADMIN_INVITE_NAMESPACE)?;
+        // Minted **before** the command envelope opens its transaction, and it stays there: this
+        // is the one mint path in Moira that already sits outside the transaction, so awaiting the
+        // Argon2 gate here holds no database resources. The three in `admin/keys.rs` cannot be
+        // hoisted the same way — see the note at their call sites.
+        let generated = self
+            .state
+            .key_hasher
+            .generate(ADMIN_INVITE_NAMESPACE)
+            .await?;
         let insert = AdminInviteInsert {
             id: Uuid::now_v7(),
             token_prefix: generated.key_prefix.clone(),
@@ -958,7 +966,16 @@ impl<'a> AdminIdentityService<'a> {
         let Some(candidate) = self.identities.find_invite_by_prefix(&prefix).await? else {
             return Err(invite_not_found());
         };
-        if self.state.key_hasher.verify(token, &candidate.token_hash)? {
+        // Awaited, and the Argon2 work runs off the runtime — see `ApiKeyHasher::verify`. This is
+        // the one verification reachable from a **fully unauthenticated** route (the invite
+        // preview), so it is also the one whose cost bound rests entirely on the prefix lookup
+        // above: no live prefix, no permit, no Argon2.
+        if self
+            .state
+            .key_hasher
+            .verify(token, &candidate.token_hash)
+            .await?
+        {
             Ok(candidate.record)
         } else {
             Err(invite_not_found())

@@ -321,6 +321,20 @@ pub struct ExecutionCommand {
     pub provider_hint: Option<Uuid>,
     pub model_hint: Option<Uuid>,
     pub credential_hint: Option<Uuid>,
+    /// Issue #214 (plan 12 §3) — the agent profile this execution must use, overriding the
+    /// one the selected route names. Set only by the flow-step and eval-suite runners in
+    /// `application::flow_eval_execution`, which target an `agent_profiles` row directly
+    /// rather than through a route. It is deliberately **not** exposed on any public request
+    /// DTO (`DiagnosticExecutionRequest`, the `/v1/responses` body) and therefore needs no
+    /// override-scope gate the way `route_hint`/`model_hint` do: an external caller cannot
+    /// reach it, and the runners that can are trusted internal callers of this pipeline (plan
+    /// 12 §3, "a new caller of the existing pipeline, not a parallel one"). Route/model
+    /// selection stays route-owned; only the preamble/parameters/`skill_refs` that the
+    /// profile carries are overridden. Fail-closed: a hint that resolves to a
+    /// missing/disabled profile refuses the execution exactly as a dangling route profile
+    /// does (issue #79).
+    #[serde(default)]
+    pub agent_profile_hint: Option<Uuid>,
     pub options: ExecutionOptions,
     #[serde(default)]
     pub metadata: Value,
@@ -576,6 +590,22 @@ pub enum ExecutionFailureClass {
     AgentProfileNotFound,
     /// F50 / issue #79 — the selected route names an agent profile the operator disabled.
     AgentProfileDisabled,
+    /// Issue #84 — the resolved agent profile's `skill_refs` name a skill this execution
+    /// cannot use: no live row, not `enabled`, a `kind = 'tool'` row with no
+    /// `skill_http_executors` child, or a set of skills that cannot be assembled into a
+    /// tool list (a duplicate `skill_key`, a parameter schema no provider would accept, a
+    /// credential type with no HTTP form, or more tools than
+    /// `skill_execution.maximum_advertised_tools` allows).
+    ///
+    /// **Fail-closed, and one class for all of those**, unlike the
+    /// `AgentProfileNotFound`/`AgentProfileDisabled` pair. That split exists because a
+    /// route names exactly one profile, so "gone" and "switched off" are two different
+    /// one-field fixes for one id. A profile names a *list* of skills and the answer is the
+    /// same in every case here — an operator must fix the agent profile or the skill row
+    /// the server-side message names — so a second public code would carry no information
+    /// the first does not. The specific [`crate::domain::SkillUnusableReason`] travels in
+    /// the audit entry and the runtime event, not on the wire.
+    SkillUnavailable,
     ModelNotFound,
     ModelForbidden,
     ModelCapabilityMismatch,
@@ -644,13 +674,14 @@ impl ExecutionFailureClass {
     /// has a code; being listed here means it then fails the catalog test until it has a string.
     /// **Add new variants to this array** — a variant omitted here is invisible to the gate, which
     /// is the one way this can still rot.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::InvalidExecutionRequest,
         Self::ApplicationUnavailable,
         Self::RouteNotFound,
         Self::RouteForbidden,
         Self::AgentProfileNotFound,
         Self::AgentProfileDisabled,
+        Self::SkillUnavailable,
         Self::ModelNotFound,
         Self::ModelForbidden,
         Self::ModelCapabilityMismatch,
@@ -694,6 +725,7 @@ impl ExecutionFailureClass {
             Self::RouteForbidden => "route_forbidden",
             Self::AgentProfileNotFound => "agent_profile_not_found",
             Self::AgentProfileDisabled => "agent_profile_disabled",
+            Self::SkillUnavailable => "skill_unavailable",
             Self::ModelNotFound => "model_not_found",
             Self::ModelForbidden => "model_forbidden",
             Self::ModelCapabilityMismatch => "model_capability_mismatch",

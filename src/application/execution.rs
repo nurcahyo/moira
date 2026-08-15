@@ -2,7 +2,10 @@ use std::{future::Future, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rig_core::completion::CompletionRequest;
+use rig_core::{
+    completion::{CompletionRequest, ToolDefinition},
+    tool::{ToolCallExtensions, ToolSet},
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{
@@ -24,7 +27,8 @@ use crate::{
         ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
         ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
         ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
-        RuntimeEventEnvelope, RuntimeEventType, UsageSummary,
+        RuntimeEventEnvelope, RuntimeEventType, SkillCredentialOutcome, SkillGuard,
+        SkillResolution, SkillUnusableReason, UsageSummary,
     },
     error::AppError,
     infra::{
@@ -32,12 +36,13 @@ use crate::{
         pg_rows::{credential_type_to_db, scope_type_to_db},
         repositories::{
             AdminRepository, ExecutionAttemptInsert, ExecutionAttemptUpdate, PgAdminRepository,
-            PgRuntimeRepository, RuntimeRepository, UsageRecordInsert,
+            PgAgentPlatformRepository, PgRuntimeRepository, RuntimeRepository, UsageRecordInsert,
         },
     },
     orchestration::{
         RigRuntimeFactory, RuntimeCacheKey, RuntimeFactory, RuntimeModelHandle, RuntimeStreamItem,
-        rig_chat_history,
+        SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolSpec, ToolCallRecord,
+        ToolLoopContext, ToolLoopFailure, build_skill_tool_set, rig_chat_history, run_tool_loop,
     },
     security::{Actor, ActorType, CredentialAadParts, SecretCipher, credential_aad},
 };
@@ -56,17 +61,26 @@ pub struct MoiraExecutionService {
     state: AppState,
     runtime_repo: PgRuntimeRepository,
     admin_repo: PgAdminRepository,
+    agent_platform_repo: PgAgentPlatformRepository,
     factory: RigRuntimeFactory,
 }
 
 impl MoiraExecutionService {
     pub fn new(state: AppState) -> Result<Self, AppError> {
         let pool = state.pool()?.clone();
+        let allow_chatgpt_subscription =
+            state.settings.provider_security.allow_chatgpt_subscription;
+        // Resolved before `state` moves into `Self`, and captured once for the same reason
+        // `allow_chatgpt_subscription` is: it is a deployment posture, not a per-request one.
+        let endpoint_policy = crate::security::ProviderEndpointPolicy::from_provider_security(
+            &state.settings.provider_security,
+        );
         Ok(Self {
             state,
             runtime_repo: PgRuntimeRepository::new(pool.clone()),
-            admin_repo: PgAdminRepository::new(pool),
-            factory: RigRuntimeFactory::new(),
+            admin_repo: PgAdminRepository::new(pool.clone()),
+            agent_platform_repo: PgAgentPlatformRepository::new(pool),
+            factory: RigRuntimeFactory::new(allow_chatgpt_subscription, endpoint_policy),
         })
     }
 
@@ -93,6 +107,8 @@ impl MoiraExecutionService {
             provider_hint: request.provider_id,
             model_hint: request.provider_model_id,
             credential_hint: request.credential_id,
+            // The diagnostic path never targets a profile directly — the route still names it.
+            agent_profile_hint: None,
             options,
             metadata: request.metadata,
         }
@@ -193,7 +209,15 @@ impl MoiraExecutionService {
         // runtime cannot use is refused here, before any provider is chosen, any credential is
         // decrypted and any attempt row is written — see `agent_profile_failure` for the
         // reasoning and for why the two answers carry different codes.
-        let agent_profile = match route.agent_profile_id {
+        //
+        // Issue #214 (plan 12 §3): a flow step or an eval case targets a specific agent profile
+        // directly (`command.agent_profile_hint`), not via the route. When present it overrides
+        // the route's own profile; route/model selection is untouched, only the profile's
+        // preamble/parameters/`skill_refs` change. The hint is a server-set field with no public
+        // request surface, so it needs no scope gate here — the runners in
+        // `application::flow_eval_execution` are trusted internal callers of this pipeline. The
+        // same fail-closed resolution and refusal path applies to the hinted id.
+        let agent_profile = match command.agent_profile_hint.or(route.agent_profile_id) {
             Some(id) => {
                 let resolution = AgentProfileResolution::classify(
                     self.runtime_repo.find_agent_profile_reference(id).await?,
@@ -229,6 +253,88 @@ impl MoiraExecutionService {
             }
             None => None,
         };
+
+        // Issue #84. Resolved once, before any candidate is chosen: the tool list belongs to
+        // the agent profile, not to whichever provider answers, and resolving it per attempt
+        // would re-decrypt every skill credential on every retry. It is also refused *here*,
+        // before a credential is decrypted or an attempt row is written, for the same reason
+        // the agent-profile refusal above is.
+        let skills = match self.resolve_agent_skills(agent_profile.as_ref()).await {
+            Ok(skills) => skills,
+            Err(failure) => {
+                self.audit_execution(&command, "execution.failed", AuditResult::Failed, &failure)
+                    .await?;
+                events.push(
+                    RuntimeEventType::ExecutionFailed,
+                    json!({ "failure_class": failure.class }),
+                );
+                return Ok(failed_outcome(
+                    command,
+                    Some(route),
+                    None,
+                    attempts,
+                    failure,
+                ));
+            }
+        };
+        // Two deliberate refusals rather than silent degradations, both recorded in
+        // `plans/12-feature-expansion-brainstorm.md` terms:
+        //
+        // * **Structured output + tools (finding F48).** `rig-core` drops `response_format`
+        //   whenever `tools` is non-empty and the history carries no tool result — silently,
+        //   with no warning — so a schema-carrying request against a tool-bearing profile
+        //   would come back as prose and fail as `StructuredOutputInvalid` one layer later,
+        //   naming the wrong cause. The unit guard
+        //   `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body` pins the
+        //   drop; this refuses the combination that would hit it.
+        // * **Streaming + tools.** The streamed path surfaces `ToolCallStarted`/`Delta`
+        //   items but has no way to feed a tool *result* back into a new stream, so tools on
+        //   a stream would be advertised and never satisfiable. Deferred deliberately rather
+        //   than half-built; see this file's `execute_rig_stream`.
+        if skills.has_tools() {
+            let refusal = if command.options.output_schema.is_some() {
+                Some(
+                    "structured output cannot be combined with agent skills yet: rig-core \
+                     drops the response schema whenever tools are advertised (finding F48)",
+                )
+            } else if command.options.stream {
+                Some(
+                    "agent skills are not available on the streaming execution path yet; \
+                     run this request without stream",
+                )
+            } else {
+                None
+            };
+            if let Some(message) = refusal {
+                let failure =
+                    ExecutionFailure::new(ExecutionFailureClass::InvalidExecutionRequest, message);
+                self.audit_execution(&command, "execution.failed", AuditResult::Failed, &failure)
+                    .await?;
+                events.push(
+                    RuntimeEventType::ExecutionFailed,
+                    json!({ "failure_class": failure.class }),
+                );
+                return Ok(failed_outcome(
+                    command,
+                    Some(route),
+                    None,
+                    attempts,
+                    failure,
+                ));
+            }
+        }
+
+        // Moira-authored, never serialized to the model, and never derived from a tool
+        // argument: a model can name any tenant it likes, so a skill's scoping has to come
+        // from the resolution Moira already performed. Keyed by `TypeId`, hence the
+        // newtype-shaped `SkillCallerScope` rather than bare strings.
+        let mut tool_extensions = ToolCallExtensions::new();
+        tool_extensions.insert(SkillCallerScope {
+            request_id: command.request_id.clone(),
+            execution_id: command.execution_id,
+            external_tenant_id: command.external_tenant_id.clone(),
+            application_id: command.application_id,
+        });
 
         let candidates = match DefaultModelRouter::new(&self.runtime_repo, &self.state)
             .select_candidates(&command, &policy, &route)
@@ -542,7 +648,11 @@ impl MoiraExecutionService {
                     }
                 };
 
-                let request = match build_completion_request(&command, agent_profile.as_ref()) {
+                let request = match build_completion_request(
+                    &command,
+                    agent_profile.as_ref(),
+                    &skills.definitions,
+                ) {
                     Ok(request) => request,
                     Err(failure) => {
                         drop(permits);
@@ -616,6 +726,28 @@ impl MoiraExecutionService {
                                 metrics: &self.state.metrics,
                                 provider_type: candidate.provider_type,
                                 attempt_started: started,
+                            },
+                        )
+                        .await
+                    } else if let Some(tools) = skills.tools.as_ref() {
+                        // The whole multi-turn sequence runs inside this one attempt: it
+                        // shares the attempt's timeout, its permit and its breaker entry,
+                        // because a tool loop that outlived any of the three would be a
+                        // second, unbounded execution wearing the first one's accounting.
+                        execute_rig_tool_loop(
+                            handle.clone(),
+                            request,
+                            ToolLoopContext {
+                                tools,
+                                definitions: &skills.definitions,
+                                guards: &skills.guards,
+                                caller_scopes: &command.identity.scopes,
+                                extensions: &tool_extensions,
+                                maximum_tool_turns: self
+                                    .state
+                                    .settings
+                                    .skill_execution
+                                    .maximum_tool_turns,
                             },
                         )
                         .await
@@ -891,6 +1023,7 @@ impl MoiraExecutionService {
                         for event in output.events {
                             events.push_existing(event);
                         }
+                        push_tool_result_events(events, attempt_id, &output.tool_calls);
                         events.push(
                             RuntimeEventType::ExecutionCompleted,
                             json!({ "attempt_id": attempt_id }),
@@ -909,7 +1042,11 @@ impl MoiraExecutionService {
                             failure: None,
                         });
                     }
-                    Ok(Err(FailedAttempt { failure, usage })) => {
+                    Ok(Err(FailedAttempt {
+                        failure,
+                        usage,
+                        tool_calls,
+                    })) => {
                         self.state
                             .circuits
                             .on_failure(
@@ -989,6 +1126,13 @@ impl MoiraExecutionService {
                             started,
                             usage,
                         ));
+                        // Emitted before the attempt's own failure event because that is the
+                        // order they happened in: a tool loop dispatches, and *then* runs out
+                        // of turns or loses the provider. Issue #252 — the failure arm used to
+                        // have no tool events at all, so an outbound `POST`/`DELETE` that had
+                        // already fired was invisible on every surface the moment the attempt
+                        // around it failed.
+                        push_tool_result_events(events, attempt_id, &tool_calls);
                         events.push(
                             RuntimeEventType::ProviderAttemptFailed,
                             json!({ "attempt_id": attempt_id, "failure_class": failure.class }),
@@ -1248,6 +1392,228 @@ impl MoiraExecutionService {
                 credential_type: record.credential_type,
                 source: credential.source,
             },
+        })
+    }
+
+    /// Turns the resolved agent profile's `skill_refs` into a live `ToolSet`, its wire
+    /// `ToolDefinition`s, and the guards evaluated before dispatch (issue #84, plan 12 §5).
+    ///
+    /// Runs **once per execution**, before the candidate loop: the tool list is a property
+    /// of the agent profile, not of the provider that happens to answer, and building it
+    /// per attempt would decrypt the same skill credentials on every retry.
+    ///
+    /// Fail-closed throughout. A `skill_refs` entry that does not resolve to an enabled,
+    /// complete row refuses the execution rather than quietly shrinking the tool list —
+    /// the same decision issue #79 took one level up for a dangling `agent_profile_id`,
+    /// and for the same reason: an agent silently missing a skill it was configured with
+    /// produces a wrong answer nobody is alerted to.
+    async fn resolve_agent_skills(
+        &self,
+        agent_profile: Option<&AgentProfileRecord>,
+    ) -> Result<ResolvedAgentSkills, ExecutionFailure> {
+        let Some(profile) = agent_profile else {
+            return Ok(ResolvedAgentSkills::default());
+        };
+        let bindings = self
+            .agent_platform_repo
+            .resolve_agent_skills(profile.id)
+            .await
+            .map_err(|_| {
+                ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    "agent skill lookup failed",
+                )
+            })?;
+        if bindings.is_empty() {
+            return Ok(ResolvedAgentSkills::default());
+        }
+
+        let mut specs = Vec::new();
+        let mut guards = Vec::new();
+        for binding in bindings {
+            match SkillResolution::classify(binding) {
+                SkillResolution::Guard { skill } => guards.push(SkillGuard::from_record(&skill)),
+                SkillResolution::Unusable { skill_id, reason } => {
+                    return Err(skill_unavailable_failure(profile, skill_id, reason));
+                }
+                SkillResolution::Tool { skill, executor } => {
+                    let credential = match executor.credential_id {
+                        Some(credential_id) => Some(
+                            self.skill_credential(
+                                profile,
+                                &skill.skill_key,
+                                credential_id,
+                                &executor.allowed_host,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
+                    specs.push(SkillToolSpec {
+                        skill_key: skill.skill_key.clone(),
+                        // Falls back to the display name so a tool is never advertised
+                        // with an empty description: that is the only guidance a model
+                        // gets beyond the parameter schema.
+                        description: skill
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| skill.display_name.clone()),
+                        params_schema: skill.params_schema.clone(),
+                        method: executor.method,
+                        url_template: executor.url_template.clone(),
+                        allowed_host: executor.allowed_host.clone(),
+                        header_template: executor.header_template.clone(),
+                        credential,
+                        timeout: Duration::from_millis(executor.timeout_ms.max(1) as u64),
+                        maximum_response_bytes: self
+                            .state
+                            .settings
+                            .skill_execution
+                            .maximum_response_bytes,
+                        outbound_policy: SkillOutboundPolicy {
+                            dns_timeout: Duration::from_millis(
+                                self.state.settings.skill_execution.dns_timeout_ms,
+                            ),
+                            allow_insecure: self
+                                .state
+                                .settings
+                                .skill_execution
+                                .allow_insecure_dev_urls,
+                        },
+                    });
+                }
+            }
+        }
+
+        let advertised = specs.len();
+        let maximum = self.state.settings.skill_execution.maximum_advertised_tools;
+        if advertised > maximum {
+            return Err(ExecutionFailure::new(
+                ExecutionFailureClass::SkillUnavailable,
+                format!(
+                    "agent profile '{}' advertises {advertised} skills, more than the \
+                     configured maximum of {maximum}",
+                    profile.profile_key
+                ),
+            ));
+        }
+
+        let (tools, definitions) =
+            build_skill_tool_set(specs, skill_http_client()?).map_err(|(skill_key, error)| {
+                ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' cannot advertise skill '{skill_key}': {}",
+                        profile.profile_key,
+                        error.as_str()
+                    ),
+                )
+            })?;
+        Ok(ResolvedAgentSkills {
+            tools: Some(tools),
+            definitions,
+            guards,
+        })
+    }
+
+    /// Resolves the credential a `skill_http_executors` row references.
+    ///
+    /// A row that names a credential and cannot get it is a refusal, never a fall-through
+    /// to an unauthenticated call: the operator attached that credential because the target
+    /// requires it, and calling without it would at best 401 and at worst succeed against
+    /// an endpoint that should have refused.
+    ///
+    /// `allowed_host` is the executor's SSRF-validated destination, and the credential is
+    /// only handed over when its owning provider is entitled to that host — see
+    /// [`crate::domain::credential_binding_permits_host`]. That rule is also enforced on the
+    /// admin write path (`application::agent_platform::patch_executor`); it is re-checked
+    /// here because a row written before the rule existed, or by anything that reaches the
+    /// table without going through that handler, would otherwise still send the secret.
+    ///
+    /// The owning provider must also still be live. Each of the three refusals below names a
+    /// different table, because each has a different remedy and an operator sent to the wrong
+    /// one finds nothing wrong there — `docs/agent-platform.md` carries the pre-deploy
+    /// inventory query that finds all three before an upgrade turns them into failures.
+    async fn skill_credential(
+        &self,
+        profile: &AgentProfileRecord,
+        skill_key: &str,
+        credential_id: Uuid,
+        allowed_host: &str,
+    ) -> Result<SkillCredential, ExecutionFailure> {
+        let outcome = self
+            .agent_platform_repo
+            .resolve_skill_credential(&self.state.cipher, credential_id, allowed_host)
+            .await
+            .map_err(|_| {
+                ExecutionFailure::new(
+                    ExecutionFailureClass::CredentialDecryptionFailed,
+                    "skill credential could not be decrypted",
+                )
+            })?;
+        let resolved = match outcome {
+            SkillCredentialOutcome::Resolved(resolved) => resolved,
+            SkillCredentialOutcome::Unusable => {
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::CredentialNotFound,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} is missing, expired or revoked",
+                        profile.profile_key
+                    ),
+                ));
+            }
+            SkillCredentialOutcome::ProviderDeleted => {
+                // Not `CredentialNotFound`, and not the "missing, expired or revoked" wording
+                // above: the `provider_credentials` row is active, unexpired and present, and
+                // an operator sent to look at it finds nothing wrong. What changed is one
+                // table over. Same class as `HostNotEntitled` because the remedy has the same
+                // shape — an admin-plane edit — and the same reason for being fail-closed: a
+                // provider nobody can see must not keep having its secrets sent.
+                tracing::warn!(
+                    profile_key = %profile.profile_key,
+                    skill_key,
+                    %credential_id,
+                    allowed_host,
+                    "refusing to send a skill credential whose owning provider is soft-deleted"
+                );
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} belongs to a provider that has been deleted; the \
+                         credential itself is still live",
+                        profile.profile_key
+                    ),
+                ));
+            }
+            SkillCredentialOutcome::HostNotEntitled => {
+                // `SkillUnavailable`, not `CredentialNotFound`: the credential is fine, the
+                // binding is not, and the remedy is an admin-plane edit to the skill rather
+                // than anything to do with the credential row. The public code carries no
+                // detail — the server-side message below is where an operator reads why.
+                tracing::warn!(
+                    profile_key = %profile.profile_key,
+                    skill_key,
+                    %credential_id,
+                    allowed_host,
+                    "refusing to send a skill credential to a host its provider does not \
+                     declare as its base_url"
+                );
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} belongs to a provider that does not declare \
+                         '{allowed_host}' as its base_url",
+                        profile.profile_key
+                    ),
+                ));
+            }
+        };
+        Ok(SkillCredential {
+            credential_type: resolved.credential_type,
+            secret: resolved.secret,
         })
     }
 
@@ -1771,13 +2137,20 @@ struct EffectiveRuntimePolicy {
     max_retries: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ExecutionRunOutput {
     text: String,
     structured_output: Option<Value>,
     usage: UsageSummary,
     provider_request_id: Option<String>,
     events: Vec<RuntimeEventEnvelope>,
+    /// Issue #84 — what the tool loop dispatched, in call order.
+    ///
+    /// Carried back rather than emitted inside the loop so `orchestration::skill_tool`
+    /// never has to hold the `EventCollector`: the Rig seam stays Rig primitives, and the
+    /// runtime-event vocabulary stays in this module (the same boundary F44 restored when
+    /// the duplicate stream drain was deleted). Always empty on the non-tool paths.
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 struct EventCollector {
@@ -2104,9 +2477,20 @@ fn structured_output_from_text(
 /// `insert_usage_record` is skipped on. Every failure raised before or instead of a complete
 /// reply keeps that default through the [`From`] impl below, so `?` still means "no reply, so
 /// nothing measured" and only a site with real counts in hand has to say so.
+///
+/// # Why the tool calls travel with it too
+///
+/// Issue #84 added the second thing a failed attempt can leave behind: a tool loop dispatches
+/// real outbound HTTP against an operator's third-party API — `HttpMethod` admits `Post`,
+/// `Put`, `Patch` and `Delete` — and then may fail on a later turn. Those mutations happened;
+/// carrying their [`ToolCallRecord`]s here is what lets the failure arm emit the same
+/// `ToolResult` runtime events the success arm does, so a `DELETE` that fired is auditable
+/// instead of invisible. Empty for every path that dispatched nothing, which is all of them
+/// but the tool loop.
 struct FailedAttempt {
     failure: ExecutionFailure,
     usage: UsageSummary,
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 impl From<ExecutionFailure> for FailedAttempt {
@@ -2114,7 +2498,37 @@ impl From<ExecutionFailure> for FailedAttempt {
         Self {
             failure,
             usage: UsageSummary::default(),
+            tool_calls: Vec::new(),
         }
+    }
+}
+
+/// Issue #84. One `ToolResult` per dispatched call, carrying the classification and nothing
+/// else: no arguments (model-authored), no output (target-authored, possibly a credential
+/// echo), and no URL. All four tool event types are filtered out of the public SSE stream by
+/// `map_runtime_event`, so these stay on the runtime-event and audit surfaces where an
+/// operator can see them.
+///
+/// Shared by the success and the failure arm rather than written twice: the records mean the
+/// same thing on both, and the failure arm is the one where an operator most needs them
+/// (issue #252 — a mutation that fired and then lost its attempt).
+fn push_tool_result_events(
+    events: &mut EventCollector,
+    attempt_id: Uuid,
+    tool_calls: &[ToolCallRecord],
+) {
+    for tool_call in tool_calls {
+        events.push(
+            RuntimeEventType::ToolResult,
+            json!({
+                "attempt_id": attempt_id,
+                "tool_name": tool_call.tool_name,
+                "outcome": tool_call.outcome,
+                "failure_kind": tool_call.failure_kind,
+                "guard_key": tool_call.guard_key,
+                "guard_reason": tool_call.guard_reason,
+            }),
+        );
     }
 }
 
@@ -2147,6 +2561,7 @@ async fn execute_rig_completion(
             return Err(FailedAttempt {
                 failure,
                 usage: output.usage,
+                tool_calls: Vec::new(),
             });
         }
     };
@@ -2155,8 +2570,53 @@ async fn execute_rig_completion(
         structured_output,
         usage: output.usage,
         provider_request_id: output.provider_request_id,
-        events: Vec::new(),
+        ..ExecutionRunOutput::default()
     })
+}
+
+/// The tool-bearing counterpart of [`execute_rig_completion`] (issue #84).
+///
+/// A separate arm rather than a branch inside that function because the two have different
+/// shapes: this one issues *several* provider calls, and the whole multi-turn sequence is
+/// what the attempt's timeout, permit and circuit-breaker entry cover. It is deliberately
+/// not reachable with an `output_schema` — `execute_inner` refuses that combination before
+/// a candidate is chosen (finding F48) — so `structured_output` is always `None` here.
+///
+/// **On success, usage is the final turn's, not a sum.** `UsageSummary` feeds `usage_records`,
+/// whose rows are per attempt, and `usage_from_rig` is the only sanctioned source either way.
+/// The under-count on that path is real and is filed separately (issue #252 finding 4); it is
+/// not what the failure arm below does, because a failed loop has no final turn to report and
+/// reporting nothing was the actual hole.
+///
+/// **On failure, both the counts and the dispatch records survive.** A bare `?` here dropped
+/// them: a loop that made four billed completions and issued four outbound calls reported
+/// `UsageSummary::default()` — read as *unknown*, so `usage_records` skipped the row entirely
+/// — and no `ToolResult` event anywhere. Same correction, and same reason, as the
+/// `execute_rig_completion` arm above.
+async fn execute_rig_tool_loop(
+    handle: Arc<RuntimeModelHandle>,
+    request: CompletionRequest,
+    context: ToolLoopContext<'_>,
+) -> Result<ExecutionRunOutput, FailedAttempt> {
+    match run_tool_loop(&handle, request, context).await {
+        Ok(outcome) => Ok(ExecutionRunOutput {
+            text: outcome.text,
+            structured_output: None,
+            usage: outcome.usage,
+            provider_request_id: outcome.provider_request_id,
+            events: Vec::new(),
+            tool_calls: outcome.tool_calls,
+        }),
+        Err(ToolLoopFailure {
+            failure,
+            usage,
+            tool_calls,
+        }) => Err(FailedAttempt {
+            failure,
+            usage,
+            tool_calls,
+        }),
+    }
 }
 
 /// Everything the streaming path needs to record time-to-first-token, grouped so the
@@ -2356,14 +2816,22 @@ async fn execute_rig_stream(
     // invoice for this call either way.
     let structured_output = match structured_output_from_text(wants_structured, &text) {
         Ok(structured_output) => structured_output,
-        Err(failure) => return Err(FailedAttempt { failure, usage }),
+        // The streamed path advertises no tools (`execute_inner` refuses the combination),
+        // so there is never a dispatch record to carry here.
+        Err(failure) => {
+            return Err(FailedAttempt {
+                failure,
+                usage,
+                tool_calls: Vec::new(),
+            });
+        }
     };
     Ok(ExecutionRunOutput {
         text,
         structured_output,
         usage,
         provider_request_id,
-        events: Vec::new(),
+        ..ExecutionRunOutput::default()
     })
 }
 
@@ -2374,9 +2842,21 @@ fn cancelled_failure() -> ExecutionFailure {
     )
 }
 
+/// Builds the request one attempt sends.
+///
+/// `tool_definitions` is the agent profile's resolved `skill_refs` (issue #84) and is the
+/// **only** thing that can put tools on the wire. In particular `AgentProfileRecord`'s
+/// `tool_policy` column is still not read here: it is an unspecified placeholder from
+/// migration 0005, and the pinned guards
+/// (`an_agent_profiles_tool_policy_does_not_become_a_tool_list_on_the_wire` in
+/// `tests/agent_profile_wire.rs`, and this module's
+/// `moiras_request_still_carries_its_schema_onto_rigs_openai_wire_body`) hold it that way
+/// on purpose — plan 12 risk R16 records that wiring tools means changing those tests
+/// deliberately, which is what the `skill_refs` half of each of them now does.
 fn build_completion_request(
     command: &ExecutionCommand,
     agent_profile: Option<&AgentProfileRecord>,
+    tool_definitions: &[ToolDefinition],
 ) -> Result<CompletionRequest, ExecutionFailure> {
     let chat_history = rig_chat_history(&command.messages)?;
     let output_schema = command
@@ -2396,7 +2876,7 @@ fn build_completion_request(
         preamble: agent_profile.and_then(|profile| profile.preamble.clone()),
         chat_history,
         documents: Vec::new(),
-        tools: Vec::new(),
+        tools: tool_definitions.to_vec(),
         temperature: command
             .options
             .temperature
@@ -2478,6 +2958,84 @@ fn usage_reported_by(attempts: &[ProviderAttemptSummary]) -> UsageSummary {
 /// without being given access to the server's logs.** None of it is a secret: these are
 /// configuration identifiers already visible on the admin plane, and the profile's `preamble` —
 /// the one field that could carry sensitive prompt content — is deliberately not here.
+/// Everything an agent profile's `skill_refs` contributed to this execution (issue #84).
+///
+/// `tools` is `Option` rather than an always-present empty `ToolSet` because `ToolSet` is
+/// not `Clone` and the distinction is load-bearing anyway: `None` means "this execution has
+/// no tools", which is the state every request had before this issue and the state
+/// `build_completion_request` must keep producing an empty `tools` vector for.
+#[derive(Default)]
+struct ResolvedAgentSkills {
+    tools: Option<ToolSet>,
+    /// What goes onto the wire, in `skill_refs` order.
+    definitions: Vec<ToolDefinition>,
+    /// Enabled `kind = 'guard'` skills, evaluated before every dispatch.
+    guards: Vec<SkillGuard>,
+}
+
+impl ResolvedAgentSkills {
+    fn has_tools(&self) -> bool {
+        !self.definitions.is_empty()
+    }
+}
+
+/// The outbound client skill calls use.
+///
+/// **Built per tool-bearing execution rather than shared on `AppState`, and it must not be
+/// `state.http`.** That client keeps `reqwest`'s default `Policy::limited(10)`, and a
+/// redirect is precisely how a validated public skill host reaches private space after
+/// [`crate::orchestration::HttpSkillTool`]'s execution-time check has already passed — the
+/// same hole `OutboundUrlPolicy::allowed_hosts` documents for the image path, except here
+/// Moira *does* make the request and so can close it outright. `Policy::none()` is that
+/// closure: a 3xx becomes an ordinary response the tool reports rather than a second
+/// request to an address nothing validated.
+///
+/// The cost is one client construction per execution that actually has skills; executions
+/// without skills never call this. Reversal condition: if skill-bearing executions become
+/// hot enough for the connection pool to matter, move this onto `AppState` as a second
+/// named client — not by reusing `state.http`, which would reintroduce the redirect.
+fn skill_http_client() -> Result<reqwest::Client, ExecutionFailure> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            ExecutionFailure::new(
+                ExecutionFailureClass::InternalError,
+                "skill http client could not be built",
+            )
+        })
+}
+
+/// The refusal a `skill_refs` entry that cannot be used produces.
+///
+/// The server-side message names the profile, the skill id and the reason so an operator
+/// can act on it; the caller only ever sees the class's public code, because a message that
+/// confirmed which skill ids exist would let a caller enumerate the registry.
+fn skill_unavailable_failure(
+    profile: &AgentProfileRecord,
+    skill_id: Uuid,
+    reason: SkillUnusableReason,
+) -> ExecutionFailure {
+    let remedy = match reason {
+        SkillUnusableReason::Missing => {
+            "no live skill has that id; create the skill or remove the reference"
+        }
+        SkillUnusableReason::NotEnabled => {
+            "that skill is not enabled; enable it or remove the reference"
+        }
+        SkillUnusableReason::NoExecutor => {
+            "that tool skill has no HTTP executor; configure one or remove the reference"
+        }
+    };
+    ExecutionFailure::new(
+        ExecutionFailureClass::SkillUnavailable,
+        format!(
+            "agent profile '{}' references skill {skill_id}: {remedy}",
+            profile.profile_key
+        ),
+    )
+}
+
 fn agent_profile_failure(
     route: &RouteDecision,
     agent_profile_id: Uuid,
@@ -2596,11 +3154,23 @@ const STRUCTURED_OUTPUT_CAPABILITY: &str = "structured_output";
 /// `output_schema` natively onto their own request shapes (`anthropic/completion.rs`
 /// `output_config`, `gemini/completion.rs` `generation_config`) and expose no constant to read.
 /// `true` is restated for those two and pinned by
-/// `the_two_native_providers_still_map_output_schema` below; that test is the thing that reds if
-/// a bump makes the restatement false.
+/// `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else` below; that
+/// test is the thing that reds if a bump makes the restatement false.
 ///
 /// `Custom` never constructs a model at all — `build_completion_model` returns
 /// `AppError::Config` — so no schema can reach any provider on that arm.
+///
+/// **`ChatgptOauth` (issue #216) is `false` for a third, distinct reason from `Custom` and
+/// `DeepSeek`: it *does* construct a real model, on the same Responses-API engine `openai`
+/// itself uses (`openai::responses_api::GenericResponsesCompletionModel<ChatGPTExt, H>`), and
+/// that engine populates `output_schema` onto `additional_parameters.text`
+/// (`responses_api/mod.rs:1202-1214`). But `chatgpt::ResponsesCompletionModel::create_request`
+/// unconditionally wipes it straight back out —
+/// `request.additional_parameters.text = None;` (`rig-core-0.40.0/src/providers/chatgpt/mod.rs:415`)
+/// — alongside `temperature`, `max_output_tokens`, and several other fields, on every request,
+/// with no `warn!` at all. `SUPPORTS_RESPONSE_FORMAT` cannot be read for it (`ChatGPTExt` does
+/// not implement `OpenAICompatibleProvider` — it is not on the chat-completions engine), so this
+/// has to be a restated `false`, not a read-from-Rig `true`/`false` like the OpenAI family.
 fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
     use rig_core::providers::openai::OpenAICompatibleProvider;
 
@@ -2615,7 +3185,7 @@ fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
             <rig_core::providers::deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
         }
         ProviderType::Anthropic | ProviderType::Gemini => true,
-        ProviderType::Custom => false,
+        ProviderType::Custom | ProviderType::ChatgptOauth => false,
     }
 }
 
@@ -2685,6 +3255,11 @@ fn supported_credential_types(
         ProviderType::Anthropic | ProviderType::Gemini | ProviderType::DeepSeek => {
             &[CredentialType::ApiKey]
         }
+        // Mirrors workstream B's Claude subscription-token storage: the ChatGPT/Codex
+        // subscription access token lives in the same `credential_type = 'oauth2'` shape,
+        // `secret_from_credential_payload` reading it out of the `"access_token"` field
+        // (`crate::security::credential_secret_field`).
+        ProviderType::ChatgptOauth => &[CredentialType::Oauth2],
         ProviderType::Custom => &[],
     }
 }
@@ -3064,6 +3639,11 @@ mod tests {
             !provider_emits_output_schema(ProviderType::Custom),
             "custom providers never construct a model, so no schema can reach a wire"
         );
+        assert!(
+            !provider_emits_output_schema(ProviderType::ChatgptOauth),
+            "rig-core changed: chatgpt::ResponsesCompletionModel::create_request no longer wipes \
+             additional_parameters.text — re-read the chatgpt wire-shape review (issue #216)"
+        );
         for provider_type in [
             ProviderType::OpenAi,
             ProviderType::OpenAiCompatible,
@@ -3193,6 +3773,7 @@ mod tests {
                 provider_hint: None,
                 model_hint: None,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options: ExecutionOptions {
                     stream,
                     output_schema: Some(json!({
@@ -3208,11 +3789,16 @@ mod tests {
                 metadata: json!({ "moira": { "purpose": "f48_guard" } }),
             };
 
-            let request = build_completion_request(&command, Some(&profile))
+            let request = build_completion_request(&command, Some(&profile), &[])
                 .expect("the guard's own request must be buildable");
             assert!(
                 request.output_schema.is_some(),
                 "the fixture must actually carry a schema, or this guard proves nothing"
+            );
+            assert!(
+                request.tools.is_empty(),
+                "issue #84 kept `tool_policy` unread: only resolved `skill_refs` may put \
+                 tools on the wire, and this fixture supplies none"
             );
 
             let wire = OpenAiWireRequest::try_from(("gpt-4o".to_string(), request))
@@ -3230,6 +3816,122 @@ mod tests {
         }
     }
 
+    /// **Issue #84 — the other half of F48, and the reason the guard above still passes.**
+    ///
+    /// Plan 12 risk R16 says wiring real tool content means touching the pinned guards
+    /// deliberately. This is that touch, and it deliberately does *not* weaken the case
+    /// above: that one proves `tool_policy` alone still produces no tools and the schema
+    /// survives; this one proves resolved `skill_refs` **do** produce a tool list, and
+    /// then demonstrates on Rig's own encoder exactly what F48 predicted would happen if
+    /// the two were ever combined — `response_format` disappears, silently.
+    ///
+    /// That demonstration is why `execute_inner` refuses the combination outright rather
+    /// than sending it: the request would come back as prose and fail one layer later as
+    /// `StructuredOutputInvalid`, naming the caller's schema for a drop rig-core performed.
+    /// If a future rig-core lifts the restriction, this case goes red on the second
+    /// assertion and the refusal in `execute_inner` can be removed with evidence.
+    #[test]
+    fn resolved_skill_refs_do_reach_the_wire_and_take_the_schema_with_them() {
+        use rig_core::providers::openai::completion::CompletionRequest as OpenAiWireRequest;
+
+        let profile = AgentProfileRecord {
+            id: Uuid::now_v7(),
+            profile_key: "issue-84".to_string(),
+            display_name: "Issue 84".to_string(),
+            preamble: None,
+            temperature: None,
+            max_tokens: None,
+            // Populated exactly as in the guard above, and still ignored: the tools below
+            // come from `skill_refs` resolution, which is a different input entirely.
+            tool_policy: json!({
+                "tools": [{ "name": "from_tool_policy", "parameters": {} }]
+            }),
+            context_policy: Value::Null,
+            memory_policy: Value::Null,
+            status: crate::domain::ResourceStatus::Active,
+            metadata: Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+            version: 1,
+        };
+        let definitions = vec![ToolDefinition {
+            name: "orders_get".to_string(),
+            description: "look an order up".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "order_id": { "type": "string" } },
+                "required": ["order_id"]
+            }),
+        }];
+
+        let command = ExecutionCommand {
+            request_id: "issue-84".to_string(),
+            execution_id: Uuid::now_v7(),
+            identity: CallerRuntimeIdentity {
+                actor_type: format!("{:?}", ActorType::SystemKey),
+                subject: None,
+                external_user_id: None,
+                external_tenant_id: None,
+                application_id: None,
+                scopes: vec!["moira:admin".to_string()],
+            },
+            application_id: None,
+            external_tenant_id: None,
+            external_user_id: None,
+            messages: vec![DomainMessage::user("hello")],
+            route_hint: None,
+            provider_hint: None,
+            model_hint: None,
+            credential_hint: None,
+            agent_profile_hint: None,
+            options: ExecutionOptions {
+                output_schema: Some(json!({
+                    "title": "Answer",
+                    "type": "object",
+                    "properties": { "a": { "type": "integer" } },
+                    "required": ["a"]
+                })),
+                ..ExecutionOptions::default()
+            },
+            metadata: json!({ "moira": { "purpose": "issue_84" } }),
+        };
+
+        let request = build_completion_request(&command, Some(&profile), &definitions)
+            .expect("a skill-bearing request must be buildable");
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orders_get"],
+            "resolved skill_refs must reach CompletionRequest.tools, and nothing derived \
+             from tool_policy may join them"
+        );
+
+        let wire = OpenAiWireRequest::try_from(("gpt-4o".to_string(), request))
+            .expect("rig-core must encode a tool-bearing request");
+        assert_eq!(
+            wire.tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["orders_get"],
+            "the tool list must survive rig-core's own encoder onto the wire"
+        );
+        assert!(
+            wire.additional_params
+                .unwrap_or(Value::Null)
+                .get("response_format")
+                .is_none(),
+            "finding F48 is still live: rig-core is expected to drop response_format on \
+             turn 1 whenever tools are advertised, which is why execute_inner refuses \
+             output_schema + skills instead of sending this request. If this assertion \
+             fails, rig-core changed and that refusal can go."
+        );
+    }
+
     #[test]
     fn provider_credential_types_match_runtime_factory_support() {
         use crate::domain::CredentialType;
@@ -3241,6 +3943,10 @@ mod tests {
         assert_eq!(
             supported_credential_types(ProviderType::OpenAiCompatible),
             &[CredentialType::ApiKey, CredentialType::BearerToken]
+        );
+        assert_eq!(
+            supported_credential_types(ProviderType::ChatgptOauth),
+            &[CredentialType::Oauth2]
         );
     }
 
@@ -3278,6 +3984,7 @@ mod tests {
             provider_hint: Some(Uuid::now_v7()),
             model_hint: Some(Uuid::now_v7()),
             credential_hint: Some(Uuid::now_v7()),
+            agent_profile_hint: None,
             options: ExecutionOptions::default(),
             metadata: Value::Null,
         };
@@ -3308,6 +4015,7 @@ mod tests {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions::default(),
             metadata: Value::Null,
         };
@@ -3591,6 +4299,7 @@ mod tests {
                 provider_hint,
                 model_hint,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options: ExecutionOptions::default(),
                 metadata: Value::Null,
             }
@@ -3722,6 +4431,7 @@ mod tests {
                 provider_hint: None,
                 model_hint: None,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options,
                 metadata: Value::Null,
             }
