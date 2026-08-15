@@ -929,6 +929,162 @@ async fn a_model_that_never_stops_calling_tools_exhausts_the_turn_budget() {
     fixture.shutdown().await;
 }
 
+/// **A loop that runs out of turns still owes an account of what it did (issue #252).**
+///
+/// The turn-budget exit above is the failure that discards the most: by the time it fires,
+/// `maximum_tool_turns` provider calls have been made and billed, and every tool call they
+/// asked for has already left the process as real outbound HTTP — `HttpMethod` admits `POST`,
+/// `PUT`, `PATCH` and `DELETE`, so those can be mutations of an operator's third-party API.
+/// Returning a bare `ExecutionFailure` dropped both facts: no `ToolResult` event named the
+/// dispatches, and the attempt recorded `UsageSummary::default()`, which means *unknown* and
+/// so skipped the `usage_records` row entirely — four calls invoiced, none metered.
+///
+/// Deliberately not asserted here: *how many* dispatches there should be. The last permitted
+/// turn dispatching at all is its own question (issue #252 finding 3); what this case pins is
+/// that every dispatch which did happen is accounted for.
+#[tokio::test]
+async fn an_exhausted_turn_budget_still_reports_its_tool_calls_and_its_tokens() {
+    let scripts = (0..8)
+        .map(|index| ProviderScript::ToolCallCompletion {
+            call_id: format!("call_{index}"),
+            name: "orders_get".to_string(),
+            arguments: json!({ "order_id": format!("B-{index}") }),
+        })
+        .collect();
+    let Some(fixture) = SkillFixture::new(scripts, json!({ "state": "shipped" })).await else {
+        return;
+    };
+    fixture
+        .seed_skill(SkillSeed::tool("orders_get", "/orders/{order_id}"))
+        .await;
+
+    let (outcome, events) = fixture.execute_with_events().await;
+    assert_eq!(
+        outcome.failure.as_ref().map(|failure| failure.class),
+        Some(ExecutionFailureClass::DeadlineExceeded),
+        "{:?}",
+        outcome.failure
+    );
+
+    let dispatched = fixture.target.calls().len();
+    assert!(
+        dispatched > 0,
+        "the scenario is only meaningful if the loop really called the target"
+    );
+    let tool_results: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.payload.get("tool_name").is_some())
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(
+        tool_results.len(),
+        dispatched,
+        "every request that reached the target must be on the runtime-event surface, even \
+         though the attempt around it failed: {events:?}"
+    );
+    assert!(
+        tool_results
+            .iter()
+            .all(|payload| payload["outcome"] == "success"),
+        "{tool_results:?}"
+    );
+
+    // Four completions at prompt 4 / completion 2 each — the scripted mock's fixed figures,
+    // so the total is arithmetic rather than a guess.
+    let attempt = outcome.attempts.first().expect("one attempt was made");
+    assert_eq!(
+        attempt.usage.total_tokens,
+        Some(24),
+        "the four billed completions must be metered, not recorded as unknown: {:?}",
+        attempt.usage
+    );
+    assert_eq!(attempt.usage.input_tokens, Some(16), "{:?}", attempt.usage);
+    assert_eq!(attempt.usage.output_tokens, Some(8), "{:?}", attempt.usage);
+    assert_eq!(
+        outcome.usage.total_tokens,
+        Some(24),
+        "the outcome reports what its own attempts reported"
+    );
+
+    let metered: i64 =
+        sqlx::query_scalar("select count(*) from usage_records where execution_id = $1")
+            .bind(outcome.execution_id)
+            .fetch_one(&fixture.fixture.pool)
+            .await
+            .expect("count usage records");
+    assert_eq!(
+        metered, 1,
+        "an all-`None` usage skips `insert_usage_record`, so dropping the counts also dropped \
+         the billing row for four calls the provider will invoice"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// **The other failure exit: the provider dies on a later turn.**
+///
+/// Turn 1 asks for the tool and the request really is issued; turn 2 answers `400`, which ends
+/// the attempt. The tool call is already spent and turn 1 is already billed, and both used to
+/// vanish with the `?` that propagated the provider's failure.
+#[tokio::test]
+async fn a_provider_failure_mid_loop_keeps_the_turn_it_already_spent() {
+    let Some(fixture) = SkillFixture::new(
+        vec![
+            ProviderScript::ToolCallCompletion {
+                call_id: "call_1".to_string(),
+                name: "orders_get".to_string(),
+                arguments: json!({ "order_id": "C-1" }),
+            },
+            ProviderScript::HttpError {
+                status: StatusCode::BAD_REQUEST,
+                body: json!({ "error": { "message": "no" } }).to_string(),
+            },
+        ],
+        json!({ "state": "shipped" }),
+    )
+    .await
+    else {
+        return;
+    };
+    fixture
+        .seed_skill(SkillSeed::tool("orders_get", "/orders/{order_id}"))
+        .await;
+
+    let (outcome, events) = fixture.execute_with_events().await;
+    assert_eq!(
+        outcome.status,
+        ExecutionStatus::Failed,
+        "{:?}",
+        outcome.failure
+    );
+    assert_eq!(
+        fixture.target.calls().len(),
+        1,
+        "turn 1's tool call really did reach the target before the provider failed"
+    );
+
+    let tool_results: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.payload.get("tool_name").is_some())
+        .map(|event| &event.payload)
+        .collect();
+    assert_eq!(
+        tool_results.len(),
+        1,
+        "the dispatch survives the provider failure that followed it: {events:?}"
+    );
+
+    let attempt = outcome.attempts.first().expect("one attempt was made");
+    assert_eq!(
+        attempt.usage.total_tokens,
+        Some(6),
+        "turn 1 answered and was billed; only turn 2 failed: {:?}",
+        attempt.usage
+    );
+
+    fixture.shutdown().await;
+}
+
 /// **Structured output plus skills is refused, not silently mangled (finding F48).**
 ///
 /// `rig-core` drops `response_format` whenever tools are advertised on turn 1, with no

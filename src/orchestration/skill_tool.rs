@@ -30,10 +30,24 @@
 //! In-band by default, per `.agents/skills/moira-rig-tools/SKILL.md`: a refusal or an
 //! upstream error becomes a classified `ToolFailure` whose `model_output` the model sees
 //! and can recover from within the same execution. Only conditions that make the whole
-//! attempt impossible (an exhausted turn budget, cancellation) become an `ExecutionFailure`.
+//! attempt impossible (an exhausted turn budget, cancellation) become an `ExecutionFailure`
+//! — and that one carries what the loop already spent and dispatched, see [`ToolLoopFailure`].
+//!
+//! # A retried attempt replays the tool calls
+//!
+//! `ProviderTimeout` and `ProviderConnectionFailed` are retryable and fallback-eligible
+//! (`orchestration::controls`), so a provider failure on turn 3 fails the attempt and
+//! `application::execution` starts a fresh one — with an empty history, so the model
+//! re-issues the calls the previous attempt already dispatched. The only correlator sent is
+//! `x-request-id`, which is request correlation and not an idempotency key, and nothing
+//! obliges a target to honour it. **A skill executor whose method carries a body must
+//! therefore be idempotent.** Moira cannot enforce that on a third-party endpoint; what it
+//! can do, and now does, is keep the record of every dispatch that did happen even when the
+//! attempt around it failed.
 
 use std::{collections::HashSet, time::Duration};
 
+use futures_util::StreamExt;
 use rig_core::{
     OneOrMany,
     completion::{
@@ -51,7 +65,7 @@ use uuid::Uuid;
 use crate::{
     domain::{
         CredentialType, ExecutionFailure, ExecutionFailureClass, GuardContext, GuardVerdict,
-        HttpMethod, SkillGuard, evaluate_guards,
+        HttpMethod, SkillGuard, UsageSummary, evaluate_guards,
     },
     orchestration::RuntimeModelHandle,
     security::{OutboundUrlPolicy, SystemResolver, validate_outbound_url},
@@ -378,22 +392,26 @@ impl Tool for HttpSkillTool {
             })?;
 
         let status = response.status();
-        let bytes = tokio::time::timeout(self.spec.timeout, response.bytes())
-            .await
-            .map_err(|_| SkillToolError::Timeout)?
-            .map_err(|_| SkillToolError::ResponseUnreadable)?;
-        let truncated = bytes.len() > self.spec.maximum_response_bytes;
-        let bounded = &bytes[..bytes.len().min(self.spec.maximum_response_bytes)];
-        let text = String::from_utf8_lossy(bounded).into_owned();
-
         if !status.is_success() {
             // The body is deliberately dropped rather than forwarded: an upstream error
             // body is the classic place a target echoes back the `Authorization` header it
             // was sent. Class and status only, same posture as the Rig boundary.
+            //
+            // Decided *before* the body is read, not after: nothing here will ever look at
+            // those bytes, so reading them would be pure cost. Dropping `response` unread
+            // ends the transfer.
             return Err(SkillToolError::Upstream {
                 status: status.as_u16(),
             });
         }
+
+        let (text, truncated) = tokio::time::timeout(
+            self.spec.timeout,
+            read_bounded_body(response, self.spec.maximum_response_bytes),
+        )
+        .await
+        .map_err(|_| SkillToolError::Timeout)?
+        .map_err(|_| SkillToolError::ResponseUnreadable)?;
 
         let body = if truncated {
             Value::String(text)
@@ -426,6 +444,43 @@ impl Tool for HttpSkillTool {
             SkillToolError::ResponseUnreadable => ToolFailure::provider(error.to_string()),
         }
     }
+}
+
+/// Reads at most `maximum_bytes` of a response body, and stops pulling once it has them.
+///
+/// **`maximum_response_bytes` is a memory bound, not a formatting rule.** The obvious
+/// spelling — `response.bytes().await` and slice afterwards — buffers the *whole* body first,
+/// so a target answering 200 with a 2 GB chunked stream puts 2 GB on the heap before the
+/// ceiling is consulted, and `spec.timeout` does not help because it bounds duration, not
+/// bytes. `security::ssrf::fetch_jwks_hardened` already carries that warning verbatim for a
+/// URL an admin configured; a skill target is less trusted than that, and this is the same
+/// counter.
+///
+/// Returning at the ceiling drops the stream, which ends the transfer mid-body. No
+/// `Content-Length` pre-check: a declared over-cap length is not an error here, it is exactly
+/// the truncation `SkillCallOutput::truncated` exists to report, and refusing it would turn a
+/// body that used to be usable-but-partial into a failed tool call.
+async fn read_bounded_body(
+    response: reqwest::Response,
+    maximum_bytes: usize,
+) -> Result<(String, bool), reqwest::Error> {
+    let mut stream = response.bytes_stream();
+    let mut buffered: Vec<u8> = Vec::with_capacity(maximum_bytes.min(8 * 1024));
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = maximum_bytes.saturating_sub(buffered.len());
+        if chunk.len() > remaining {
+            // Kept byte-for-byte identical to what the buffer-then-slice version produced,
+            // so only the memory ceiling moves: the first `maximum_bytes` bytes, flagged.
+            buffered.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    drop(stream);
+    Ok((String::from_utf8_lossy(&buffered).into_owned(), truncated))
 }
 
 fn reqwest_method(method: HttpMethod) -> reqwest::Method {
@@ -671,11 +726,70 @@ pub struct ToolCallRecord {
 #[derive(Debug)]
 pub struct ToolLoopOutcome {
     pub text: String,
-    pub usage: crate::domain::UsageSummary,
+    pub usage: UsageSummary,
     pub provider_request_id: Option<String>,
     /// Model calls made, including the final one that produced `text`.
     pub turns: usize,
     pub tool_calls: Vec<ToolCallRecord>,
+}
+
+/// A tool loop that could not finish, **plus everything it had already spent and done**.
+///
+/// A bare [`ExecutionFailure`] was wrong here for the same reason it was wrong on the
+/// structured-output path (`application::execution::FailedAttempt`, issue #80): by the time
+/// this loop fails it may have made several billed provider calls and dispatched real
+/// outbound requests, and `HttpMethod` admits `Post`/`Put`/`Patch`/`Delete`. Dropping the
+/// records left a mutation of an operator's third-party API with no trace on any surface —
+/// no runtime event, no attempt metadata — and dropping the counts billed those provider
+/// calls as `UsageSummary::default()`, which reads as *unknown* and skips the
+/// `usage_records` row entirely.
+#[derive(Debug)]
+pub struct ToolLoopFailure {
+    pub failure: ExecutionFailure,
+    /// Every turn that answered, summed.
+    ///
+    /// A sum rather than "the last turn's", which is what [`ToolLoopOutcome`] reports:
+    /// there is no answering turn on this path, so the only honest figure is the total of
+    /// the calls that were actually made and invoiced. (Whether the success path should sum
+    /// too is a separate, filed question — see issue #252 finding 4.)
+    pub usage: UsageSummary,
+    /// Tool calls dispatched before the failure, in call order.
+    pub tool_calls: Vec<ToolCallRecord>,
+}
+
+impl ToolLoopFailure {
+    fn new(
+        class: ExecutionFailureClass,
+        message: &'static str,
+        usage: UsageSummary,
+        tool_calls: Vec<ToolCallRecord>,
+    ) -> Self {
+        Self {
+            failure: ExecutionFailure::new(class, message),
+            usage,
+            tool_calls,
+        }
+    }
+}
+
+/// Folds one turn's counts into the running total.
+///
+/// `Option` semantics are `UsageSummary`'s own and match
+/// `application::execution::usage_was_reported`: `None` means the provider said nothing, not
+/// that it charged nothing. So a turn that reported nothing must not erase a turn that did —
+/// `None` is only preserved where every turn was `None`. Saturating because these are
+/// provider-supplied numbers and a wrap would be a worse lie than a clamp.
+fn accumulate_usage(total: &mut UsageSummary, turn: &UsageSummary) {
+    fn add(total: &mut Option<u64>, turn: Option<u64>) {
+        if let Some(value) = turn {
+            *total = Some(total.unwrap_or(0).saturating_add(value));
+        }
+    }
+    add(&mut total.input_tokens, turn.input_tokens);
+    add(&mut total.output_tokens, turn.output_tokens);
+    add(&mut total.cached_input_tokens, turn.cached_input_tokens);
+    add(&mut total.reasoning_tokens, turn.reasoning_tokens);
+    add(&mut total.total_tokens, turn.total_tokens);
 }
 
 /// Everything the loop needs besides the model handle and the request it re-issues.
@@ -706,11 +820,16 @@ pub struct ToolLoopContext<'a> {
 /// deadlines, circuit breaking, permits and cancellation — see
 /// `.agents/skills/moira-rig-agents-rag/SKILL.md`, whose default answer for the public path
 /// is to stay at the `CompletionModel` level.
+///
+/// **Every exit carries what the loop did.** The failure type is [`ToolLoopFailure`], not a
+/// bare [`ExecutionFailure`], so the dispatched-call records and the accumulated token counts
+/// survive an exit through any arm rather than only the answering one; `?` is deliberately
+/// not used on the provider call for that reason.
 pub async fn run_tool_loop(
     handle: &RuntimeModelHandle,
     mut request: CompletionRequest,
     context: ToolLoopContext<'_>,
-) -> Result<ToolLoopOutcome, ExecutionFailure> {
+) -> Result<ToolLoopOutcome, ToolLoopFailure> {
     let ToolLoopContext {
         tools,
         definitions,
@@ -720,24 +839,42 @@ pub async fn run_tool_loop(
         maximum_tool_turns,
     } = context;
     if maximum_tool_turns == 0 {
-        return Err(ExecutionFailure::new(
+        return Err(ToolLoopFailure::new(
             ExecutionFailureClass::InvalidExecutionRequest,
             "tool turn budget must be at least one",
+            UsageSummary::default(),
+            Vec::new(),
         ));
     }
     let mut history: Vec<Message> = request.chat_history.iter().cloned().collect();
     let mut tool_calls = Vec::new();
+    let mut spent = UsageSummary::default();
 
     for turn in 1..=maximum_tool_turns {
         request.tools = definitions.to_vec();
-        request.chat_history = OneOrMany::many(history.clone()).map_err(|_| {
-            ExecutionFailure::new(
+        let Ok(chat_history) = OneOrMany::many(history.clone()) else {
+            return Err(ToolLoopFailure::new(
                 ExecutionFailureClass::InvalidExecutionRequest,
                 "execution command must contain at least one message",
-            )
-        })?;
+                spent,
+                tool_calls,
+            ));
+        };
+        request.chat_history = chat_history;
 
-        let output = handle.completion(request.clone()).await?;
+        let output = match handle.completion(request.clone()).await {
+            Ok(output) => output,
+            // The turns before this one were answered and billed, and any tool calls they
+            // made have already left the process. Both travel with the failure.
+            Err(failure) => {
+                return Err(ToolLoopFailure {
+                    failure,
+                    usage: spent,
+                    tool_calls,
+                });
+            }
+        };
+        accumulate_usage(&mut spent, &output.usage);
         if output.tool_calls.is_empty() {
             return Ok(ToolLoopOutcome {
                 text: output.text,
@@ -755,12 +892,14 @@ pub async fn run_tool_loop(
             .cloned()
             .map(AssistantContent::ToolCall)
             .collect();
-        let content = OneOrMany::many(assistant_content).map_err(|_| {
-            ExecutionFailure::new(
+        let Ok(content) = OneOrMany::many(assistant_content) else {
+            return Err(ToolLoopFailure::new(
                 ExecutionFailureClass::ProviderInvalidResponse,
                 "provider returned an empty assistant turn",
-            )
-        })?;
+                spent,
+                tool_calls,
+            ));
+        };
         history.push(Message::Assistant {
             id: output.provider_request_id.clone(),
             content,
@@ -782,18 +921,24 @@ pub async fn run_tool_loop(
                 None => UserContent::tool_result(tool_call.id.clone(), content),
             });
         }
-        let content = OneOrMany::many(results).map_err(|_| {
-            ExecutionFailure::new(
+        let Ok(content) = OneOrMany::many(results) else {
+            return Err(ToolLoopFailure::new(
                 ExecutionFailureClass::InternalError,
                 "tool execution produced no tool results",
-            )
-        })?;
+                spent,
+                tool_calls,
+            ));
+        };
         history.push(Message::User { content });
     }
 
-    Err(ExecutionFailure::new(
+    // The budget-exhaustion exit is the one that discards the most: `maximum_tool_turns`
+    // billed completions and every tool call they asked for, all of which really happened.
+    Err(ToolLoopFailure::new(
         ExecutionFailureClass::DeadlineExceeded,
         "execution exceeded the configured tool turn budget",
+        spent,
+        tool_calls,
     ))
 }
 
@@ -1203,5 +1348,122 @@ mod tests {
                 .retryable,
             Some(false)
         );
+    }
+
+    /// **`maximum_response_bytes` bounds memory, not just what the model is shown.**
+    ///
+    /// What is asserted is deliberately *not* the truncation — the buffer-then-slice version
+    /// truncated too, so a truncation test passes either way and proves nothing. It is how much
+    /// of the body the target managed to hand out before Moira stopped pulling. Awaiting
+    /// `response.bytes()` made that figure the whole body, every byte of it resident at once,
+    /// with `spec.timeout` bounding only the duration; a target that answers 200 with a 2 GB
+    /// chunked stream then decides how much heap Moira uses.
+    ///
+    /// 64 MiB behind a 4 KiB cap, and the pass bar is a quarter of the body — loose on purpose,
+    /// because the kernel's socket buffer and hyper's own read-ahead legitimately overshoot the
+    /// cap by megabytes, while the defect overshoots it by the entire body.
+    #[tokio::test]
+    async fn a_response_far_larger_than_the_cap_is_never_buffered_whole() {
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 1_024;
+        const CAP: usize = 4 * 1024;
+
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let address = start_oversize_target(OversizeTarget {
+            served: served.clone(),
+            chunk: CHUNK,
+            chunks: CHUNKS,
+        })
+        .await;
+
+        let mut oversized = spec(
+            &format!("http://{address}/orders/{{order_id}}"),
+            json!({
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"]
+            }),
+        );
+        oversized.allowed_host = "127.0.0.1".to_string();
+        oversized.maximum_response_bytes = CAP;
+        // A loopback `http://` target needs the same dev escape hatch
+        // `tests/skill_tool_loop.rs` runs under, and for the same reason.
+        oversized.outbound_policy.allow_insecure = true;
+        // Generous on purpose: the read must end because of the ceiling, not the clock. A
+        // 500 ms budget would let the old implementation fail as a `Timeout` and hide which
+        // of the two bounds actually stopped it.
+        oversized.timeout = Duration::from_secs(20);
+
+        let tool = HttpSkillTool::new(oversized, reqwest::Client::new()).expect("tool builds");
+        let output = tool
+            .call_with_extensions(
+                SkillToolArgs(json!({"order_id": "A-1"})),
+                &ToolCallExtensions::new(),
+            )
+            .await
+            .expect("an over-cap body is truncated, not an error");
+
+        assert!(output.truncated, "an over-cap body must be flagged partial");
+        assert_eq!(
+            output.body.as_str().map(str::len),
+            Some(CAP),
+            "the model must be shown exactly the ceiling"
+        );
+        let served = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            served < CHUNK * CHUNKS / 4,
+            "the client must let go at the ceiling: the target served {served} bytes of \
+             {} before Moira stopped reading, so the cap bounded the model's view and not \
+             the heap",
+            CHUNK * CHUNKS
+        );
+    }
+
+    /// A loopback target whose body is far larger than any cap, counting the bytes it actually
+    /// hands to hyper. That counter is the observation: it stops climbing when the client stops
+    /// reading, so it measures the peak the client was willing to take.
+    #[derive(Clone)]
+    struct OversizeTarget {
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        chunk: usize,
+        chunks: usize,
+    }
+
+    async fn serve_oversize(
+        axum::extract::State(target): axum::extract::State<OversizeTarget>,
+    ) -> axum::response::Response {
+        // One allocation, cloned per chunk: `Bytes` is refcounted, so the *target* stays small
+        // however large the body it advertises.
+        let payload = axum::body::Bytes::from(vec![b'x'; target.chunk]);
+        let served = target.served.clone();
+        let chunk = target.chunk;
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(0..target.chunks).map(
+            move |_| {
+                served.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, std::io::Error>(payload.clone())
+            },
+        ));
+        // No `Content-Length`, so this is a chunked body — the shape the finding names, and
+        // the one no header pre-check could have caught.
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .expect("oversize response builds")
+    }
+
+    async fn start_oversize_target(target: OversizeTarget) -> std::net::SocketAddr {
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(serve_oversize))
+            .with_state(target);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oversize target");
+        let address = listener.local_addr().expect("oversize target address");
+        tokio::spawn(async move {
+            // The result is ignored because the client disconnects mid-body by design, which
+            // is the whole point of this target.
+            let _ = axum::serve(listener, app).await;
+        });
+        address
     }
 }
