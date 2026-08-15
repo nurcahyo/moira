@@ -32,10 +32,11 @@ pub use agent_platform::{
     EvalCaseRecord, EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest,
     EvalSuiteRecord, EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus,
     GradingKind, GuardContext, GuardDenialReason, GuardPolicy, GuardPolicyError, GuardVerdict,
-    HttpMethod, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillGuard,
-    SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
-    SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillResolution, SkillStatus,
-    SkillUnusableReason, evaluate_guards,
+    HttpMethod, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
+    SkillCredentialOutcome, SkillGuard, SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord,
+    SkillImportRequest, SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord,
+    SkillResolution, SkillStatus, SkillUnusableReason, credential_binding_permits_host,
+    evaluate_guards,
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,

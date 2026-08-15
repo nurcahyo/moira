@@ -87,6 +87,13 @@ async fn dispatch_one(
         state.http.clone(),
         metrics(),
         Arc::new(settings),
+        // Derived from the fixture's own settings, exactly as `run_supervisor` derives it
+        // from `AppState`. `test_state` opts into both `provider_security` escape hatches, so
+        // the mock control plane on `http://127.0.0.1:<port>` is reachable; `strict_state`
+        // opts into neither, which is what the deny test below turns on.
+        moira::infra::workers::oauth_refresh::TokenEndpointPolicy::from_provider_security(
+            &state.settings.provider_security,
+        ),
     );
     queue
         .run_once(&dispatcher, &metrics())
@@ -531,6 +538,105 @@ async fn oauth_token_refresh_skips_a_credential_with_no_configured_token_endpoin
     );
 }
 
+/// Issue #251 finding 2: `providers.metadata` is a free-form JSON blob nothing validates, so
+/// an operator (or anyone who compromises `moira:providers:write`) could point
+/// `oauth_token_endpoint` at `http://127.0.0.1:…` or `http://169.254.169.254/…` and Moira
+/// would POST a **decrypted refresh token** there.
+///
+/// The mock control plane here is the exfiltration target, and the assertion that matters is
+/// `token_call_count() == 0`: not "the refresh failed" but "the refresh token never left the
+/// process". Everything else about the fixture is identical to
+/// `oauth_token_refresh_rotates_the_credential_end_to_end` — same mock, same reachable
+/// loopback address, same due credential — so the *only* difference between a rotation and a
+/// refusal is `strict_state`'s `provider_security`, which is what a real deployment has.
+#[tokio::test]
+async fn oauth_token_refresh_never_posts_a_refresh_token_to_an_ssrf_blocked_endpoint() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let state = strict_state(&pool).await;
+    let control_plane = MockControlPlane::start().await;
+    let actor = admin_actor();
+    let admin = AdminService::new(&state).expect("admin service");
+
+    let provider = admin
+        .create_provider(
+            &actor,
+            &request_context(),
+            ProviderCreateRequest {
+                provider_type: ProviderType::Anthropic,
+                display_name: "Exfiltration target provider".to_string(),
+                base_url: None,
+                // Written unvalidated — `create_provider` checks `base_url`, never
+                // `metadata`. That is exactly the finding: the write path is not the guard.
+                metadata: json!({ "oauth_token_endpoint": control_plane.token_endpoint() }),
+            },
+        )
+        .await
+        .expect("create provider");
+
+    let expires_soon = Utc::now() + chrono::Duration::seconds(60);
+    let credential = admin
+        .create_credential(
+            &actor,
+            &request_context(),
+            CredentialCreateRequest {
+                provider_id: provider.id,
+                credential_type: CredentialType::Oauth2,
+                scope: CredentialScope::Global,
+                secret: CredentialSecret::OAuth2 {
+                    access_token: "old-access-token".to_string(),
+                    refresh_token: Some("old-refresh-token".to_string()),
+                    token_type: Some("Bearer".to_string()),
+                    expires_at: Some(expires_soon),
+                },
+                display_name: Some("Exfiltration test credential".to_string()),
+                priority: 100,
+                expires_at: Some(expires_soon),
+                metadata: json!({}),
+            },
+        )
+        .await
+        .expect("create oauth2 credential");
+
+    let settings = WorkerSettings::default();
+    queue(&pool, settings.clone())
+        .enqueue("oauth-token-refresh", json!({}), None, &metrics())
+        .await
+        .expect("enqueue oauth-token-refresh");
+    let outcome = dispatch_one(&state, settings).await;
+
+    assert_eq!(
+        control_plane.token_call_count(),
+        0,
+        "the refresh token must never be POSTed to an endpoint the outbound SSRF policy \
+         refuses"
+    );
+    // Fail-soft per credential, exactly as an unreachable identity provider is: one
+    // misconfigured provider must not dead-letter the whole job.
+    assert_eq!(
+        outcome.completed, 1,
+        "the job itself still completes; only this credential's refresh is refused"
+    );
+
+    let admin_repo = PgAdminRepository::new(pool.clone());
+    let unchanged = admin_repo
+        .get_credential(credential.id)
+        .await
+        .expect("load the credential");
+    assert_eq!(
+        unchanged.expires_at, credential.expires_at,
+        "a refused refresh must leave the credential row untouched"
+    );
+    assert_eq!(
+        unchanged.version, credential.version,
+        "a refused refresh must not bump the credential's version"
+    );
+
+    control_plane.shutdown().await;
+}
+
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
     sqlx::query_scalar("select status from worker_jobs where id = $1")
         .bind(id)
@@ -549,4 +655,20 @@ async fn test_state(pool: &PgPool) -> moira::app::AppState {
     moira::app::AppState::new(settings, Some(pool.clone()))
         .await
         .expect("build test app state")
+}
+
+/// [`test_state`] with **neither** `provider_security` escape hatch — the shape every real
+/// deployment has, and the only shape production can have (`Settings::validate_production`
+/// rejects `allow_http_provider_urls`). Used by the token-endpoint SSRF test below; every
+/// other test in this file wants the permissive fixture so it can talk to the loopback mock.
+async fn strict_state(pool: &PgPool) -> moira::app::AppState {
+    let settings = moira::config::Settings::default();
+    assert!(
+        !settings.provider_security.allow_http_provider_urls
+            && !settings.provider_security.allow_private_provider_urls,
+        "the shipped defaults must not grant either provider_security escape hatch"
+    );
+    moira::app::AppState::new(settings, Some(pool.clone()))
+        .await
+        .expect("build strict test app state")
 }

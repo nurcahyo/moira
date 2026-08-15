@@ -28,7 +28,7 @@ use crate::{
         EvalSuitePatchRequest, EvalSuiteRecord, IdempotencyRecord, ListCursor, ListResponse,
         Pagination, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
         SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
-        SkillImportResponse, SkillPatchRequest, SkillRecord,
+        SkillImportResponse, SkillPatchRequest, SkillRecord, credential_binding_permits_host,
     },
     error::AppError,
     infra::repositories::{
@@ -372,6 +372,31 @@ impl<'a> AgentPlatformService<'a> {
     /// `request.url_template` is set, the new URL is SSRF-validated and its host replaces
     /// `allowed_host` server-side; `request.url_template` alone can never set `allowed_host`
     /// to a value the URL does not actually resolve to.
+    ///
+    /// # A credential may only be bound to its own provider's host
+    ///
+    /// Passing the SSRF guard says the destination is not *internal*; it says nothing about
+    /// whether this deployment's secrets are allowed to go there, and
+    /// `https://collector.attacker.example` passes it. Since the bound credential is
+    /// decrypted at call time and sent as `Authorization: Bearer <plaintext>`, an
+    /// existence-only check on `credential_id` made `moira:skills:write` equivalent to
+    /// reading every provider secret in the deployment (issue #253 finding 1). So the
+    /// binding must satisfy
+    /// [`credential_binding_permits_host`](crate::domain::credential_binding_permits_host):
+    /// the credential's provider must declare the executor's `allowed_host` as its
+    /// `base_url` host.
+    ///
+    /// The pair is checked **as it will be after this patch**, not as it arrives, because
+    /// either half alone is enough to move a secret: binding a credential to an existing
+    /// hostile host, and moving an existing credential's host to a hostile one, are the same
+    /// attack from two directions. A patch that touches neither still re-validates, which is
+    /// deliberate — it makes a stored row that predates this rule un-patchable until the
+    /// binding is corrected, rather than letting an unrelated `timeout_ms` edit renew it.
+    ///
+    /// Reading the current row outside the write transaction is safe under this resource's
+    /// existing optimistic-concurrency contract: any concurrent change moves `updated_at`,
+    /// and the transaction then rejects the caller's now-stale `expected_updated_at` with a
+    /// 409 before the patch lands.
     pub async fn patch_executor(
         &self,
         actor: &Actor,
@@ -384,12 +409,6 @@ impl<'a> AgentPlatformService<'a> {
         if let Some(timeout_ms) = request.timeout_ms {
             validate_executor_timeout_ms(timeout_ms)?;
         }
-        if let Some(credential_id) = request.credential_id {
-            // Existence-only check: confirms the reference is live before it is stored.
-            // `provider_credentials` owns its own secret handling — this never reads a
-            // secret.
-            self.admin_repo.get_credential(credential_id).await?;
-        }
         let (new_url_template, new_allowed_host) = match &request.url_template {
             Some(url_template) => {
                 let validated_url = validate_skill_url(url_template).await?;
@@ -401,6 +420,19 @@ impl<'a> AgentPlatformService<'a> {
             }
             None => (None, None),
         };
+
+        let current = self.repo.get_executor(skill_id).await?;
+        // An omitted field means "leave unchanged" on this resource (see
+        // `SkillHttpExecutorPatchRequest`), so the effective pair is the patch's value where
+        // it has one and the stored value otherwise.
+        let effective_host = new_allowed_host
+            .clone()
+            .unwrap_or_else(|| current.allowed_host.clone());
+        if let Some(credential_id) = request.credential_id.or(current.credential_id) {
+            self.require_credential_entitled_to_host(credential_id, &effective_host)
+                .await?;
+        }
+
         self.repo
             .patch_executor(
                 skill_id,
@@ -418,6 +450,42 @@ impl<'a> AgentPlatformService<'a> {
                 ),
             )
             .await
+    }
+
+    /// Confirms `credential_id` names a live row **and** that its provider is entitled to
+    /// receive that secret at `allowed_host`.
+    ///
+    /// Two reads rather than one join: both are by primary key on tables an admin write
+    /// already touches, and keeping the entitlement decision in the service layer is what
+    /// lets it share one pure rule with the execution path
+    /// (`application::execution::skill_credential`) instead of forking into two SQL
+    /// predicates that can drift.
+    ///
+    /// The refusal names neither the provider nor its `base_url`: this endpoint is reachable
+    /// with `moira:skills:write` alone, and a message that confirmed where a given credential
+    /// is allowed to talk would turn the refusal into a way to enumerate the provider table.
+    async fn require_credential_entitled_to_host(
+        &self,
+        credential_id: Uuid,
+        allowed_host: &str,
+    ) -> Result<(), AppError> {
+        // Existence check, unchanged: `provider_credentials` owns its own secret handling and
+        // this never reads a secret.
+        let credential = self.admin_repo.get_credential(credential_id).await?;
+        let provider = self.admin_repo.get_provider(credential.provider_id).await?;
+        if credential_binding_permits_host(provider.base_url.as_deref(), allowed_host) {
+            return Ok(());
+        }
+        tracing::warn!(
+            %credential_id,
+            allowed_host,
+            "refused to bind a provider credential to a skill executor whose host its \
+             provider does not declare as its base_url"
+        );
+        Err(AppError::unprocessable(
+            "skill_credential_host_mismatch",
+            "The referenced credential's provider does not serve this executor's host.",
+        ))
     }
 
     pub async fn delete_executor(

@@ -356,7 +356,7 @@ pub async fn get_skill_executor(
     ),
     responses(
         (status = 200, description = "HTTP executor updated", body = SkillHttpExecutorRecord, headers(("ETag" = String, description = "Quoted RFC 3339 updated_at, this resource's If-Match basis"))),
-        (status = "4XX", description = "Request, authentication, authorization, conflict, not-found, or SSRF-blocked-host error", body = ErrorResponse),
+        (status = "4XX", description = "Request, authentication, authorization, conflict, not-found, SSRF-blocked-host, or credential-host-mismatch error (422 skill_credential_host_mismatch when the executor would end up carrying a credential whose provider does not serve its allowed_host)", body = ErrorResponse),
         (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
     ),
     security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))

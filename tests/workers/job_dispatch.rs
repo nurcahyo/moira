@@ -57,6 +57,10 @@ fn default_dispatcher_for(pool: &PgPool) -> RealJobDispatcher {
         reqwest::Client::new(),
         metrics(),
         Arc::new(moira::config::WorkerSettings::default()),
+        // The shipped default: neither `provider_security` escape hatch, so the oauth
+        // handler's token endpoint must be a public https URL. Nothing here enqueues that
+        // job — `tests/workers/latency_health_oauth.rs` owns both sides of that decision.
+        moira::infra::workers::oauth_refresh::TokenEndpointPolicy::default(),
     )
 }
 

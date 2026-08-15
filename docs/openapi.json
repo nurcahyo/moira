@@ -30103,7 +30103,7 @@
                 }
               }
             },
-            "description": "Request, authentication, authorization, conflict, not-found, or SSRF-blocked-host error",
+            "description": "Request, authentication, authorization, conflict, not-found, SSRF-blocked-host, or credential-host-mismatch error (422 skill_credential_host_mismatch when the executor would end up carrying a credential whose provider does not serve its allowed_host)",
             "headers": {
               "X-Request-Id": {
                 "description": "Request correlation identifier",

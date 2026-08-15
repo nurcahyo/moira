@@ -157,8 +157,284 @@ fn sample_document(host: &str, suffix: &str) -> Value {
     })
 }
 
+/// A second public IP literal, so a test can name a host that is legitimate as far as the
+/// SSRF guard is concerned but is *not* [`RESOLVABLE_TEST_HOST`]. Standing in for issue #253
+/// finding 1's `collector.attacker.example`: the whole point is that it passes
+/// `validate_outbound_url`, because a public host always does.
+const OTHER_PUBLIC_TEST_HOST: &str = "1.1.1.1";
+
 fn skill_id_of(record: &Value) -> Uuid {
     Uuid::parse_str(record["id"].as_str().expect("skill id")).expect("UUID id")
+}
+
+impl Fixture {
+    /// Creates a provider whose `base_url` is `https://{host}` and one `api_key` credential
+    /// on it, returning the credential id. Both go through the real admin routes, so the
+    /// credential is stored and encrypted exactly as a real one is.
+    async fn credential_on_provider_at(&self, host: &str, label: &str) -> Uuid {
+        let provider = self
+            .request(
+                "POST",
+                "/api/v1/admin/providers",
+                None,
+                Some(json!({
+                    "provider_type": "custom",
+                    "display_name": format!("{label} provider {}", self.suffix),
+                    "base_url": format!("https://{host}"),
+                    "metadata": {}
+                })),
+            )
+            .await;
+        assert_eq!(
+            provider.status,
+            StatusCode::CREATED,
+            "create provider: {}",
+            provider.body
+        );
+        let provider_id = provider.body["id"]
+            .as_str()
+            .expect("provider id")
+            .to_string();
+
+        let credential = self
+            .request(
+                "POST",
+                "/api/v1/admin/provider-credentials",
+                None,
+                Some(json!({
+                    "provider_id": provider_id,
+                    "credential_type": "api_key",
+                    "scope": {"type": "global"},
+                    "secret": {"api_key": format!("sk-{label}-{}", self.suffix)},
+                    "display_name": format!("{label} credential"),
+                    "priority": 100,
+                    "metadata": {}
+                })),
+            )
+            .await;
+        assert_eq!(
+            credential.status,
+            StatusCode::CREATED,
+            "create credential: {}",
+            credential.body
+        );
+        Uuid::parse_str(credential.body["id"].as_str().expect("credential id"))
+            .expect("UUID credential id")
+    }
+
+    /// Imports [`sample_document`] at `host` and returns `(skill_id, executor_etag)`.
+    async fn imported_executor(&self, host: &str, label: &str) -> (Uuid, String) {
+        let document = sample_document(host, &format!("{label}{}", self.suffix));
+        let imported = self
+            .request(
+                "POST",
+                "/api/v1/admin/skills/import",
+                None,
+                Some(json!({ "document": document })),
+            )
+            .await;
+        assert_eq!(
+            imported.status,
+            StatusCode::CREATED,
+            "import: {}",
+            imported.body
+        );
+        let skill_id = skill_id_of(&imported.body["skills"][0]);
+        let fetched = self
+            .request(
+                "GET",
+                &format!("/api/v1/admin/skills/{skill_id}/executor"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(fetched.status, StatusCode::OK, "get: {}", fetched.body);
+        assert_eq!(fetched.body["allowed_host"], json!(host));
+        (skill_id, fetched.etag.expect("GET must return an ETag"))
+    }
+}
+
+/// Issue #253 finding 1. `skill_http_executors.credential_id` is decrypted at call time and
+/// sent as `Authorization: Bearer <plaintext>`, and the only check on it was that the row
+/// existed — so `moira:skills:write` was silently equivalent to reading every provider secret
+/// in the deployment, by binding one to an attacker-controlled *public* host.
+///
+/// Both directions of the attack are pinned here, because either half alone moves the secret:
+/// binding a foreign credential to this executor's host, and moving a bound credential's host
+/// after the fact.
+#[tokio::test]
+async fn a_skill_executor_may_only_carry_a_credential_its_own_provider_issued() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "bind")
+        .await;
+    let executor_path = format!("/api/v1/admin/skills/{skill_id}/executor");
+
+    // The attack: a credential belonging to a provider that talks to a different host.
+    // `1.1.1.1` is an ordinary public host, so the SSRF guard has no objection to it and
+    // never sees this request at all — the refusal has to come from the binding rule.
+    let foreign = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "foreign")
+        .await;
+    let refused = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&etag),
+            Some(json!({ "credential_id": foreign })),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"], "skill_credential_host_mismatch",
+        "body: {}",
+        refused.body
+    );
+
+    // The refusal is a refusal, not a partial write.
+    let after = fixture.request("GET", &executor_path, None, None).await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(
+        after.body["credential_id"],
+        Value::Null,
+        "a refused bind must leave credential_id unset"
+    );
+    assert_eq!(
+        after.etag.as_deref(),
+        Some(etag.as_str()),
+        "a refused bind must not bump updated_at"
+    );
+
+    // A credential whose provider does serve this executor's host binds normally.
+    let own = fixture
+        .credential_on_provider_at(RESOLVABLE_TEST_HOST, "own")
+        .await;
+    let bound = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&etag),
+            Some(json!({ "credential_id": own })),
+        )
+        .await;
+    assert_eq!(bound.status, StatusCode::OK, "body: {}", bound.body);
+    assert_eq!(bound.body["credential_id"], json!(own.to_string()));
+    let bound_etag = bound.etag.expect("PATCH must return an ETag");
+
+    // The other direction: leave the credential alone and move the *host* under it. The new
+    // URL is a perfectly good public https URL, so `validate_skill_url` allows it; only the
+    // binding rule stands between a bound secret and a new destination.
+    let moved = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&bound_etag),
+            Some(json!({
+                "url_template": format!("https://{OTHER_PUBLIC_TEST_HOST}/v1/orders")
+            })),
+        )
+        .await;
+    assert_eq!(
+        moved.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        moved.body
+    );
+    assert_eq!(
+        moved.body["error"]["code"], "skill_credential_host_mismatch",
+        "body: {}",
+        moved.body
+    );
+
+    let final_state = fixture.request("GET", &executor_path, None, None).await;
+    assert_eq!(
+        final_state.body["allowed_host"],
+        json!(RESOLVABLE_TEST_HOST),
+        "a refused host move must leave allowed_host where it was"
+    );
+    assert_eq!(final_state.body["credential_id"], json!(own.to_string()));
+}
+
+/// A provider left on its vendor default has no `base_url`, so there is no host to compare
+/// against and nothing it can entitle. Fail-closed — see
+/// `domain::credential_binding_permits_host` for why inventing the vendor default would be
+/// worse than refusing.
+#[tokio::test]
+async fn a_credential_whose_provider_has_no_base_url_cannot_be_bound_at_all() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "nobase")
+        .await;
+
+    let provider = fixture
+        .request(
+            "POST",
+            "/api/v1/admin/providers",
+            None,
+            Some(json!({
+                "provider_type": "custom",
+                "display_name": format!("Vendor-default provider {}", fixture.suffix),
+                "base_url": Value::Null,
+                "metadata": {}
+            })),
+        )
+        .await;
+    assert_eq!(
+        provider.status,
+        StatusCode::CREATED,
+        "body: {}",
+        provider.body
+    );
+    let credential = fixture
+        .request(
+            "POST",
+            "/api/v1/admin/provider-credentials",
+            None,
+            Some(json!({
+                "provider_id": provider.body["id"],
+                "credential_type": "api_key",
+                "scope": {"type": "global"},
+                "secret": {"api_key": format!("sk-default-{}", fixture.suffix)},
+                "display_name": "Vendor-default credential",
+                "priority": 100,
+                "metadata": {}
+            })),
+        )
+        .await;
+    assert_eq!(
+        credential.status,
+        StatusCode::CREATED,
+        "body: {}",
+        credential.body
+    );
+
+    let refused = fixture
+        .request(
+            "PATCH",
+            &format!("/api/v1/admin/skills/{skill_id}/executor"),
+            Some(&etag),
+            Some(json!({ "credential_id": credential.body["id"] })),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
 }
 
 #[tokio::test]

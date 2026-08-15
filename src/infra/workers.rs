@@ -303,6 +303,9 @@ impl WorkerRegistry {
             state.http.clone(),
             state.metrics.clone(),
             self.settings.clone(),
+            oauth_refresh::TokenEndpointPolicy::from_provider_security(
+                &state.settings.provider_security,
+            ),
         );
         let mut queue_interval = tokio::time::interval(Duration::from_secs(
             self.settings.queue_poll_interval_seconds.max(1),
