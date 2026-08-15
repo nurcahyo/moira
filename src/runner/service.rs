@@ -184,9 +184,12 @@ impl<E: ContainerEngine> RunnerService<E> {
     /// framing was wrong and is recorded here so nobody repeats it.
     ///
     /// What is broken is the write itself, from this process. The text lands — the CLI echoes
-    /// it back masked — and the carriage return does not take effect. The full account, the
-    /// evidence that the container is blameless, and the eight things already tried are in the
-    /// [`super::docker_engine`] module docs. **Read them before changing anything here.**
+    /// it back masked — and the carriage return does not take effect. One real property was
+    /// established and is now honoured (the carriage return is only acted on while the attach
+    /// connection stays open), and it is necessary without being sufficient. The full account
+    /// — the 2×2 matrix of Docker client against connection lifetime, the instrumentation, and
+    /// everything ruled out — is in the [`super::docker_engine`] module docs. **Read them
+    /// before changing anything here.**
     ///
     /// One real bug on this side *was* found and fixed: `awaiting_authorization` used to mean
     /// only "a URL has been scraped", which let a caller submit before the CLI's reader

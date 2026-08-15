@@ -83,41 +83,51 @@ already unproven on #272).
 successfully **against a container this service created** — same image, same config, same
 payload — producing `OAuth error: Request failed with status code 400` for a bogus code.
 Stronger: after this service had typed a code into the prompt, that Node client sending a
-*bare* `\r` submitted that same already-typed code. The text lands; the carriage return, sent
-from this process, does not.
+*bare* `\r` submitted that same already-typed code.
 
-Tried, and did not fix it — listed so nobody repeats them:
+**One real property was established**, and the code now honours it: the carriage return is
+only acted on **while the attach connection stays open**. Closing right after the write
+discards it. `ATTACH_HOLD` (30 s, with a compile-time floor and a unit test) and a read-half
+drain that starts at the moment of upgrade are what implement that.
+
+**It is necessary and not sufficient here.** The lifetime was tested against both Docker
+clients at both magnitudes, and all four cells fail from Rust:
+
+| | hold ≈ 2 s | hold = 30 s, draining throughout |
+|---|---|---|
+| `bollard` attach | no submit | no submit |
+| hand-rolled HTTP 101 upgrade over the raw socket | no submit | no submit |
+
+The 30 s runs were instrumented rather than assumed — the drain reported 3 chunks received and
+the hold reported elapsing a full 30 s after the write — so the stream was genuinely live and
+the connection genuinely open. A Node client holding ~12 s on the same image submits. The
+hand-rolled client was reverted (twice, deliberately): it behaved identically to `bollard`, so
+shipping ~150 lines of bespoke HTTP plus two extra tokio features would have added surface for
+no measured benefit.
+
+Other things tried and ruled out, so nobody repeats them:
 
 | Attempt | Result |
 |---|---|
 | `code + "\r"` in one write (the frozen contract's payload) | text lands, no submit |
 | code and `\r` as two writes, 100 ms and 250 ms apart | same |
 | bracketed paste `ESC[200~…ESC[201~` | worse — the terminator is typed literally, so this CLI does not implement it |
-| a settle delay before the first byte, matching the reference client | same |
-| holding the connection open 2 s after the flush | same |
-| draining the read half concurrently from the moment of upgrade | same |
-| `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same — **kept anyway**, it is the correct config |
-| replacing `bollard`'s attach with a hand-rolled HTTP 101 upgrade over the raw socket | same (`HTTP/1.1 101 UPGRADED`, 38 bytes written, ends with CR), so it was reverted rather than shipped unproven |
+| a settle delay before the first byte | same, and **kept** — the reference client does it |
+| `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same, and **kept** — it is the correct config, pinned by a test |
+| gating `awaiting_authorization` on the paste prompt rather than the URL | same, and **kept** — a genuine bug, see below |
 
-One genuine bug on this side *was* found and fixed along the way: `awaiting_authorization`
-used to mean only "a URL has been scraped", which let a caller submit before the CLI's reader
-existed. It now also requires the paste prompt. Necessary, not sufficient.
+Two genuine bugs on this side *were* found by this investigation and are fixed:
 
-**The next step is to diff the two clients on the wire** — `strace`/`dtruss`, or a proxy
-between client and daemon — not to try another payload. The payload is settled: measured
-working twice from the reference client. `MOIRA_RUNNER__TOKEN_PREFIX` remains configurable
-(default `sk-ant-`) so the token-scraping half can be corrected without a rebuild once the
-write is fixed.
+1. `awaiting_authorization` used to mean only "a URL has been scraped", which let a caller
+   submit before the CLI's reader existed. It now also requires the paste prompt.
+2. The container was created with `AttachStdin: true`, which tells the daemon to expect a
+   client attached at start time. It is now created detached, exactly as `docker run -dit`.
 
-Two incidental findings worth keeping, both of which cost real debugging time:
-
-- **`bollard` does not read the Docker CLI's *context*.** Its fallback is
-  `/var/run/docker.sock`, which on Docker Desktop for macOS does not exist unless the operator
-  enables the compatibility symlink — so `docker version` can report a healthy server while
-  this service reports `Socket not found`. Hence `MOIRA_RUNNER__DOCKER_HOST`.
-- **The daemon's log driver emits whole lines only.** A container sitting at a prompt written
-  with `printf 'PROMPT> '` (no newline) yields **zero bytes** from the log endpoint until a
-  newline arrives.
+**The next step is to diff the two clients at the syscall or socket level** — `dtruss`, or a
+proxy between client and daemon — which is the one thing that has not been done. **Not**
+another payload: the payload is settled, measured working twice from the reference client.
+`MOIRA_RUNNER__TOKEN_PREFIX` remains configurable (default `sk-ant-`) so the token-scraping
+half can be corrected without a rebuild once the write is fixed.
 
 ## Configuration
 

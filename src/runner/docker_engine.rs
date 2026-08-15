@@ -34,9 +34,9 @@
 //!
 //! # THE OPEN DEFECT: submitting an authorization code does not work from this client
 //!
-//! Read this before touching [`ContainerEngine::write_stdin`] or its callers. Everything else
-//! in this file is verified against a real daemon; this one path is not, and the boundary is
-//! sharp.
+//! Read this before touching [`ContainerEngine::write_stdin`], [`ATTACH_HOLD`] or their
+//! callers. Everything else in this file is verified against a real daemon; this one path is
+//! not, and the boundary is sharp.
 //!
 //! **What works.** The write reaches the container. The CLI echoes the authorization code back
 //! masked, so the attach upgrade, the pty, the container config and the payload are all
@@ -53,35 +53,55 @@
 //! the prompt, that Node client sending a *bare* `\r` submitted that same already-typed code.
 //! So the text lands and the carriage return does not, and the container is blameless.
 //!
-//! **What was tried and did not fix it**, so nobody repeats it:
+//! ## The one real property this investigation established
+//!
+//! **The carriage return is only acted on while the attach connection stays open.** Closing
+//! right after the write discards it. That is why [`ATTACH_HOLD`] exists, why it is 30 s, and
+//! why it carries a compile-time floor.
+//!
+//! ## …and why that is necessary but not sufficient here
+//!
+//! The connection lifetime was tested against both Docker clients, at both magnitudes. All
+//! four cells fail from Rust:
+//!
+//! | | hold ≈ 2 s | hold = 30 s, draining throughout |
+//! |---|---|---|
+//! | `bollard` attach | no submit | no submit |
+//! | hand-rolled HTTP 101 upgrade over the raw socket | no submit | no submit |
+//!
+//! The 30 s runs were instrumented rather than assumed: the drain reported **3 chunks
+//! received** and the hold reported elapsing a full 30 s after the write, so the stream was
+//! genuinely live and the connection genuinely open. A Node client holding ~12 s on the same
+//! image submits.
+//!
+//! **The hand-rolled client was reverted**, twice, and deliberately: it behaved identically to
+//! `bollard` (`HTTP/1.1 101 UPGRADED`, 38 bytes written, `ends_with_cr=true`), so shipping
+//! ~150 lines of bespoke HTTP plus two extra tokio features would have added surface for no
+//! measured benefit. Two independent Rust clients failing identically, where a Node client
+//! succeeds, says the difference is not the choice of Docker library.
+//!
+//! ## Other things tried, so nobody repeats them
 //!
 //! | Attempt | Result |
 //! |---|---|
 //! | `code + "\r"` in one write (the frozen contract's payload) | text lands, no submit |
 //! | code and `\r` as two writes, 100 ms and 250 ms apart | same |
 //! | bracketed paste `ESC[200~…ESC[201~` | worse — the terminator is typed literally, so this CLI does not implement it |
-//! | a settle delay before the first byte, matching the reference client | same |
-//! | holding the connection open for 2 s after the flush | same |
-//! | draining the read half concurrently from the moment of upgrade | same |
-//! | `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same (kept anyway — it is the correct config) |
-//! | replacing `bollard`'s attach with a hand-rolled HTTP 101 upgrade over the raw socket | same, so it was reverted rather than shipped unproven |
+//! | a settle delay before the first byte, matching the reference client | same, and **kept** — it is what the reference does |
+//! | `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same, and **kept** — it is the correct config, pinned by a test |
+//! | gating `awaiting_authorization` on the paste prompt rather than the URL | same, and **kept** — it was a genuine bug: the old state let a caller write before the CLI's reader existed |
 //!
-//! The hand-rolled client is the notable one: it produced `HTTP/1.1 101 UPGRADED` and wrote 38
-//! bytes ending in `\r`, and behaved identically to `bollard`. Two independent Rust clients
-//! failing the same way, where a Node client succeeds, says the difference is not in the
-//! choice of Docker library. It was not isolated further.
-//!
-//! **The next step** is to diff the two clients on the wire — `strace`/`dtruss` or a socket
-//! proxy between client and daemon — rather than to try another payload. The payload is
-//! settled: it is measured working, twice, from the reference client.
+//! **The payload is settled — do not vary it.** `code + "\r"` is measured working twice from
+//! the reference client. The next diagnostic step is to diff the two clients at the syscall or
+//! socket level (`dtruss`, or a proxy between client and daemon), which is the one thing that
+//! has not been done.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bollard::{
     Docker,
-    container::AttachContainerResults,
-    container::LogOutput,
+    container::{AttachContainerResults, LogOutput},
     errors::Error as BollardError,
     models::{ContainerCreateBody, HostConfig},
     query_parameters::{
@@ -114,19 +134,39 @@ use super::{
 /// can perceive.
 const ATTACH_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// How long the attach connection is held open after the last byte is flushed.
+/// How long the attach connection is held open after the write, still draining.
 ///
-/// # The failure this exists to prevent, measured
+/// # Necessary, and — from this client — measured NOT to be sufficient
 ///
-/// Dropping the connection immediately after `flush` delivered the authorization code — the
-/// CLI echoed it back masked — and **lost the trailing `\r` that submits it**. The runner then
-/// sat at `awaiting_authorization` for ever with a code visibly typed into the prompt. A flush
-/// returns when the bytes are handed to the transport, not when the daemon has forwarded them
-/// to the container, so closing on the next line truncates the tail of the write.
+/// The reference client's behaviour is unambiguous: **the carriage return that submits the
+/// pasted line is only acted on while the attach connection stays open.** Closing right after
+/// the write discards it, even though the write succeeded and the daemon accepted the bytes.
+/// That is a real property of the mechanism, so this hold exists and carries a compile-time
+/// floor.
 ///
-/// The reference client holds the socket open for seconds. Two is comfortably past the
-/// observed hand-off and still bounded, which matters because this runs inside a request.
-const ATTACH_LINGER: std::time::Duration = std::time::Duration::from_millis(2000);
+/// It does not, on its own, make submission work from this process. See the module docs for
+/// the full 2×2 matrix; the short version is that 30 s of holding, with the read half drained
+/// continuously and both facts confirmed by instrumentation, still does not submit here while
+/// a Node client holding ~12 s does. Do not read this constant as "the fix" — read it as one
+/// of the two things the reference client does that this client must not stop doing.
+///
+/// 30 s is generous against the reference client's ~12 s, because the wait is for an OAuth
+/// round trip over somebody else's network. It costs one idle socket and one task per code
+/// submission, and it is off the request path — [`ContainerEngine::write_stdin`] returns as
+/// soon as the write is flushed.
+const ATTACH_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The compile-time floor on [`ATTACH_HOLD`].
+///
+/// A runtime test can be deleted along with the behaviour it guards; this cannot. Setting the
+/// hold to zero — or back to the 2 s an earlier revision of this file used and called a
+/// "linger" — fails the build. The floor sits below the reference client's measured ~12 s and
+/// well above the 2 s that is known not to be enough.
+const _: () = assert!(
+    ATTACH_HOLD.as_secs() >= 10,
+    "ATTACH_HOLD must stay well above the 2s an earlier revision used: the CLI only acts on \
+     the submitting carriage return while the attach connection is open"
+);
 
 /// A [`ContainerEngine`] backed by the real Docker Engine API.
 pub struct DockerEngine {
@@ -378,42 +418,72 @@ impl ContainerEngine for DockerEngine {
             .logs(false)
             .build();
 
-        let AttachContainerResults { input, mut output } = self
+        // The attach is awaited here so a refusal — no such container, daemon down — surfaces
+        // to the caller instead of disappearing into a spawned task.
+        let attached = self
             .docker
             .attach_container(container, Some(options))
             .await
             .map_err(classify)?;
-        let mut input = input;
 
-        // Drain the read half for the whole life of the attach, starting before the write.
-        // The reference client for this flow registers its reader before writing, and a
-        // socket nobody reads is a socket whose peer can stall.
-        //
-        // The bytes are dropped. On a successful exchange this stream carries the minted
-        // token, so it is never accumulated, never returned and never logged; `transcript` is
-        // the one place that reads a container's output for its content.
-        let pump = tokio::spawn(async move { while output.next().await.is_some() {} });
+        // THE CONNECTION OUTLIVES THIS CALL, deliberately. See [`ATTACH_HOLD`]: the CLI only
+        // acts on the submitting carriage return while the attach is open, so the stream is
+        // owned by a detached task that keeps draining and keeps the socket alive well past
+        // the write. `write_stdin` returns as soon as the write is flushed, so
+        // `POST /v1/runners/{id}/authorization-code` still answers promptly.
+        let payload = bytes.to_vec();
+        let (report, written) = tokio::sync::oneshot::channel();
 
-        tokio::time::sleep(ATTACH_SETTLE).await;
+        tokio::spawn(async move {
+            let AttachContainerResults { mut input, output } = attached;
 
-        let write = async {
-            input.write_all(bytes).await.map_err(|error| {
-                EngineError::Failed(format!("write to container stdin: {error}"))
-            })?;
-            input
-                .flush()
-                .await
-                .map_err(|error| EngineError::Failed(format!("flush container stdin: {error}")))
+            // Drain from the moment of upgrade, not from after the write: the reference
+            // client registers its reader first, and a socket nobody reads is a socket whose
+            // peer can stall. Instrumented once and confirmed live — the stream delivers
+            // chunks and does not end early.
+            //
+            // The bytes are dropped. On a successful exchange this stream carries the minted
+            // token, so it is never accumulated, never returned and never logged;
+            // `transcript` is the one place that reads a container's output for its content.
+            let mut output = output;
+            let pump = tokio::spawn(async move { while output.next().await.is_some() {} });
+
+            tokio::time::sleep(ATTACH_SETTLE).await;
+
+            // `EngineError` is not `Clone`, so the outcome crosses the channel as a message
+            // and is rebuilt on the far side.
+            let outcome: Result<(), String> = async {
+                input
+                    .write_all(&payload)
+                    .await
+                    .map_err(|error| format!("write to container stdin: {error}"))?;
+                input
+                    .flush()
+                    .await
+                    .map_err(|error| format!("flush container stdin: {error}"))
+            }
+            .await;
+
+            let succeeded = outcome.is_ok();
+            // If the receiver is gone the caller was cancelled. Hold the connection anyway:
+            // the container has already been written to, and abandoning it now is exactly the
+            // shape of the bug this design exists to avoid.
+            let _ = report.send(outcome);
+
+            if succeeded {
+                tokio::time::sleep(ATTACH_HOLD).await;
+            }
+            pump.abort();
+            drop(input);
+        });
+
+        match written.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(EngineError::Failed(reason)),
+            Err(_) => Err(EngineError::Failed(
+                "the container attach task ended before it reported the write".to_string(),
+            )),
         }
-        .await;
-
-        if write.is_ok() {
-            tokio::time::sleep(ATTACH_LINGER).await;
-        }
-
-        pump.abort();
-        drop(input);
-        write
     }
 
     async fn rename(&self, container: &str, new_name: &str) -> Result<(), EngineError> {
@@ -483,6 +553,40 @@ mod tests {
             Some(false),
             "StdinOnce=true closes stdin when the first attach detaches, and this design \
              attaches once, writes, and detaches"
+        );
+    }
+
+    /// The attach connection must outlive the write, and this is the guard for it.
+    ///
+    /// # What this catches, and what it honestly cannot
+    ///
+    /// It catches the regression that cost this workstream eight attempts: someone reading
+    /// `write_stdin`, seeing a 30-second sleep on what looks like a fire-and-forget write, and
+    /// "tidying" it away. The carriage return that submits the pasted line is only acted on
+    /// while the connection is open, so shortening or deleting this silently returns the
+    /// service to a state where it accepts a code and does nothing with it.
+    ///
+    /// It cannot catch it *behaviourally*, and that is worth stating rather than implying
+    /// otherwise. The property lives in a real CLI's reader on the far side of a real daemon;
+    /// the in-memory engine has no connection to close, and even the opt-in Docker suite could
+    /// not see it — its probe container runs `sh -c 'read line'`, and a POSIX `read` does not
+    /// care whether the writer is still attached. That suite passed throughout the entire
+    /// period this bug was live. So the guard here is the constant plus the `const assert!`
+    /// beside it, and the reason is written down where the next reader will find it.
+    #[test]
+    fn the_attach_hold_stays_long_enough_to_submit() {
+        // Measured NOT to work at 2s; the reference client uses ~12s.
+        assert!(
+            ATTACH_HOLD >= std::time::Duration::from_secs(10),
+            "ATTACH_HOLD is {ATTACH_HOLD:?}; an earlier revision used 2s and the CLI never \
+             acted on the submitting carriage return"
+        );
+        // The settle before the first byte is the reference client's other timing property.
+        assert!(ATTACH_SETTLE >= std::time::Duration::from_millis(1000));
+        assert!(
+            ATTACH_HOLD > ATTACH_SETTLE,
+            "holding for less time than we wait before writing would mean closing almost \
+             immediately after the write, which is the failure itself"
         );
     }
 
