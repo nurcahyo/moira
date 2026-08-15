@@ -370,6 +370,17 @@ impl AuthService {
         }
     }
 
+    /// The hasher this service authenticates with, so a test can prove it is the *same* one
+    /// `AppState` holds rather than a second construction with its own Argon2 budget.
+    ///
+    /// Test-only and deliberately narrow: exposing the hasher in production code would invite a
+    /// caller to reach around `verify_api_key` and skip the prefix lookup that bounds the
+    /// unauthenticated cost.
+    #[cfg(test)]
+    pub(crate) fn key_hasher(&self) -> &ApiKeyHasher {
+        &self.key_hasher
+    }
+
     pub async fn authenticate_admin(
         &self,
         pool: &PgPool,
@@ -616,7 +627,18 @@ impl AuthService {
         let rows = sqlx::query(sql).bind(key_prefix).fetch_all(pool).await?;
         for row in rows {
             let key_hash: String = row.try_get("key_hash")?;
-            if self.key_hasher.verify(raw_key, &key_hash)? {
+            // One Argon2 permit per row, taken inside the loop, which is the correct accounting
+            // even though the loop is one row in practice —
+            // `system_api_keys_prefix_active_unique` and `consumer_api_keys_prefix_active_unique`
+            // (migrations/0003_security_foundation.sql) are unique over live rows. The bound must
+            // not depend on that staying true.
+            //
+            // The `?` propagates two new failures unchanged: a `503 auth_verification_overloaded`
+            // when the gate was full for the whole queue timeout, and a `500` when the stored hash
+            // asks for more Argon2 memory than this process will allocate. Both are `Err`, never
+            // `Ok(false)` — answering "invalid credential" for a credential that was never checked
+            // turns an overload into a `401` operators chase as a client bug.
+            if self.key_hasher.verify(raw_key, &key_hash).await? {
                 let id: Uuid = row.try_get("id")?;
                 let application_id: Option<Uuid> = row.try_get("application_id")?;
                 let scopes: Vec<String> = row.try_get("scopes")?;

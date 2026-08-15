@@ -74,7 +74,18 @@ impl<'a> ApiKeyAdminService<'a> {
                         &request.display_name,
                         &request.scopes,
                     )?;
-                    let generated = key_hasher.generate("moira_sys")?;
+                    // STAYS INSIDE THE COMMAND CLOSURE. Hoisting the mint above
+                    // `AdminCommandRunner::execute` would mint and then discard a key on every
+                    // idempotent replay hit — a live credential written to nothing, invisible
+                    // until an audit asks where it went.
+                    //
+                    // The accepted trade: awaiting the Argon2 gate here can extend an open
+                    // Postgres transaction — and, when an `Idempotency-Key` is present, the
+                    // `pg_try_advisory_xact_lock` `claim_idempotency` holds — by at most one
+                    // `api_keys.verification_queue_timeout_ms` (250 ms as shipped). That is
+                    // defensible at 250 ms and stops being defensible if someone raises the
+                    // timeout without re-reading this comment.
+                    let generated = key_hasher.generate("moira_sys").await?;
                     let record = transaction
                         .create_system_key(
                             Uuid::now_v7(),
@@ -179,7 +190,8 @@ impl<'a> ApiKeyAdminService<'a> {
                         "application",
                     )
                     .await?;
-                    let generated = key_hasher.generate("moira_cons")?;
+                    // Inside the closure for the reason spelled out at `create_system_key`.
+                    let generated = key_hasher.generate("moira_cons").await?;
                     let record = transaction
                         .create_consumer_key(
                             Uuid::now_v7(),
@@ -289,7 +301,8 @@ impl<'a> ApiKeyAdminService<'a> {
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, |transaction| {
                 Box::pin(async move {
-                    let generated = key_hasher.generate(&namespace)?;
+                    // Inside the closure for the reason spelled out at `create_system_key`.
+                    let generated = key_hasher.generate(&namespace).await?;
                     let record = transaction
                         .rotate_key(
                             &table,

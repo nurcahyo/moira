@@ -132,7 +132,33 @@ tl_count_skips() {
 #
 # The `.config/nextest.toml` header carried "622 passed" for months and was wrong by ~730;
 # both numbers here were taken from a run, not copied from a comment.
-TL_TEST_COUNT_MINIMUM=1353
+#
+# Re-measured 2026-08-14 on the #176 branch by `/usr/bin/make gates`: **1442** at fe4b347
+# (source declaring 1436), then **1443** with the one test this branch's own review added. The
+# floor had drifted 89 tests below the truth — the suite grew across several merges while this
+# line stayed at 1353 — so the "any net drop reds it" claim above had become false by that
+# margin: 89 tests could have been deleted with every gate still green. It is the measured
+# number again.
+#
+# Re-measured 2026-08-15 after merging `origin/develop` (5a86a67) into the #176 branch:
+# **1458** passed, source declaring 1452, by `/usr/bin/make gates` with both Postgres and Redis
+# up and zero skip lines. #245 and #244 landed between the two measurements, which is the whole
+# 15-test difference — this branch adds no test to the 1443 above and removed the one runtime
+# assertion it briefly had, because clippy correctly asked for `const { assert!(..) }` and a
+# compile-time check is the better home for it.
+#
+# The gap between passed and declared is the doctests. `tl_declared_tests` counts `#[test]` /
+# `#[tokio::test]` attributes only, while both the local `cargo test --workspace` and CI's
+# `__doc__` shard (`scripts/ci-shard-run.sh`, `cargo test --all-features --doc`) also run the
+# documentation examples. Both sides count them, so the two numbers stay comparable — which is
+# what makes it safe for `scripts/ci-assert-union.sh` to check the union against this same
+# constant. The offset has been +6 across every measurement here.
+#
+# ZERO HEADROOM, DELIBERATELY. Pinning at the measured count is what makes "any net drop reds
+# it" true, and it is the reason the line above had become a lie. The cost is real and belongs
+# to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
+# until this number moves with it. That is the intended failure, not a flake.
+TL_TEST_COUNT_MINIMUM=1458
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

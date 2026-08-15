@@ -6,7 +6,7 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::error::AppError;
+use crate::{error::AppError, security::DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
@@ -303,6 +303,25 @@ pub struct ApiKeySettings {
     pub pepper_version: String,
     pub allow_insecure_dev_pepper: bool,
     pub prefix_length: usize,
+    /// Concurrent Argon2id operations this process will run (issue #176).
+    ///
+    /// `None` — the shipped default — derives it from
+    /// `std::thread::available_parallelism()`, clamped to
+    /// `[1, MAX_DERIVED_VERIFICATION_CONCURRENCY]`. That is the right default because Argon2id at
+    /// `p=1` is single-threaded per call: concurrency past the core count buys no throughput and
+    /// costs 19 MiB of resident memory per extra permit.
+    ///
+    /// It is a **memory budget** as well as a concurrency one — peak arena is this value times
+    /// `ARGON2_ARENA_BYTES` — so `Settings::validate` refuses anything above
+    /// `MAX_VERIFICATION_CONCURRENCY`. Raise it together with `resources.limits.cpu`, never alone.
+    pub verification_concurrency: Option<usize>,
+    /// How long a request waits for a verification permit before being refused with a
+    /// `503 auth_verification_overloaded`.
+    ///
+    /// Zero would mean "shed instantly", which reads like the house pattern
+    /// (`ConcurrencyController::acquire`) and is wrong for a permit held tens of milliseconds —
+    /// see `DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS`. It is refused rather than treated as a mode.
+    pub verification_queue_timeout_ms: u64,
 }
 
 impl std::fmt::Debug for ApiKeySettings {
@@ -315,6 +334,14 @@ impl std::fmt::Debug for ApiKeySettings {
             .field("pepper_version", &self.pepper_version)
             .field("allow_insecure_dev_pepper", &self.allow_insecure_dev_pepper)
             .field("prefix_length", &self.prefix_length)
+            // Neither is a secret, and both are rendered: an operator diagnosing an
+            // `auth_verification_overloaded` needs the bound and the timeout, and a hand-written
+            // `Debug` that silently drops new fields is how a redaction becomes a blind spot.
+            .field("verification_concurrency", &self.verification_concurrency)
+            .field(
+                "verification_queue_timeout_ms",
+                &self.verification_queue_timeout_ms,
+            )
             .finish()
     }
 }
@@ -869,6 +896,11 @@ impl Settings {
         // random tail is not a tuning choice either.
         self.validate_api_key_prefix(&mut violations);
 
+        // And again, for the other half of the same struct: the Argon2 gate's bound is a
+        // resident-memory budget and its timeout is an availability decision, so neither is
+        // clamped into something the operator did not ask for.
+        self.validate_api_key_verification_gate(&mut violations);
+
         // And again: a stale-JWKS ceiling below the freshness window is a bound that cannot
         // be enforced, because the fresh read path never consults it.
         self.validate_jwks_stale_ceiling(&mut violations);
@@ -1172,6 +1204,50 @@ impl Settings {
                  the anonymous invite preview's guessing space to a search",
                 self.api_keys.prefix_length
             ));
+        }
+    }
+
+    /// The Argon2id gate's two knobs, checked in every environment (issue #176).
+    ///
+    /// Both are **refused, not clamped**, on the reasoning `validate_api_key_prefix` records
+    /// directly above: a clamp makes a misconfiguration invisible, and these two decide how much
+    /// resident memory the authentication path may hold and how long a caller waits before a
+    /// `503`. Getting either silently is worse than not starting.
+    ///
+    /// The ceiling is a memory budget, not a taste: `MAX_VERIFICATION_CONCURRENCY` times
+    /// `ARGON2_ARENA_BYTES` is 1,216 MiB, already 59% of the chart's `resources.limits.memory:
+    /// 2Gi`. Above it an operator is configuring an OOMKill, and Rust aborts on allocation
+    /// failure rather than unwinding, so there would be no degraded mode to fall back to.
+    fn validate_api_key_verification_gate(&self, violations: &mut Vec<String>) {
+        use crate::security::{ARGON2_ARENA_BYTES, MAX_VERIFICATION_CONCURRENCY};
+
+        match self.api_keys.verification_concurrency {
+            Some(0) => violations.push(
+                "api_keys.verification_concurrency must be at least 1, or no request can ever \
+                 obtain an Argon2 permit and every authenticated call waits out its queue timeout \
+                 and fails with auth_verification_overloaded"
+                    .to_string(),
+            ),
+            Some(concurrency) if concurrency > MAX_VERIFICATION_CONCURRENCY => {
+                violations.push(format!(
+                    "api_keys.verification_concurrency ({concurrency}) must be at most \
+                     {MAX_VERIFICATION_CONCURRENCY}: each concurrent Argon2id operation holds a \
+                     {} MiB arena resident, so {concurrency} of them peak at {} MiB against the \
+                     2 GiB the shipped chart limits this container to",
+                    ARGON2_ARENA_BYTES / (1024 * 1024),
+                    concurrency * ARGON2_ARENA_BYTES / (1024 * 1024),
+                ));
+            }
+            _ => {}
+        }
+
+        if self.api_keys.verification_queue_timeout_ms == 0 {
+            violations.push(
+                "api_keys.verification_queue_timeout_ms must be at least 1: a zero timeout sheds \
+                 the moment the gate is full, which returns 503 to a well-behaved caller's \
+                 two-request burst on a two-core box"
+                    .to_string(),
+            );
         }
     }
 
@@ -1712,6 +1788,8 @@ impl Default for ApiKeySettings {
             pepper_version: "dev-local".to_string(),
             allow_insecure_dev_pepper: true,
             prefix_length: 20,
+            verification_concurrency: None,
+            verification_queue_timeout_ms: DEFAULT_VERIFICATION_QUEUE_TIMEOUT_MS,
         }
     }
 }
@@ -2264,8 +2342,9 @@ mod tests {
     ///
     /// It also pins **refusal, not clamping**: the shipped default must pass, and one below
     /// the floor must produce a startup error, in every environment.
-    #[test]
-    fn the_api_key_prefix_floor_is_the_point_where_a_namespace_stops_leaving_random_material() {
+    #[tokio::test]
+    async fn the_api_key_prefix_floor_is_the_point_where_a_namespace_stops_leaving_random_material()
+    {
         use crate::security::{
             ApiKeyHasher, KEY_NAMESPACES, MIN_API_KEY_PREFIX_LENGTH, MIN_RANDOM_PREFIX_CHARS,
         };
@@ -2281,7 +2360,10 @@ mod tests {
 
         // At the floor, even the *longest* namespace leaves the required random material.
         let at_floor = ApiKeyHasher::new(b"pepper".to_vec(), "v1", MIN_API_KEY_PREFIX_LENGTH);
-        let generated = at_floor.generate(longest).expect("generate at the floor");
+        let generated = at_floor
+            .generate(longest)
+            .await
+            .expect("generate at the floor");
         let random = generated
             .key_prefix
             .strip_prefix(&format!("{longest}_"))
@@ -2331,6 +2413,69 @@ mod tests {
             .to_string();
         assert!(
             error.contains("api_keys.prefix_length"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The Argon2 gate's knobs are refused, not clamped, and the ceiling is derived from the
+    /// container's memory limit rather than chosen (issue #176).
+    ///
+    /// Both boundaries are asserted, not just the rejected side: `MAX_VERIFICATION_CONCURRENCY`
+    /// itself has to be an *accepted* value or it is not the ceiling, which is the mutation that
+    /// survived the equivalent prefix-length test until it checked both sides.
+    #[test]
+    fn the_argon2_verification_gate_settings_are_refused_rather_than_clamped() {
+        use crate::security::{ARGON2_ARENA_BYTES, MAX_VERIFICATION_CONCURRENCY};
+
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.deployment.environment,
+            DeploymentEnvironment::Development,
+            "the check must fire outside production, so this must not be a production default"
+        );
+        assert_eq!(
+            settings.api_keys.verification_concurrency, None,
+            "the shipped default must derive the bound from the core count, not pin a number"
+        );
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the shipped api_keys gate settings must validate");
+
+        settings.api_keys.verification_concurrency = Some(MAX_VERIFICATION_CONCURRENCY);
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("the ceiling itself must be an accepted configuration");
+
+        settings.api_keys.verification_concurrency = Some(0);
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero bound must be refused: nothing could ever acquire a permit")
+            .to_string();
+        assert!(
+            error.contains("api_keys.verification_concurrency"),
+            "unexpected error: {error}"
+        );
+
+        settings.api_keys.verification_concurrency = Some(MAX_VERIFICATION_CONCURRENCY + 1);
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a bound above the memory ceiling must be refused")
+            .to_string();
+        // The message has to carry the arithmetic, because "64" on its own tells an operator
+        // nothing about *why* their 128 was refused.
+        assert!(
+            error.contains(&format!("{} MiB arena", ARGON2_ARENA_BYTES / (1024 * 1024))),
+            "the refusal must name the per-operation arena: {error}"
+        );
+
+        settings.api_keys.verification_concurrency = None;
+        settings.api_keys.verification_queue_timeout_ms = 0;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero queue timeout must be refused")
+            .to_string();
+        assert!(
+            error.contains("api_keys.verification_queue_timeout_ms"),
             "unexpected error: {error}"
         );
     }

@@ -7,6 +7,11 @@ use super::I18nEntry;
 
 pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
+        key: "moira.error.auth_verification_overloaded",
+        default_message: "The service is at capacity for credential checks. Retry shortly.",
+        description: "Used when an API-key verification or mint waited api_keys.verification_queue_timeout_ms for one of the api_keys.verification_concurrency Argon2id permits and did not get one. It says nothing about the presented credential, which was never checked - it is a capacity signal, not a rejection, which is why it is a 503 rather than a 401. Transient: retry after a short delay. If it persists, the gate is smaller than the authenticated traffic needs and the operator must raise resources.limits.cpu and api_keys.verification_concurrency together, because the default bound is derived from the core count.",
+    },
+    I18nEntry {
         key: "moira.error.bad_request",
         default_message: "The request could not be processed.",
         description: "Generic client-side request validation or shape errors.",
