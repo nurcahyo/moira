@@ -50,6 +50,62 @@ pub struct Settings {
     pub rag: RagSettings,
     #[serde(default)]
     pub skill_execution: SkillExecutionSettings,
+    #[serde(default)]
+    pub claude_runner: ClaudeRunnerSettings,
+}
+
+/// The `moira-runner` control endpoint (issue #275, workstream R2 of #272).
+///
+/// # Why this is a settings section and not a database row
+///
+/// `moira-runner` is the **only** component in the deployment that holds Docker Engine API
+/// access, which is root-equivalent on its host. Where it lives, and the bearer token that
+/// reaches it, are therefore deployment topology — the same category as `database.url` — not
+/// runtime configuration an admin API may rewrite. Putting the address in the database would
+/// mean an admin-plane write could repoint Moira's runner calls at an arbitrary host; putting
+/// the token there would mean Moira storing a credential to a root-equivalent service in a
+/// table the console can list.
+///
+/// # `enabled` is off by default and is a hard gate, not a hint
+///
+/// A deployment with no runner service is the normal case. With `enabled = false` the whole
+/// `/api/v1/admin/runners` surface answers `503 runner_service_disabled` before any network
+/// call, so the absent-service failure mode is a named refusal rather than a connect timeout.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClaudeRunnerSettings {
+    /// Whether this deployment has a `moira-runner` to talk to at all.
+    pub enabled: bool,
+    /// Base URL of the runner control endpoint — scheme, host and port only; the client appends
+    /// `/v1/runners…`. Defaults to the contract's loopback bind.
+    pub base_url: String,
+    /// The bearer token presented on every runner call. Never logged, never returned, never
+    /// placed in an error message.
+    ///
+    /// `Option` rather than an empty-string sentinel so "unset" and "set to the empty string"
+    /// are the same startup violation for one reason instead of two.
+    pub auth_token: Option<String>,
+    /// Total budget for one runner call, applied as both the request timeout and the connect
+    /// timeout on the purpose-built client. A floor under every call site, so one that forgets
+    /// its own `RequestBuilder::timeout` still cannot hang an admin request.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for ClaudeRunnerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // The contract's default bind. Loopback: the runner service is never exposed to the
+            // internet, and a non-loopback address without TLS is a startup violation below.
+            base_url: "http://127.0.0.1:8090".to_string(),
+            auth_token: None,
+            // Provisioning starts a container, which on a cold image pull is the slowest call in
+            // the set. Ten seconds is generous for a loopback call and still well under the
+            // admin route timeout, so a stalled runner surfaces as a runner error rather than a
+            // gateway timeout with no attribution.
+            request_timeout_ms: 10_000,
+        }
+    }
 }
 
 /// Bounds on RAG document ingestion (plan 11, Sub-Phase A).
@@ -913,6 +969,11 @@ impl Settings {
         // production-hardening question. See the function.
         self.validate_content_encryption(&mut violations);
 
+        // Same category: an enabled runner endpoint with no token, or one Moira cannot parse,
+        // is a configuration that cannot work. The TLS half is production hardening and lives
+        // inside the same function so an operator reads one list, not two.
+        self.validate_claude_runner(&mut violations);
+
         // `rag_chunks.chunk_index`, `start_offset` and `end_offset` are all `integer`, and the
         // chunker casts into them. A ceiling at or above `i32::MAX` would make those casts
         // saturate silently, so it is rejected at startup rather than discovered as a chunk
@@ -1197,6 +1258,85 @@ impl Settings {
     /// **Refused, not clamped.** A clamp makes the misconfiguration invisible: the operator
     /// believes they set one value, the process runs another, and nothing says so. The same
     /// reasoning `validated_invite_lifetime` applies to an invitation's lifetime.
+    /// The `moira-runner` control endpoint (issue #275).
+    ///
+    /// Runs in **every** environment, because everything it checks is the difference between a
+    /// runner surface that can work and one that cannot — with one exception, flagged inline: the
+    /// plaintext-over-the-network rule is a production judgement and says so.
+    ///
+    /// Nothing here is checked while `enabled` is false. A deployment with no runner service must
+    /// not be forced to invent a token for a subsystem it never calls, and the surface refuses
+    /// with `503 runner_service_disabled` before it can reach a network anyway.
+    fn validate_claude_runner(&self, violations: &mut Vec<String>) {
+        if !self.claude_runner.enabled {
+            return;
+        }
+
+        if self
+            .claude_runner
+            .auth_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            violations.push(
+                "claude_runner.auth_token must be set when claude_runner.enabled is true; the \
+                 runner control endpoint authenticates every route except /healthz with a bearer \
+                 token, so an unset token is a surface that answers 401 to itself"
+                    .to_string(),
+            );
+        }
+
+        if self.claude_runner.request_timeout_ms == 0 {
+            violations.push(
+                "claude_runner.request_timeout_ms must be greater than zero; it is the floor \
+                 under every runner call and a zero budget is an immediate timeout, not an \
+                 unlimited one"
+                    .to_string(),
+            );
+        }
+
+        let Ok(url) = reqwest::Url::parse(&self.claude_runner.base_url) else {
+            violations.push(format!(
+                "claude_runner.base_url must be a valid absolute URL, got {:?}",
+                self.claude_runner.base_url
+            ));
+            return;
+        };
+
+        if !matches!(url.scheme(), "http" | "https") {
+            violations.push(format!(
+                "claude_runner.base_url must use http or https, got scheme {:?}",
+                url.scheme()
+            ));
+            return;
+        }
+
+        // The contract binds loopback by default and says a non-loopback bind without TLS must be
+        // a startup error. Moira is the caller, so it enforces the same rule from its own side:
+        // a bearer token to a root-equivalent service must not cross a network in the clear.
+        //
+        // Development is exempt deliberately — the integration tests run a fake runner on
+        // `http://127.0.0.1:0`, which is loopback and therefore permitted in every environment
+        // anyway; the exemption exists for a developer pointing at a runner on another host in a
+        // lab, which is exactly the situation production must refuse.
+        let is_loopback = url
+            .host_str()
+            .is_some_and(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]");
+        if url.scheme() == "http"
+            && !is_loopback
+            && matches!(
+                self.deployment.environment,
+                DeploymentEnvironment::Production
+            )
+        {
+            violations.push(format!(
+                "claude_runner.base_url must use https when it is not loopback, got {:?}; the \
+                 bearer token it carries authenticates a service with Docker Engine access",
+                self.claude_runner.base_url
+            ));
+        }
+    }
+
     fn validate_api_key_prefix(&self, violations: &mut Vec<String>) {
         use crate::security::{MIN_API_KEY_PREFIX_LENGTH, MIN_RANDOM_PREFIX_CHARS};
 

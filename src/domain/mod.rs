@@ -10,6 +10,10 @@ mod message;
 mod models;
 mod pagination;
 mod public;
+// Issue #275 (workstream R2 of #272). Containerised Claude runner DTOs — deliberately a module
+// of their own rather than more types in `admin.rs`, because the invariant that binds them (no
+// token field, ever) is easier to hold in a file whose header states it.
+mod runners;
 mod runtime;
 
 pub use admin::{
@@ -96,6 +100,10 @@ pub use public::{
     PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
     PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicToolDeclaration,
     PublicUsageRecord, PublicUsageSummary, ResponsePersistenceMode, UsageQuery,
+};
+pub use runners::{
+    ClaudeRunnerAuthorizationCodeRequest, ClaudeRunnerFinalizeRequest,
+    ClaudeRunnerProvisionRequest, ClaudeRunnerRecord, ClaudeRunnerState,
 };
 pub use runtime::{
     AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord,

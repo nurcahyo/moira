@@ -19,6 +19,9 @@ mod keyset;
 mod policy_row;
 mod provider_observability;
 mod public;
+// Issue #275 (workstream R2 of #272). The `claude_runners` mirror table, as one repository
+// owning one table — see the module header for why no secret column exists on it.
+mod runners;
 mod runtime;
 mod setup;
 mod worker_jobs;
@@ -110,6 +113,11 @@ pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
 };
+// Issue #275 (workstream R2 of #272).
+pub use runners::{
+    ClaudeRunnerInsert, ClaudeRunnerRepository, PgClaudeRunnerRepository, RunnerStateUpdate,
+};
+pub(crate) use runners::{runner_wrong_state, version_conflict as runner_version_conflict};
 pub use runtime::{
     ExecutionAttemptInsert, ExecutionAttemptUpdate, PgRuntimeRepository,
     RuntimeCredentialCandidate, RuntimeRepository, UsageRecordInsert,

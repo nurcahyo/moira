@@ -1785,7 +1785,7 @@ pub fn audit_result_to_db(result: &AuditResult) -> &'static str {
     }
 }
 
-fn credential_scope_from_parts(
+pub(crate) fn credential_scope_from_parts(
     scope_type: ScopeType,
     external_tenant_id: Option<String>,
     application_id: Option<uuid::Uuid>,

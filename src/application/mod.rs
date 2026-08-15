@@ -14,6 +14,10 @@ mod graph;
 mod identity;
 mod memory_extraction;
 mod public;
+// Issue #275 (workstream R2 of #272). Containerised Claude runner orchestration — its own
+// module rather than another `admin/` context, because the one rule it holds (the minted token
+// never leaves this process) is easier to keep in a file whose header states it.
+mod runners;
 mod runtime_admin;
 mod setup;
 mod summarization;
@@ -57,6 +61,7 @@ pub use memory_extraction::{
 pub use agent_platform::AgentPlatformService;
 pub(crate) use memory_extraction::SECRET_NEEDLES;
 pub use public::{ExecutionPipeline, PublicExecutionService};
+pub use runners::ClaudeRunnerService;
 pub use runtime_admin::RuntimeAdminService;
 pub use setup::SetupService;
 // Plan 11 Sub-Phase E. Same split as `context_planner` and `memory_extraction`: the trigger

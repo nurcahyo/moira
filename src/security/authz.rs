@@ -93,6 +93,24 @@ pub const ADMIN_SCOPES: &[&str] = &[
     // `:write`/`:delete` siblings: the endpoint has no write side to gate. Implied by
     // `moira:admin` like every scope in this list.
     "moira:graph:read",
+    // Issue #275 (workstream R2 of #272) — containerised Claude runners. Named against the
+    // `moira:providers:{read,write,delete}` precedent, and for the same reason those three exist
+    // rather than one: `write` covers provisioning, submitting the authorization code and
+    // finalizing, while tearing a runner down destroys a container and is worth its own scope.
+    //
+    // `AuthorizationService::require` rejects an unknown scope with a 500, so these are not
+    // decoration: without them the whole `/api/v1/admin/runners…` surface would be unreachable
+    // rather than unprotected. Implied by `moira:admin` like every scope in this list.
+    //
+    // Note what `moira:runners:write` deliberately does NOT imply: finalizing a runner mints a
+    // provider credential, and that write goes through `AdminService::create_credential`, which
+    // asks for `moira:credentials:write` on its own. A caller holding only the runner scopes can
+    // drive a runner to `ready` and cannot turn its token into a stored credential. That is the
+    // intended shape — the credential chain's authorization is not something this surface may
+    // borrow past.
+    "moira:runners:read",
+    "moira:runners:write",
+    "moira:runners:delete",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
     // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin

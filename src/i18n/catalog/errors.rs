@@ -814,4 +814,54 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         default_message: "A guard refused this skill call.",
         description: "Used when a kind='guard' skill listed in the agent profile's skill_refs refuses one tool call before it is dispatched (issue #84, plan 12 §5 skills-as-guards). Unlike skill_unavailable this is not a terminal execution failure: the denial is returned to the model as the tool's result so it can proceed without that tool, which costs one turn instead of failing a request whose output may already be committed. Guards narrow only - a guard can refuse a call Moira's own authorization permitted, never permit one it refused - so a denial never widens what a caller may do. The machine-readable reason (skill_not_allowed, skill_denied, missing_scope, policy_unreadable) travels in the tool result and the runtime event. policy_unreadable is the fail-closed arm: a guard whose metadata.guard object is missing or malformed denies everything it governs rather than silently ceasing to guard.",
     },
+    I18nEntry {
+        key: "moira.error.runner_service_disabled",
+        default_message: "Containerised Claude runners are not enabled in this deployment.",
+        description: "Used by every /api/v1/admin/runners route (issue #275, workstream R2 of #272) when claude_runner.enabled is false, which is the default. Refused before any network call, so a deployment with no moira-runner gets a named 503 instead of a connect timeout with no attribution. moira-runner is the only component in the deployment that holds Docker Engine API access; Moira never does, which is why its absence is a configuration answer rather than a degraded mode. The remedy is to deploy moira-runner and set claude_runner.enabled, base_url and auth_token.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_service_unavailable",
+        default_message: "The runner service could not be reached.",
+        description: "Used when a call into moira-runner failed to produce a usable reply (issue #275, workstream R2 of #272): a connect failure, a timeout, a body that would not parse, or an upstream 5xx including the contract's own docker_unavailable. Deliberately one code for the whole class, and deliberately carrying nothing from the upstream response: moira-runner scrapes a container's tty stream, which is where the minted token lives, so relaying its prose would put an unbounded string that has been adjacent to credential material into a Moira response and a Moira log line at once. The specific cause is in the runner service's own logs, correlated by the runner_reference recorded in the audit row.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_service_unauthorized",
+        default_message: "Moira is not authorized to call the runner service.",
+        description: "Used when moira-runner answers 401 or 403 to Moira's own bearer token (issue #275, workstream R2 of #272). Split from runner_service_unavailable because the remedy differs in kind: this is a configuration mismatch between claude_runner.auth_token and the token moira-runner was started with, usually a rotation applied on one side only, and no amount of waiting or capacity fixes it. Mapped to 503 rather than 401 because the failed authentication is Moira's, not the caller's - the caller's own credential was accepted.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_not_found",
+        default_message: "The runner was not found.",
+        description: "Used when no live claude_runners row answers the requested id, or when moira-runner reports that the runner it names no longer exists (issue #275, workstream R2 of #272). Note the deliberate exception on the read path: a GET whose runner has been reaped past its TTL marks the mirror row expired and returns it, rather than 404-ing, so a runner that reached the end of its life stays visible in the console instead of vanishing from its own list.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_wrong_state",
+        default_message: "The runner is not in a state that permits this operation.",
+        description: "Used when a runner lifecycle transition is illegal (issue #275, workstream R2 of #272): submitting an authorization code to a runner that is not awaiting_authorization, or finalizing one that is not ready. Emitted from both sides of the boundary under one code - Moira's mirror refuses first, which saves a round trip, and a relayed upstream 409 maps here too - because they are the same fact seen at two moments and an operator should read one remedy rather than two failures that look unrelated. The check is a from-state comparison made inside the same transaction as the write, which is why these transitions carry no If-Match: a version match proves only that nobody else wrote, while a state match proves the transition is legal.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_token_unavailable",
+        default_message: "This runner's token has already been retrieved and cannot be read again.",
+        description: "Used when moira-runner answers 410 token_already_retrieved (issue #275, workstream R2 of #272). The token endpoint is one-shot by design, so this means the token was fetched once and the runner can never yield it again. The usual cause is a finalize whose credential write failed after the token had been read: Moira stores nothing on that path - no credential row, no state change - so the runner stays ready and the second attempt lands here. That is the honest signal, and the remedy is to delete the runner and provision a new one; there is no way to recover the token, and there is deliberately no place in Moira it could have been stashed.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_request_rejected",
+        default_message: "The runner service rejected the request.",
+        description: "Used when moira-runner answers 400 invalid_request, or when an authorization code arrives empty (issue #275, workstream R2 of #272). Mapped to 422 rather than relaying the upstream 400 because the request reached Moira in a well-formed shape and was refused on its content. Carries nothing from the upstream body, for the reason runner_service_unavailable records.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_label_invalid",
+        default_message: "A runner label must be 1 to 64 characters of [a-z0-9-].",
+        description: "Used when a runner provisioning request carries a label outside the charset moira-runner accepts (issue #275, workstream R2 of #272). Validated on Moira's side as well as the runner service's because the label becomes part of a container name: a local refusal names the rule, while a relayed remote 400 would only say the request was invalid.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_ttl_invalid",
+        default_message: "The requested runner lifetime is outside the permitted window.",
+        description: "Used when ttl_seconds on a runner provisioning request is below 60 or above 3600 (issue #275, workstream R2 of #272). Refused rather than clamped, on the reasoning the API-key prefix and Argon2 gate settings already record: a clamp makes a misconfiguration invisible. The floor stops a runner expiring before the operator can read its authorization URL; the ceiling stops a container living for days holding a half-finished OAuth flow, which is the state in this feature with the largest blast radius.",
+    },
+    I18nEntry {
+        key: "moira.error.duplicate_runner_label",
+        default_message: "A live runner already uses this label.",
+        description: "Used when provisioning a runner whose label collides with an existing, not-soft-deleted claude_runners row (issue #275, workstream R2 of #272). The uniqueness is while-live, so a deleted runner's name is reusable; two live runners sharing a name would make the console's own list ambiguous.",
+    },
 ];

@@ -9,6 +9,8 @@ mod identity;
 mod observability;
 mod openapi;
 mod public;
+// Issue #275 (workstream R2 of #272). The containerised-Claude-runner admin surface.
+mod runners;
 
 use std::{sync::Arc, time::Duration};
 
@@ -642,6 +644,12 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(admin::disable_trusted_jwt_issuer))
         .routes(routes!(admin::list_audit_events))
         .routes(routes!(admin::get_audit_event))
+        // Issue #275 (workstream R2 of #272) — containerised Claude runners. Kept in one
+        // contiguous block so a concurrent workstream editing this file rebases mechanically.
+        .routes(routes!(runners::list_runners, runners::provision_runner))
+        .routes(routes!(runners::get_runner, runners::delete_runner))
+        .routes(routes!(runners::submit_runner_authorization_code))
+        .routes(routes!(runners::finalize_runner))
         // Issue #214 (plan 12 §3) — agent platform: skills CRUD. Kept in one contiguous
         // block so a concurrent workstream editing this file rebases mechanically.
         .routes(routes!(
@@ -843,6 +851,10 @@ mod tests {
             "/api/v1/admin/jwt-issuers/{id}/disable",
             "/api/v1/admin/audit-events",
             "/api/v1/admin/audit-events/{id}",
+            "/api/v1/admin/runners",
+            "/api/v1/admin/runners/{id}",
+            "/api/v1/admin/runners/{id}/authorization-code",
+            "/api/v1/admin/runners/{id}/finalize",
         ]
         .into_iter()
         .collect();
@@ -881,7 +893,10 @@ mod tests {
         // + issue #83's rolling provider-health read surface: GET /api/v1/admin/providers/health = 1.
         // + issue #214 (plan 12 §3) the execution half: POST .../eval-suites/{id}/run and
         //   POST .../flows/{id}/run = 2.
-        assert_eq!(operation_count, 186);
+        // + issue #275 (workstream R2 of #272) containerised Claude runners:
+        //   POST/GET /api/v1/admin/runners, GET/DELETE .../runners/{id},
+        //   POST .../runners/{id}/authorization-code, POST .../runners/{id}/finalize = 6.
+        assert_eq!(operation_count, 192);
     }
 
     #[test]
@@ -1540,7 +1555,7 @@ mod tests {
     /// runtime-policy `PUT` reads the header through `optional_if_match`, the
     /// context-router routing-defaults `PUT` (issue #213) mirrors that exact contract, and
     /// the agent-platform skill writes (issue #214) add their own If-Match operations.
-    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 52] = [
+    const IF_MATCH_OPERATIONS: [(&str, &str, bool); 53] = [
         // Plan 09 wave 2. Ownership transfer takes a required precondition and grant
         // revocation deliberately does not: a `PATCH` that flips a flag is a lost-update
         // hazard, while a soft revoke is idempotent in intent and answers a repeat with
@@ -1633,6 +1648,21 @@ mod tests {
         ("/api/v1/admin/eval-suites/{id}", "patch", true),
         ("/api/v1/admin/flows/{id}", "delete", true),
         ("/api/v1/admin/flows/{id}", "patch", true),
+        // Issue #275 (workstream R2 of #272) — containerised Claude runners. `DELETE` is the
+        // ONLY runner operation in this inventory, and the two state-machine transitions
+        // (`authorization-code`, `finalize`) are deliberately absent rather than overlooked.
+        //
+        // `GET /api/v1/admin/runners/{id}` refreshes Moira's mirror from the runner service and
+        // persists what it learns, which bumps `version` — that refresh is what surfaces
+        // `authorization_url` at all, so a console polling for it would invalidate its own ETag
+        // between the poll and the submit, and every transition would 412 on the happy path.
+        // The transitions are guarded by an explicit from-state check inside the same
+        // transaction as the write instead, which is the stronger property: a version match
+        // proves only that nobody else wrote, while a state match proves the transition is
+        // legal. `DELETE` keeps the precondition because destroying a container is not a
+        // state-machine step, and a lost update there removes a container out from under a
+        // concurrent operator.
+        ("/api/v1/admin/runners/{id}", "delete", true),
         (
             "/api/v1/admin/users/{external_user_id}/provider-credentials/{id}",
             "delete",
