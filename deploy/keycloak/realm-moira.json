@@ -1,0 +1,88 @@
+{
+  "realm": "moira",
+  "displayName": "Moira (local dev)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "loginTheme": "keycloak",
+  "clients": [
+    {
+      "clientId": "moira-console",
+      "name": "Moira console (local dev)",
+      "description": "LOCAL DEVELOPMENT ONLY \u2014 issue #260. The client secret below (moira-local-dev-secret) is a published dev value committed to the repo, not a real credential. Never reuse this realm export outside a laptop.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "moira-local-dev-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://localhost:3000/api/auth/oauth2/callback/moira-console-idp",
+        "https://127.0.0.1:3000/api/auth/oauth2/callback/moira-console-idp",
+        "https://localhost:3000/*",
+        "https://127.0.0.1:3000/*",
+        "http://localhost:3000/api/auth/oauth2/callback/moira-console-idp",
+        "http://127.0.0.1:3000/api/auth/oauth2/callback/moira-console-idp",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*"
+      ],
+      "webOrigins": [
+        "https://localhost:3000",
+        "https://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+      ],
+      "fullScopeAllowed": true,
+      "attributes": {
+        "post.logout.redirect.uris": "+"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "owner",
+      "email": "owner@moira.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Owner",
+      "lastName": "(local dev)",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "owner",
+          "temporary": false
+        }
+      ],
+      "requiredActions": [],
+      "realmRoles": [
+        "default-roles-moira"
+      ]
+    },
+    {
+      "username": "operator",
+      "email": "operator@moira.local",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Operator",
+      "lastName": "(local dev)",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "operator",
+          "temporary": false
+        }
+      ],
+      "requiredActions": [],
+      "realmRoles": [
+        "default-roles-moira"
+      ]
+    }
+  ]
+}

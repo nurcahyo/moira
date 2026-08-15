@@ -1,0 +1,58 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-items: flex-start;
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  padding-top: 0.75rem;
+  margin-top: 0.5rem;
+  width: 100%;
+}
+
+.heading {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: 100%;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.textarea {
+  width: 100%;
+  min-height: 4rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 0.5rem;
+  border-radius: 0.25rem;
+  border: 1px solid #d1d5db;
+}
+
+.select {
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.25rem;
+  border: 1px solid #d1d5db;
+}
+
+.status {
+  margin: 0;
+  color: #555;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}

@@ -65,6 +65,11 @@ const NAV_ITEMS: readonly NavItem[] = [
   { href: "/settings/auth", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_auth_settings },
   { href: "/admins", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_admins },
   { href: "/graph", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_graph },
+  { href: "/skills", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_skills },
+  { href: "/providers/health", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_provider_health },
+  { href: "/evals", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_evals },
+  { href: "/flows", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_flows },
+  { href: "/playground", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_playground },
 ];
 
 export interface ConsoleHeaderProps {

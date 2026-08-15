@@ -10,12 +10,19 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  CLAUDE_API_KEY_CREDENTIAL_DISPLAY_NAME,
+  CLAUDE_API_KEY_PROVIDER_DISPLAY_NAME,
   CLAUDE_SUBSCRIPTION_CREDENTIAL_DISPLAY_NAME,
   CLAUDE_SUBSCRIPTION_PROVIDER_DISPLAY_NAME,
   CLAUDE_SUBSCRIPTION_PROVIDER_TYPE,
+  connectClaudeApiKey,
   connectClaudeSubscription,
   isClaudeSubscriptionError,
+  loadClaudeApiKeyStatus,
+  loadClaudeSubscriptionStatus,
+  MAX_API_KEY_LENGTH,
   MAX_SUBSCRIPTION_TOKEN_LENGTH,
+  resolveAnthropicApiKey,
   resolveSubscriptionToken,
 } from "@/lib/claude-subscription";
 import { CONSOLE_MESSAGE_KEYS } from "@/lib/i18n/keys";
@@ -214,6 +221,36 @@ describe("connectClaudeSubscription — the oauth2 credential", () => {
     expect(result.credentialId).toBe(CREDENTIAL_ID);
   });
 
+  test("never rotates an oauth2 credential belonging to a DIFFERENT provider", async () => {
+    // Regression for the plan-12 review finding. `listProviderCredentials` is called with
+    // `providerId`, but Moira's handler ignores every `PageQuery` filter and answers 200 with an
+    // unfiltered page (`src/domain/admin.rs:40-50`, pinned by a test). Until this predicate
+    // existed, the match was `credential_type === "oauth2"` alone, so the page's first oauth2 row
+    // — from any provider in the deployment — was rotated: its sealed secret overwritten with the
+    // Claude token, and the intended provider left with none.
+    //
+    // The stub is what hid this. It keys on the bare path and ignores the query, and every row
+    // the fixtures built already carried the right `provider_id`, so the bug was structurally
+    // untestable. This row deliberately carries a foreign one.
+    const FOREIGN_PROVIDER_ID = "11111111-1111-4111-8111-111111111111";
+    const FOREIGN_CREDENTIAL_ID = "22222222-2222-4222-8222-222222222222";
+    const { stub, client } = clientFor({
+      [CREDENTIAL_LIST]: () => ({
+        status: 200,
+        body: page([
+          credentialRecord({ id: FOREIGN_CREDENTIAL_ID, provider_id: FOREIGN_PROVIDER_ID }),
+        ]),
+      }),
+    });
+
+    const result = await connectClaudeSubscription(client, { accessToken: TOKEN });
+
+    expect(stub.routes()).not.toContain(CREDENTIAL_ROTATE);
+    expect(stub.routes()).toContain(CREDENTIAL_CREATE);
+    expect(result.outcome).toBe("created");
+    expect(result.credentialId).not.toBe(FOREIGN_CREDENTIAL_ID);
+  });
+
   test("re-enables a rotated credential that came back disabled", async () => {
     const { stub, client } = clientFor({
       [CREDENTIAL_LIST]: () => ({ status: 200, body: page([credentialRecord()]) }),
@@ -301,5 +338,258 @@ describe("resolveSubscriptionToken", () => {
 
   test("trims leading and trailing whitespace on an otherwise valid token", () => {
     expect(resolveSubscriptionToken(`  ${TOKEN}  `)).toEqual({ ok: true, token: TOKEN });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Mode B: connectClaudeApiKey — a DIFFERENT dedicated provider row           */
+/* -------------------------------------------------------------------------- */
+
+const API_KEY_PROVIDER_ID = "aaaaaaaa-3333-4333-8333-333333333333";
+const API_KEY_CREDENTIAL_ID = "bbbbbbbb-3333-4333-8333-333333333333";
+const ANTHROPIC_API_KEY = "sk-ant-unmistakable-console-api-key-9f1a2b";
+
+const API_KEY_PROVIDER_LIST = "GET /api/v1/admin/providers";
+const API_KEY_PROVIDER_CREATE = "POST /api/v1/admin/providers";
+const API_KEY_CREDENTIAL_LIST = "GET /api/v1/admin/provider-credentials";
+const API_KEY_CREDENTIAL_CREATE = "POST /api/v1/admin/provider-credentials";
+const API_KEY_CREDENTIAL_ROTATE = `POST /api/v1/admin/provider-credentials/${API_KEY_CREDENTIAL_ID}/rotate`;
+
+function apiKeyProviderRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    id: API_KEY_PROVIDER_ID,
+    provider_type: CLAUDE_SUBSCRIPTION_PROVIDER_TYPE,
+    display_name: CLAUDE_API_KEY_PROVIDER_DISPLAY_NAME,
+    status: "active",
+    metadata: {},
+    created_at: "2026-08-14T00:00:00Z",
+    updated_at: "2026-08-14T00:00:00Z",
+    version: 1,
+    ...overrides,
+  };
+}
+
+function apiKeyCredentialRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    id: API_KEY_CREDENTIAL_ID,
+    provider_id: API_KEY_PROVIDER_ID,
+    credential_type: "api_key",
+    scope: { type: "global" },
+    secret_fingerprint: "sha256:another-fingerprint-that-must-not-cross",
+    masked_secret: "api_key****mask",
+    status: "active",
+    priority: 0,
+    metadata: {},
+    created_at: "2026-08-14T00:00:00Z",
+    updated_at: "2026-08-14T00:00:00Z",
+    version: 1,
+    ...overrides,
+  };
+}
+
+function apiKeyHandlers(overrides: Record<string, StubHandler> = {}): Record<string, StubHandler> {
+  return {
+    [API_KEY_PROVIDER_LIST]: () => ({ status: 200, body: page([]) }),
+    [API_KEY_PROVIDER_CREATE]: () => ({ status: 201, body: apiKeyProviderRecord() }),
+    [API_KEY_CREDENTIAL_LIST]: () => ({ status: 200, body: page([]) }),
+    [API_KEY_CREDENTIAL_CREATE]: () => ({ status: 201, body: apiKeyCredentialRecord() }),
+    [API_KEY_CREDENTIAL_ROTATE]: () => ({ status: 200, body: apiKeyCredentialRecord({ version: 2 }) }),
+    ...overrides,
+  };
+}
+
+function apiKeyClientFor(overrides: Record<string, StubHandler> = {}) {
+  const stub = createMoiraStub(apiKeyHandlers(overrides));
+  const client = new MoiraClient({
+    baseUrl: MOIRA_STUB_BASE_URL,
+    systemKey: "sk_test_stub",
+    fetch: stub.fetch,
+  });
+  return { stub, client };
+}
+
+describe("connectClaudeApiKey — a DIFFERENT dedicated provider row from the subscription one", () => {
+  test("creates a dedicated anthropic provider named for the API key, not the subscription", async () => {
+    const { stub, client } = apiKeyClientFor();
+    await connectClaudeApiKey(client, { apiKey: ANTHROPIC_API_KEY });
+
+    expect(stub.routes().slice(0, 2)).toEqual([API_KEY_PROVIDER_LIST, API_KEY_PROVIDER_CREATE]);
+    const sent = stub.bodyOf(API_KEY_PROVIDER_CREATE) as Record<string, unknown>;
+    expect(sent).toEqual({
+      provider_type: CLAUDE_SUBSCRIPTION_PROVIDER_TYPE,
+      display_name: CLAUDE_API_KEY_PROVIDER_DISPLAY_NAME,
+    });
+    // Never the subscription row's own display name.
+    expect(sent["display_name"]).not.toBe(CLAUDE_SUBSCRIPTION_PROVIDER_DISPLAY_NAME);
+  });
+
+  test("creates the credential with a secret shaped as EXACTLY { api_key }", async () => {
+    const { stub, client } = apiKeyClientFor();
+    const result = await connectClaudeApiKey(client, { apiKey: ANTHROPIC_API_KEY });
+
+    const sent = stub.bodyOf(API_KEY_CREDENTIAL_CREATE) as Record<string, unknown>;
+    expect(sent["provider_id"]).toBe(API_KEY_PROVIDER_ID);
+    expect(sent["credential_type"]).toBe("api_key");
+    expect(sent["display_name"]).toBe(CLAUDE_API_KEY_CREDENTIAL_DISPLAY_NAME);
+    const secret = sent["secret"] as Record<string, unknown>;
+    expect(Object.keys(secret)).toEqual(["api_key"]);
+    expect(secret["api_key"]).toBe(ANTHROPIC_API_KEY);
+    expect(result.outcome).toBe("created");
+  });
+
+  test("rotates an existing api_key credential in place rather than creating a second row", async () => {
+    const { stub, client } = apiKeyClientFor({
+      [API_KEY_CREDENTIAL_LIST]: () => ({ status: 200, body: page([apiKeyCredentialRecord()]) }),
+    });
+    const result = await connectClaudeApiKey(client, { apiKey: ANTHROPIC_API_KEY });
+
+    expect(stub.routes()).not.toContain(API_KEY_CREDENTIAL_CREATE);
+    expect(stub.routes()).toContain(API_KEY_CREDENTIAL_ROTATE);
+    expect(result.outcome).toBe("rotated");
+  });
+
+  test("the key reaches Moira and nothing else — the result carries no secret", async () => {
+    const { stub, client } = apiKeyClientFor();
+    const result = await connectClaudeApiKey(client, { apiKey: ANTHROPIC_API_KEY });
+
+    expect(JSON.stringify(stub.bodyOf(API_KEY_CREDENTIAL_CREATE))).toContain(ANTHROPIC_API_KEY);
+    expect(JSON.stringify(result)).not.toContain(ANTHROPIC_API_KEY);
+    expect(Object.keys(result).sort()).toEqual(["credentialId", "outcome", "providerId"]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* resolveAnthropicApiKey                                                     */
+/* -------------------------------------------------------------------------- */
+
+describe("resolveAnthropicApiKey", () => {
+  test("refuses an empty or whitespace-only value", () => {
+    expect(resolveAnthropicApiKey("")).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_required,
+    });
+    expect(resolveAnthropicApiKey("   ")).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_required,
+    });
+  });
+
+  test("refuses a non-string value", () => {
+    expect(resolveAnthropicApiKey(undefined)).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_required,
+    });
+  });
+
+  test("refuses a value longer than the bound", () => {
+    const tooLong = `sk-ant-${"a".repeat(MAX_API_KEY_LENGTH)}`;
+    expect(resolveAnthropicApiKey(tooLong)).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_too_long,
+    });
+  });
+
+  test("refuses a value carrying a control character", () => {
+    expect(resolveAnthropicApiKey(`${ANTHROPIC_API_KEY}\nextra-line`)).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_invalid,
+    });
+  });
+
+  test("refuses a value that does not start with sk-ant-", () => {
+    expect(resolveAnthropicApiKey("sk-proj-this-is-an-openai-key")).toEqual({
+      ok: false,
+      messageKey: CONSOLE_MESSAGE_KEYS.claude_api_key_wrong_shape,
+    });
+  });
+
+  test("accepts a well-formed key, trimmed", () => {
+    expect(resolveAnthropicApiKey(`  ${ANTHROPIC_API_KEY}  `)).toEqual({
+      ok: true,
+      apiKey: ANTHROPIC_API_KEY,
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Read-only status                                                           */
+/* -------------------------------------------------------------------------- */
+
+describe("loadClaudeSubscriptionStatus / loadClaudeApiKeyStatus", () => {
+  test("not_connected when no matching provider row exists", async () => {
+    const { client } = clientFor();
+    expect(await loadClaudeSubscriptionStatus(client)).toEqual({
+      kind: "not_connected",
+      status: null,
+      expiresAt: null,
+    });
+  });
+
+  test("not_connected when the provider exists but carries no matching credential", async () => {
+    const { client } = clientFor({ [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }) });
+    expect(await loadClaudeSubscriptionStatus(client)).toEqual({
+      kind: "not_connected",
+      status: null,
+      expiresAt: null,
+    });
+  });
+
+  test("connected, with the credential's status and expiry", async () => {
+    const { client } = clientFor({
+      [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }),
+      [CREDENTIAL_LIST]: () => ({
+        status: 200,
+        body: page([credentialRecord({ status: "disabled", expires_at: "2026-12-01T00:00:00Z" })]),
+      }),
+    });
+    expect(await loadClaudeSubscriptionStatus(client)).toEqual({
+      kind: "connected",
+      status: "disabled",
+      expiresAt: "2026-12-01T00:00:00Z",
+    });
+  });
+
+  test("never carries masked_secret or a fingerprint, even though the underlying record does", async () => {
+    const { client } = clientFor({
+      [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }),
+      [CREDENTIAL_LIST]: () => ({ status: 200, body: page([credentialRecord()]) }),
+    });
+    const status = await loadClaudeSubscriptionStatus(client);
+    const text = JSON.stringify(status);
+    expect(text).not.toContain("mask");
+    expect(text).not.toContain("fingerprint");
+  });
+
+  test("unknown when the provider list is truncated before a match is confirmed absent", async () => {
+    const { client } = clientFor({ [PROVIDER_LIST]: () => ({ status: 200, body: page([], true) }) });
+    expect(await loadClaudeSubscriptionStatus(client)).toEqual({
+      kind: "unknown",
+      status: null,
+      expiresAt: null,
+    });
+  });
+
+  test("unknown when the credential list is truncated before a match is confirmed absent", async () => {
+    const { client } = clientFor({
+      [PROVIDER_LIST]: () => ({ status: 200, body: page([providerRecord()]) }),
+      [CREDENTIAL_LIST]: () => ({ status: 200, body: page([], true) }),
+    });
+    expect(await loadClaudeSubscriptionStatus(client)).toEqual({
+      kind: "unknown",
+      status: null,
+      expiresAt: null,
+    });
+  });
+
+  test("loadClaudeApiKeyStatus reads the DIFFERENT dedicated row, independently", async () => {
+    const { client } = apiKeyClientFor({
+      [API_KEY_PROVIDER_LIST]: () => ({ status: 200, body: page([apiKeyProviderRecord()]) }),
+      [API_KEY_CREDENTIAL_LIST]: () => ({ status: 200, body: page([apiKeyCredentialRecord()]) }),
+    });
+    expect(await loadClaudeApiKeyStatus(client)).toEqual({
+      kind: "connected",
+      status: "active",
+      expiresAt: null,
+    });
   });
 });

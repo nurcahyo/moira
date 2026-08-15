@@ -28,8 +28,8 @@ pub use ingestion::{
     prepare_chunks,
 };
 pub use openapi_import::{
-    MAX_IMPORT_OPERATIONS, OpenApiImportError, ParsedImport, ParsedOperation,
-    parse_openapi_document,
+    MAX_DOCUMENT_BYTES, MAX_IMPORT_OPERATIONS, MAX_OPERATION_SCHEMA_BYTES, MAX_TOTAL_SCHEMA_BYTES,
+    OpenApiImportError, ParsedImport, ParsedOperation, parse_openapi_document,
 };
 pub use provider_url::normalize_openai_base_url;
 pub use retrieval::{
@@ -46,6 +46,6 @@ pub use runtime_factory::{
 };
 pub use skill_tool::{
     HttpSkillTool, SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolBuildError,
-    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopOutcome, build_skill_tool_set,
-    run_tool_loop,
+    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopFailure, ToolLoopOutcome,
+    build_skill_tool_set, run_tool_loop,
 };

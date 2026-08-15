@@ -47,6 +47,26 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when Moira cannot reach or use its database, for example when a required database connection is not configured.",
     },
     I18nEntry {
+        key: "moira.error.eval_suite_not_runnable",
+        default_message: "This eval suite cannot be run.",
+        description: "Used by POST /api/v1/admin/eval-suites/{id}/run (issue #214, plan 12 §3) when the suite cannot be evaluated: it is not active, or it has no cases. An eval with nothing to grade produces no signal, so it is refused rather than returning an empty pass. The English message names the specific reason so the operator can enable the suite or add cases.",
+    },
+    I18nEntry {
+        key: "moira.error.eval_target_missing",
+        default_message: "This eval run has no target agent profile.",
+        description: "Used by POST /api/v1/admin/eval-suites/{id}/run (issue #214, plan 12 §3) when no target agent profile can be resolved for the run: the request did not supply agent_profile_id, the suite carries no metadata.target_agent_profile_id, or the resolved id names no live agent profile. Fail-closed: an eval measures a subject, so a run with no subject is refused rather than graded against nothing.",
+    },
+    I18nEntry {
+        key: "moira.error.flow_not_runnable",
+        default_message: "This flow cannot be run.",
+        description: "Used by POST /api/v1/admin/flows/{id}/run (issue #214, plan 12 §3) when the flow cannot be executed: it is not active, or it has no steps. The English message names the specific reason so the operator can enable the flow or add steps.",
+    },
+    I18nEntry {
+        key: "moira.error.flow_step_failed",
+        default_message: "A flow step failed, so the run was aborted.",
+        description: "Used to describe a flow step whose underlying execution did not succeed. A flow is sequential and fail-closed (plan 12 §3 decision 15): the first failing step aborts the whole run, no later step runs, and the run is marked failed. This is not returned as an HTTP error from POST /api/v1/admin/flows/{id}/run — that endpoint returns 200 with the failed run so the caller can inspect it — it is the message key for the failed step's error_summary, which also carries the sanitized failure class (no provider body, no prompt). The console renders this generic message alongside that class.",
+    },
+    I18nEntry {
         key: "moira.error.forbidden",
         default_message: "You do not have permission to perform this action.",
         description: "Used when the caller is authenticated but not authorized.",
@@ -767,7 +787,7 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
         key: "moira.error.invalid_openapi_spec",
         default_message: "The OpenAPI document could not be parsed.",
-        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, or it defines no importable operations. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
+        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, it defines no importable operations, or it exceeds the import byte budget (a document over 512 KiB, a single derived params_schema over 64 KiB, or derived schemas totalling over 2 MiB - the guard against $ref amplification, where one referenced schema is deep-cloned once per operation). The message carries the measured size and the cap it exceeded. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
     },
     I18nEntry {
         key: "moira.error.ssrf_blocked_host",

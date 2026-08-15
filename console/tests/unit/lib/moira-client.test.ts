@@ -171,7 +171,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly fifteen of the registry's operations declare a key", () => {
+  test("exactly twenty of the registry's operations declare a key", () => {
     // Every entry is read off the spec, not assumed;
     // `tests/contract/openapi-contract.test.ts` re-derives each flag from
     // `docs/openapi.json` on every run.
@@ -193,6 +193,22 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     // `revokeConsumerKey` declares neither that nor `If-Match` — unlike every
     // provider-family disable. Read off the spec; the neighbouring families would
     // have predicted the wrong answer.
+    //
+    // FOUR MORE WITH PLAN 12 §§3/5/6: `createSkill` and `importSkills` (the
+    // OpenAPI import pipeline creates rows too, and a double-submit must replay
+    // rather than import the same spec twice), `createEvalSuite`, `createFlow`.
+    // The same shape as the LLM surface repeats: every top-level CREATE declares
+    // a key, and none of enable/disable/bulk-enable/patch/delete does —
+    // `bulkEnableSkills` in particular declares NEITHER this nor `If-Match`,
+    // because it is a multi-row operation with no single row version.
+    //
+    // ONE MORE WITH ISSUE #261 (the playground): `createResponse` (`POST
+    // /api/v1/responses`, the non-streaming fallback) declares an OPTIONAL
+    // key, unlike every other entry above — the playground does not supply
+    // one (a replayed prompt should execute again, not silently return the
+    // first answer), which is legal since the header is declared, not
+    // required. `streamResponse` is NOT in this list: the spec explicitly
+    // rejects `Idempotency-Key` on the streaming operation.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
@@ -202,12 +218,17 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
       "createApplication",
       "createAuthProvider",
       "createConsumerKey",
+      "createEvalSuite",
+      "createFlow",
       "createProvider",
       "createProviderCredential",
       "createProviderModel",
+      "createResponse",
       "createRoutingPolicy",
+      "createSkill",
       "createTrustedJwtIssuer",
       "deleteAdminIdentity",
+      "importSkills",
       "patchAdminIdentity",
       "redeemAdminInvite",
       "revokeAdminInvite",
@@ -710,6 +731,61 @@ const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
   "previewAdminInvite",
   "redeemAdminInvite",
   "revokeAdminInvite",
+  // Plan 12 §§3/5/6. The agent-platform registries — skills, eval suites, flows
+  // — are a NEW administrative surface, not LLM runtime configuration: none of
+  // them names a provider, model, credential or routing knob to change, and
+  // `LLM_CONFIG_OPERATION_NAMES` is derived from the provider/model/credential/
+  // routing PATH SEGMENT alone (`collectionSegmentOf`), which none of these
+  // share. They are not an auth-provider operation either.
+  //
+  // `getProviderHealth` (issue #83) is DELIBERATELY ABSENT from this list even
+  // though it is no more "LLM configuration" than these — its path segment is
+  // `providers`, the same segment `LLM_CONFIG_COLLECTIONS` already contains, so
+  // `collectionSegmentOf` classifies it there automatically. Listing it here too
+  // would double-classify it and fail this very completeness check. Its only
+  // consequence is inheriting "every LLM-configuration operation requires a
+  // credential", which is true of it regardless.
+  "listSkills",
+  "createSkill",
+  "getSkill",
+  "patchSkill",
+  "deleteSkill",
+  "enableSkill",
+  "disableSkill",
+  "bulkEnableSkills",
+  "importSkills",
+  "listSkillExecutors",
+  "getSkillExecutor",
+  "patchSkillExecutor",
+  "deleteSkillExecutor",
+  "listEvalSuites",
+  "createEvalSuite",
+  "getEvalSuite",
+  "patchEvalSuite",
+  "deleteEvalSuite",
+  "listEvalCases",
+  "createEvalCase",
+  "deleteEvalCase",
+  "listEvalRuns",
+  "listFlows",
+  "createFlow",
+  "getFlow",
+  "patchFlow",
+  "deleteFlow",
+  "listFlowRuns",
+  "listAgentProfiles",
+  // Issue #261 (the playground). The public execution surface — chat, its
+  // streaming twin, the post-run execution summary, and the admin-only
+  // diagnostic — is EXECUTION, not LLM runtime CONFIGURATION: none of them
+  // names a provider, model, credential or routing knob to CHANGE, which is
+  // the property `LLM_CONFIG_OPERATION_NAMES` is derived over. Their path
+  // segments (`responses`, `executions`, `runtime`) do not match
+  // `LLM_CONFIG_COLLECTIONS` either, so `collectionSegmentOf` would not have
+  // classified them there by accident. Not an auth-provider operation.
+  "createResponse",
+  "streamResponse",
+  "getExecution",
+  "diagnoseRuntime",
 ] as const satisfies readonly MoiraOperationName[];
 
 describe("the LLM configuration surface is administration, never bootstrap", () => {

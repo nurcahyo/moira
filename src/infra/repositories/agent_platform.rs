@@ -22,18 +22,21 @@ use uuid::Uuid;
 use crate::{
     domain::{
         AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
-        AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentSkillBinding, AuditLogInsert,
-        EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest,
-        EvalSuitePatchRequest, EvalSuiteRecord, ListCursor, ResolvedCredential, SkillCreateRequest,
+        AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentFlowStepRunRecord, AgentSkillBinding,
+        AuditLogInsert, EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalRunStatus,
+        EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord, EvalTriggerKind,
+        FlowRunStatus, FlowStepRunStatus, ListCursor, ResolvedCredential, SkillCreateRequest,
         SkillCredentialOutcome, SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord,
         SkillPatchRequest, SkillRecord, credential_binding_permits_host,
     },
     error::AppError,
     infra::pg_rows::{
         agent_flow_record_from_row, agent_flow_run_record_from_row,
-        agent_flow_step_record_from_row, credential_record_from_row, credential_type_to_db,
-        eval_case_record_from_row, eval_run_record_from_row, eval_suite_record_from_row,
-        flow_step_on_failure_to_db, grading_kind_to_db, http_method_to_db, scope_type_to_db,
+        agent_flow_step_record_from_row, agent_flow_step_run_record_from_row,
+        credential_record_from_row, credential_type_to_db, eval_case_record_from_row,
+        eval_run_record_from_row, eval_run_status_to_db, eval_suite_record_from_row,
+        eval_trigger_kind_to_db, flow_run_status_to_db, flow_step_on_failure_to_db,
+        flow_step_run_status_to_db, grading_kind_to_db, http_method_to_db, scope_type_to_db,
         skill_http_executor_record_from_row, skill_record_from_row,
     },
     orchestration::ParsedOperation,
@@ -88,9 +91,13 @@ const FLOW_VERSION_FOR_UPDATE: &str =
 const FLOW_STEP_COLUMNS: &str = "id, flow_id, step_key, step_order, agent_profile_id, \
      on_failure, input_mapping, metadata, created_at";
 
-/// `agent_flow_runs` is append-only; produced by the (not-yet-built) flow orchestrator, never
-/// written through this admin surface.
+/// `agent_flow_runs` is append-only; produced by the flow orchestrator (issue #214, the
+/// execution half), never written through the admin CRUD surface.
 const FLOW_RUN_COLUMNS: &str = "id, flow_id, status, metadata, created_at, completed_at";
+
+/// `agent_flow_step_runs` is append-only; one row per step attempted within a flow run.
+const FLOW_STEP_RUN_COLUMNS: &str = "id, flow_run_id, step_id, execution_id, status, \
+     error_summary, created_at, completed_at";
 
 #[derive(Clone)]
 pub struct PgAgentPlatformRepository {
@@ -832,8 +839,8 @@ impl PgAgentPlatformRepository {
     }
 
     // =================================================================================
-    // Eval runs — read-only. Produced by execution, never written through this admin
-    // surface (F2's read-only-runs decision).
+    // Eval runs — read-only via the admin CRUD surface; produced by the offline eval
+    // runner (issue #214, the execution half) through `insert_eval_run`.
     // =================================================================================
 
     pub async fn list_eval_runs(
@@ -854,6 +861,54 @@ impl PgAgentPlatformRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(eval_run_record_from_row).collect()
+    }
+
+    /// Every case of a suite, in creation order — the offline eval runner grades them all in
+    /// one pass, so it reads the whole set rather than a keyset page.
+    pub async fn all_eval_cases(&self, suite_id: Uuid) -> Result<Vec<EvalCaseRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {EVAL_CASE_COLUMNS} from eval_cases where suite_id = $1 \
+             order by created_at asc, id asc"
+        ))
+        .bind(suite_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(eval_case_record_from_row).collect()
+    }
+
+    /// Writes one terminal `eval_runs` row for a completed offline run. `trigger_kind` is
+    /// always `offline_manual` on this path (decision 14 — no CI or online sampling yet);
+    /// `results` carries the per-case pass/fail detail and `score` the pass rate. `completed_at`
+    /// is stamped `now()` because the offline runner is inline: the row is written once, in its
+    /// final state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_eval_run(
+        &self,
+        id: Uuid,
+        suite_id: Uuid,
+        agent_profile_id: Uuid,
+        trigger_kind: EvalTriggerKind,
+        status: EvalRunStatus,
+        score: Option<f64>,
+        results: &Value,
+        metadata: &Value,
+    ) -> Result<EvalRunRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "insert into eval_runs (id, suite_id, agent_profile_id, trigger_kind, status, \
+             score, results, metadata, completed_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, now()) returning {EVAL_RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(suite_id)
+        .bind(agent_profile_id)
+        .bind(eval_trigger_kind_to_db(&trigger_kind))
+        .bind(eval_run_status_to_db(&status))
+        .bind(score)
+        .bind(results)
+        .bind(metadata)
+        .fetch_one(&self.pool)
+        .await?;
+        eval_run_record_from_row(&row)
     }
 
     // =================================================================================
@@ -1041,8 +1096,8 @@ impl PgAgentPlatformRepository {
     }
 
     // =================================================================================
-    // Flow runs — read-only. Produced by the (not-yet-built) flow orchestrator, never
-    // written through this admin surface.
+    // Flow runs — read-only via the admin CRUD surface; produced by the flow orchestrator
+    // (issue #214, the execution half) through the insert/finalize helpers below.
     // =================================================================================
 
     pub async fn list_flow_runs(
@@ -1063,6 +1118,105 @@ impl PgAgentPlatformRepository {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(agent_flow_run_record_from_row).collect()
+    }
+
+    /// Opens a flow run in the `running` state before any step executes, so a concurrent
+    /// `GET .../flows/{id}/runs` can see the run in flight and a run left `running` is the
+    /// honest signal that the orchestrator died mid-flow.
+    pub async fn insert_flow_run(
+        &self,
+        id: Uuid,
+        flow_id: Uuid,
+        metadata: &Value,
+    ) -> Result<AgentFlowRunRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "insert into agent_flow_runs (id, flow_id, metadata) values ($1, $2, $3) \
+             returning {FLOW_RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(flow_id)
+        .bind(metadata)
+        .fetch_one(&self.pool)
+        .await?;
+        agent_flow_run_record_from_row(&row)
+    }
+
+    /// Moves a flow run to a terminal state (`completed`/`failed`/`cancelled`) and stamps
+    /// `completed_at`.
+    pub async fn finalize_flow_run(
+        &self,
+        id: Uuid,
+        status: FlowRunStatus,
+    ) -> Result<AgentFlowRunRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "update agent_flow_runs set status = $2, completed_at = now() where id = $1 \
+             returning {FLOW_RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(flow_run_status_to_db(&status))
+        .fetch_one(&self.pool)
+        .await?;
+        agent_flow_run_record_from_row(&row)
+    }
+
+    /// Opens one step run in the `running` state.
+    pub async fn insert_flow_step_run(
+        &self,
+        id: Uuid,
+        flow_run_id: Uuid,
+        step_id: Uuid,
+    ) -> Result<AgentFlowStepRunRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "insert into agent_flow_step_runs (id, flow_run_id, step_id, status) \
+             values ($1, $2, $3, 'running') returning {FLOW_STEP_RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(flow_run_id)
+        .bind(step_id)
+        .fetch_one(&self.pool)
+        .await?;
+        agent_flow_step_run_record_from_row(&row)
+    }
+
+    /// Moves a step run to a terminal state, correlating it to the underlying pipeline
+    /// `execution_id` and carrying a sanitized `error_summary` on the failure path.
+    pub async fn finalize_flow_step_run(
+        &self,
+        id: Uuid,
+        status: FlowStepRunStatus,
+        execution_id: Option<Uuid>,
+        error_summary: Option<&str>,
+    ) -> Result<AgentFlowStepRunRecord, AppError> {
+        let row = sqlx::query(&format!(
+            "update agent_flow_step_runs set status = $2, execution_id = $3, \
+             error_summary = $4, completed_at = now() where id = $1 \
+             returning {FLOW_STEP_RUN_COLUMNS}"
+        ))
+        .bind(id)
+        .bind(flow_step_run_status_to_db(&status))
+        .bind(execution_id)
+        .bind(error_summary)
+        .fetch_one(&self.pool)
+        .await?;
+        agent_flow_step_run_record_from_row(&row)
+    }
+
+    /// Every step run of a flow run, in creation order — the run response returns them so the
+    /// caller sees per-step results without a second round trip.
+    pub async fn list_flow_step_runs(
+        &self,
+        flow_run_id: Uuid,
+    ) -> Result<Vec<AgentFlowStepRunRecord>, AppError> {
+        let rows = sqlx::query(&format!(
+            "select {FLOW_STEP_RUN_COLUMNS} from agent_flow_step_runs where flow_run_id = $1 \
+             order by created_at asc, id asc"
+        ))
+        .bind(flow_run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(agent_flow_step_run_record_from_row)
+            .collect()
     }
 }
 

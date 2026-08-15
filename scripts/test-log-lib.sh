@@ -167,7 +167,21 @@ tl_count_skips() {
 # it" true, and it is the reason the line above had become a lie. The cost is real and belongs
 # to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
 # until this number moves with it. That is the intended failure, not a flake.
-TL_TEST_COUNT_MINIMUM=1562
+#
+# Both sides of the merge below moved this line, so both histories are kept. `develop` carried
+# **1466** — 1458 + 8 derived, not measured, from `fix/plan12-4-backend` (issues #251 finding 1,
+# #253 finding 2: one SQL-shape unit test and one end-to-end HTTP test for the provider-health
+# average-latency decode, plus six unit tests for the OpenAPI import byte budget). That branch
+# ran its tests targeted rather than through a full `/usr/bin/make gates`, because five units
+# were working in parallel worktrees and a full gate run each would have serialised them. It was
+# therefore arithmetic on the last measured figure, safe in the direction that matters and
+# explicitly asking to be re-measured.
+#
+# This is that re-measurement. Re-measured 2026-08-16 on the merge of `develop` into
+# `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
+# with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
+# 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
+TL_TEST_COUNT_MINIMUM=1588
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

@@ -19,14 +19,14 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
-    application::{AgentPlatformService, RequestContext},
+    application::{AgentPlatformService, FlowEvalExecutionService, RequestContext},
     domain::{
         AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
-        EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest,
-        EvalSuitePatchRequest, EvalSuiteRecord, ListResponse, PageQuery, SkillBulkEnableRequest,
-        SkillBulkEnableResponse, SkillCreateRequest, SkillHttpExecutorPatchRequest,
-        SkillHttpExecutorRecord, SkillImportRequest, SkillImportResponse, SkillPatchRequest,
-        SkillRecord,
+        AgentFlowRunResult, EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalRunRequest,
+        EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord, FlowRunRequest,
+        ListResponse, PageQuery, SkillBulkEnableRequest, SkillBulkEnableResponse,
+        SkillCreateRequest, SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord,
+        SkillImportRequest, SkillImportResponse, SkillPatchRequest, SkillRecord,
     },
     error::{AppError, ErrorResponse},
 };
@@ -653,6 +653,35 @@ pub async fn list_eval_runs(
         .map(Json)
 }
 
+/// Runs every case of a suite against a target agent profile through the normal execution
+/// pipeline and grades the output (issue #214, plan 12 §3, the execution half). Offline,
+/// inline, `exact_match`/`contains`/`schema_valid` only (decision 14 — no LLM-judge). No
+/// `If-Match`: this appends a new `eval_runs` row, it does not mutate the versioned suite.
+#[utoipa::path(
+    post, path = "/api/v1/admin/eval-suites/{id}/run", tag = "admin-eval-suites",
+    request_body = EvalRunRequest,
+    params(("id" = Uuid, Path, description = "Eval suite identifier")),
+    responses(
+        (status = 200, description = "Completed eval run with per-case pass/fail results", body = EvalRunRecord),
+        (status = "4XX", description = "Request, authentication, authorization, or not-found error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn run_eval_suite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<EvalRunRequest>,
+) -> Result<Json<EvalRunRecord>, AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    FlowEvalExecutionService::new(&state)?
+        .run_eval_suite(&actor, &ctx, id, request)
+        .await
+        .map(Json)
+}
+
 // =========================================================================================
 // Flows (issue #214, plan 12 §3). Steps travel inside the flow's own create/patch body — see
 // `domain::AgentFlowRecord`'s doc comment — so there is no separate steps CRUD surface here.
@@ -815,6 +844,37 @@ pub async fn list_flow_runs(
     let actor = admin_actor(&state, &headers).await?;
     AgentPlatformService::new(&state)?
         .list_flow_runs(&actor, id, query.cursor.as_deref(), query.limit())
+        .await
+        .map(Json)
+}
+
+/// Executes a flow's steps in order through the normal execution pipeline, fail-closed
+/// (issue #214, plan 12 §3, the execution half). Sequential-only (decision 13); a step
+/// failure aborts the run and marks it `failed` (decision 15). Returns `200` with the
+/// finalized run and its step-run rows even when the run failed — a step failure is data (the
+/// run `status` and the aborting step's `error_summary`), not an HTTP error. No `If-Match`:
+/// this appends new run rows, it does not mutate the versioned flow.
+#[utoipa::path(
+    post, path = "/api/v1/admin/flows/{id}/run", tag = "admin-flows",
+    request_body = FlowRunRequest,
+    params(("id" = Uuid, Path, description = "Flow identifier")),
+    responses(
+        (status = 200, description = "Finalized flow run with one step-run row per step attempted", body = AgentFlowRunResult),
+        (status = "4XX", description = "Request, authentication, authorization, or not-found error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn run_flow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<FlowRunRequest>,
+) -> Result<Json<AgentFlowRunResult>, AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    let ctx = RequestContext::from_headers(&headers);
+    FlowEvalExecutionService::new(&state)?
+        .run_flow(&actor, &ctx, id, request)
         .await
         .map(Json)
 }

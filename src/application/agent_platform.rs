@@ -1361,6 +1361,21 @@ mod skill_import_tests {
             OpenApiImportError::MissingServerUrl,
             OpenApiImportError::InvalidServerUrl("not a url".to_string()),
             OpenApiImportError::NoOperations,
+            // The three byte-budget refusals are 400s on the same generic code: they are a
+            // property of the submitted document, and the message carries the numbers.
+            OpenApiImportError::DocumentTooLarge {
+                bytes: 3_000_000,
+                cap: 524_288,
+            },
+            OpenApiImportError::OperationSchemaTooLarge {
+                skill_key: "op0".to_string(),
+                bytes: 200_000,
+                cap: 65_536,
+            },
+            OpenApiImportError::TotalSchemaTooLarge {
+                bytes: 90_000_000,
+                cap: 2_097_152,
+            },
         ] {
             let error = import_parse_error_to_app_error(failure);
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);

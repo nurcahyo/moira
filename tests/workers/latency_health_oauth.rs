@@ -36,7 +36,7 @@ use uuid::Uuid;
 use axum::http::StatusCode;
 
 use crate::support::{
-    TestDatabase,
+    MoiraHttpServer, TestDatabase,
     mock_control_plane::{MockControlPlane, TokenScript},
 };
 
@@ -358,6 +358,95 @@ async fn provider_health_check_records_an_unhealthy_snapshot_for_an_unreachable_
     let (status, latency_ms) = snapshot_row(&pool, provider.id).await;
     assert_eq!(status, "unhealthy");
     assert!(latency_ms.is_none());
+}
+
+/// The read half of issue #83, end to end over the real router: probe a reachable provider,
+/// then `GET /api/v1/admin/providers/health` and read the aggregate back.
+///
+/// This is the only test in the tree that decodes `average_latency_ms`, and decoding it is the
+/// whole point. `provider_health_snapshots.latency_ms` is `integer`, so `avg(latency_ms)` is
+/// Postgres `numeric`; this crate builds sqlx with neither `bigdecimal` nor `rust_decimal`, so
+/// there is no `NUMERIC` decoder at all and `try_get::<Option<f64>>` fails with `ColumnDecode`
+/// on any non-NULL value — a 500 for every caller, from the first reachable probe onwards.
+/// The writers' own tests could never see it: they read `provider_health_snapshots` directly
+/// and never touch the aggregate. Hence the deliberate shape here — a real snapshot with a
+/// non-null `latency_ms` first, then the route, then an assertion that the number arrived.
+///
+/// Going through `MoiraHttpServer` rather than calling `AdminService::provider_health`
+/// directly buys the status code: a `ColumnDecode` becomes `AppError::Sqlx` becomes 500, and
+/// "the endpoint answers 200" is the claim the issue disputes.
+#[tokio::test]
+async fn provider_health_summary_reports_the_average_latency_over_http() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let state = test_state(&pool).await;
+    let control_plane = MockControlPlane::start().await;
+
+    let provider = AdminService::new(&state)
+        .expect("admin service")
+        .create_provider(
+            &admin_actor(),
+            &request_context(),
+            ProviderCreateRequest {
+                provider_type: ProviderType::OpenAiCompatible,
+                display_name: "Health summary provider".to_string(),
+                base_url: Some(control_plane.health_url()),
+                metadata: json!({}),
+            },
+        )
+        .await
+        .expect("create provider");
+
+    let settings = WorkerSettings::default();
+    queue(&pool, settings.clone())
+        .enqueue("provider-health-check", json!({}), None, &metrics())
+        .await
+        .expect("enqueue provider-health-check");
+    let outcome = dispatch_one(&state, settings).await;
+    assert_eq!(outcome.completed, 1);
+
+    // The row the aggregate is about to average over: `healthy`, so `latency_ms` is non-null,
+    // which is precisely the state that makes the summary's decode run at all.
+    let (status, latency_ms) = snapshot_row(&pool, provider.id).await;
+    assert_eq!(status, "healthy");
+    let measured = latency_ms.expect("a reachable probe must record a measured latency");
+
+    let server = MoiraHttpServer::start(state.clone()).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/v1/admin/providers/health", server.base_url))
+        .send()
+        .await
+        .expect("call GET /api/v1/admin/providers/health");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the health read surface must not 500 once a reachable probe is in the window"
+    );
+    let body: serde_json::Value = response.json().await.expect("parse the health response");
+
+    let wanted = json!(provider.id);
+    let entry = body["providers"]
+        .as_array()
+        .expect("providers must be an array")
+        .iter()
+        .find(|entry| entry["provider_id"] == wanted)
+        .expect("the probed provider must appear in the summary");
+    assert_eq!(entry["status"], "healthy");
+    assert_eq!(entry["probes_total"], json!(1));
+    assert_eq!(entry["probes_successful"], json!(1));
+    let average = entry["average_latency_ms"]
+        .as_f64()
+        .expect("average_latency_ms must be a number, not null");
+    assert!(
+        (average - f64::from(measured)).abs() < 0.5,
+        "the average over one snapshot must be that snapshot's latency: got {average}, \
+         snapshot recorded {measured}"
+    );
+
+    server.shutdown().await;
+    control_plane.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------------------

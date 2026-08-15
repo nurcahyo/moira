@@ -767,6 +767,57 @@ pub struct AgentFlowRunRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+/// One `agent_flow_step_runs` row — a single step's execution within a flow run (issue #214,
+/// plan 12 §3). Append-only, produced by the flow orchestrator, never authored through the
+/// admin CRUD surface. `execution_id` correlates the step to the underlying pipeline execution
+/// so an operator can join it against `execution_attempts`/`usage_records`/audit rows;
+/// `error_summary` carries a sanitized failure reason (a message key, never a provider body)
+/// on the step that aborted the run (decision 15).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentFlowStepRunRecord {
+    pub id: Uuid,
+    pub flow_run_id: Uuid,
+    pub step_id: Uuid,
+    pub execution_id: Option<Uuid>,
+    pub status: FlowStepRunStatus,
+    pub error_summary: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// `POST /api/v1/admin/flows/{id}/run` body. The optional `input` seeds the first step's
+/// prompt; when omitted the first step runs with an empty prompt (a flow whose first step
+/// reads only from its agent profile's preamble is legitimate). A step may still declare
+/// `input_mapping` to draw from `run_input` or a literal instead of the previous step's
+/// output — see `application::flow_eval_execution` for the passing convention.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FlowRunRequest {
+    #[serde(default)]
+    pub input: Option<Value>,
+}
+
+/// `POST /api/v1/admin/flows/{id}/run` response: the finalized flow run plus one step-run row
+/// per step attempted, in step order. Returned with `200` even when the run failed — a
+/// step failure is data (the run's `status` is `failed` and the aborting step's
+/// `error_summary` names why), not an HTTP error.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentFlowRunResult {
+    pub run: AgentFlowRunRecord,
+    pub steps: Vec<AgentFlowStepRunRecord>,
+}
+
+/// `POST /api/v1/admin/eval-suites/{id}/run` body. `agent_profile_id` names the target the
+/// suite's cases are graded against; when omitted it falls back to the suite's
+/// `metadata.target_agent_profile_id`. If neither resolves, the run is refused with
+/// `eval_target_missing` — an eval with no subject cannot measure anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EvalRunRequest {
+    #[serde(default)]
+    pub agent_profile_id: Option<Uuid>,
+}
+
 #[cfg(test)]
 mod credential_binding_tests {
     use super::credential_binding_permits_host;

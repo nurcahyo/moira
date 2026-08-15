@@ -73,12 +73,19 @@ tool loop (#84).
 2. **Rejects outright** (never silently truncates) a document defining more than **300**
    operations (§5 decision 23), returning `import_cap_exceeded` with the true count in the error
    envelope's `details`.
-3. SSRF-validates the document's `servers[0].url` through
+3. Enforces a byte budget alongside that count, returning `invalid_openapi_spec`: the input
+   document may not exceed **512 KiB**, any one derived `params_schema` may not exceed **64
+   KiB**, and the derived schemas may not exceed **2 MiB** in aggregate across the whole import.
+   The aggregate cap is the one that matters — `$ref` resolution deep-clones the referenced
+   schema once per operation, so 300 operations sharing one modest `$ref` amplify hundreds of
+   times over while every per-operation figure stays unremarkable. Charges are measured on the
+   referenced value and refused before the clone.
+4. SSRF-validates the document's `servers[0].url` through
    `security::ssrf::validate_outbound_url` — the same guard that hardens JWKS fetches — before any
    database write. A blocked host (private/loopback/link-local/metadata range, or a non-`https`
    scheme) returns `ssrf_blocked_host` without revealing the resolved address or the specific
    denial reason.
-4. On success, creates one `draft`/`tool` `skills` row plus one `skill_http_executors` row per
+5. On success, creates one `draft`/`tool` `skills` row plus one `skill_http_executors` row per
    operation, in a single transaction — all-or-nothing.
 
 Every imported skill lands `draft`, exactly like a hand-authored one (§5 decision 22) — the
@@ -426,8 +433,8 @@ versioned registries (`skills`, `eval_suites`, `agent_flows`).
   pagination, `If-Match`).
 - `src/http/agent_platform.rs` — admin handlers, registered additively in `src/http/mod.rs`.
 - `src/orchestration/openapi_import.rs` — pure OpenAPI 3.x parsing (issue #237): no I/O, so the
-  300-operation cap, `$ref` resolution, and skill-key derivation are unit-testable without a
-  network or a database.
+  300-operation cap, the byte budget, `$ref` resolution, and skill-key derivation are
+  unit-testable without a network or a database.
 - `tests/skill_import.rs` — end-to-end coverage over real Postgres: import, the operation cap,
   the SSRF block, and the executor CRUD lifecycle.
 - `tests/agent_platform.rs` — end-to-end coverage over real Postgres for skills, eval
