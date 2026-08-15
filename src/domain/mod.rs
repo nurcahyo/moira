@@ -28,11 +28,12 @@ pub use admin::{
 };
 pub use agent_platform::{
     AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
-    AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentSkillBinding, EvalCaseCreateRequest,
-    EvalCaseRecord, EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest,
-    EvalSuiteRecord, EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus,
-    GradingKind, GuardContext, GuardDenialReason, GuardPolicy, GuardPolicyError, GuardVerdict,
-    HttpMethod, SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillGuard,
+    AgentFlowRunResult, AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentFlowStepRunRecord,
+    AgentSkillBinding, EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalRunRequest,
+    EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord, EvalTriggerKind,
+    FlowRunRequest, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind, GuardContext,
+    GuardDenialReason, GuardPolicy, GuardPolicyError, GuardVerdict, HttpMethod,
+    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillGuard,
     SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
     SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillResolution, SkillStatus,
     SkillUnusableReason, evaluate_guards,

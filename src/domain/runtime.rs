@@ -321,6 +321,20 @@ pub struct ExecutionCommand {
     pub provider_hint: Option<Uuid>,
     pub model_hint: Option<Uuid>,
     pub credential_hint: Option<Uuid>,
+    /// Issue #214 (plan 12 §3) — the agent profile this execution must use, overriding the
+    /// one the selected route names. Set only by the flow-step and eval-suite runners in
+    /// `application::flow_eval_execution`, which target an `agent_profiles` row directly
+    /// rather than through a route. It is deliberately **not** exposed on any public request
+    /// DTO (`DiagnosticExecutionRequest`, the `/v1/responses` body) and therefore needs no
+    /// override-scope gate the way `route_hint`/`model_hint` do: an external caller cannot
+    /// reach it, and the runners that can are trusted internal callers of this pipeline (plan
+    /// 12 §3, "a new caller of the existing pipeline, not a parallel one"). Route/model
+    /// selection stays route-owned; only the preamble/parameters/`skill_refs` that the
+    /// profile carries are overridden. Fail-closed: a hint that resolves to a
+    /// missing/disabled profile refuses the execution exactly as a dangling route profile
+    /// does (issue #79).
+    #[serde(default)]
+    pub agent_profile_hint: Option<Uuid>,
     pub options: ExecutionOptions,
     #[serde(default)]
     pub metadata: Value,

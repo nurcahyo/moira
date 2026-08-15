@@ -1414,6 +1414,7 @@ impl ConversationService {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions {
                 // Zero temperature: the same transcript must produce the same candidates, or
                 // the dedupe below is testing a moving target.
@@ -1999,6 +2000,7 @@ impl ConversationService {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions {
                 // Zero temperature: two runs over the same backlog must produce the same
                 // summary, or `summary_hash` stops being a content address of anything.
