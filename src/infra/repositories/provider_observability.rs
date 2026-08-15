@@ -328,6 +328,23 @@ const PRUNE_HEALTH_SNAPSHOTS_SQL: &str = r#"
 /// aggregate query cannot also project a non-aggregated column without a `group by` that would
 /// defeat the point of aggregating in the first place; two small lateral subqueries per
 /// provider is the standard shape for "an aggregate plus the single latest row" in Postgres.
+///
+/// `avg(latency_ms)` is cast to `double precision` **in SQL**, and that cast is load-bearing,
+/// not cosmetic. `provider_health_snapshots.latency_ms` is `integer`
+/// (`migrations/0005_provider_runtime.sql`), and Postgres `avg(integer)` returns `numeric`.
+/// This crate builds sqlx without `bigdecimal` and without `rust_decimal` (`Cargo.toml`), so no
+/// `NUMERIC` decoder is compiled in at all: `f64`'s `Type<Postgres>` is `FLOAT8` and
+/// `Row::try_get` runs a type-compatibility check on every non-NULL value, so decoding a
+/// `numeric` into `Option<f64>` is a hard `ColumnDecode` error — a 500 on `GET
+/// /api/v1/admin/providers/health` for as long as any reachable probe is in the window, not a
+/// rounding wart. It only *looked* correct because the two states that make the average NULL
+/// (no snapshots at all, or every snapshot `unhealthy`, which stores `latency_ms = null`) skip
+/// the check entirely. Casting server-side keeps the wire type FLOAT8, which is the one type
+/// this build can decode.
+///
+/// `provider_health_summary_reports_the_average_latency_over_http` in
+/// `tests/workers/latency_health_oauth.rs` is the regression test: it drives a real probe to a
+/// real snapshot and reads the route, which is the only shape that exercises the decode.
 const PROVIDER_HEALTH_SUMMARIES_SQL: &str = r#"
     select
         p.id as provider_id,
@@ -345,7 +362,7 @@ const PROVIDER_HEALTH_SUMMARIES_SQL: &str = r#"
         select
             count(*) as probes_total,
             count(*) filter (where status <> 'unhealthy') as probes_successful,
-            avg(latency_ms) as average_latency_ms,
+            avg(latency_ms)::double precision as average_latency_ms,
             max(observed_at) as last_probe_at,
             max(observed_at) filter (where status <> 'unhealthy') as last_success_at,
             max(observed_at) filter (where status = 'unhealthy') as last_failure_at
@@ -390,5 +407,17 @@ mod tests {
     #[test]
     fn health_snapshots_are_always_written_at_provider_scope() {
         assert!(RECORD_HEALTH_SNAPSHOT_SQL.contains("values (gen_random_uuid(), $1, null,"));
+    }
+
+    /// `avg(integer)` is `numeric` in Postgres, and this build has no `NUMERIC` decoder (see
+    /// the constant's own doc comment). The cast to `double precision` is the only reason
+    /// `average_latency_ms` can be read into `Option<f64>` at all, so an edit that drops it
+    /// must go red here as well as in the end-to-end test — this one costs no database.
+    #[test]
+    fn the_health_summary_average_is_cast_to_float8_in_sql() {
+        assert!(
+            PROVIDER_HEALTH_SUMMARIES_SQL.contains("avg(latency_ms)::double precision"),
+            "avg(latency_ms) must be cast in SQL: this build decodes FLOAT8, never NUMERIC"
+        );
     }
 }

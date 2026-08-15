@@ -787,7 +787,7 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
         key: "moira.error.invalid_openapi_spec",
         default_message: "The OpenAPI document could not be parsed.",
-        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, or it defines no importable operations. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
+        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, it defines no importable operations, or it exceeds the import byte budget (a document over 512 KiB, a single derived params_schema over 64 KiB, or derived schemas totalling over 2 MiB - the guard against $ref amplification, where one referenced schema is deep-cloned once per operation). The message carries the measured size and the cap it exceeded. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
     },
     I18nEntry {
         key: "moira.error.ssrf_blocked_host",

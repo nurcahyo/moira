@@ -158,7 +158,16 @@ tl_count_skips() {
 # it" true, and it is the reason the line above had become a lie. The cost is real and belongs
 # to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
 # until this number moves with it. That is the intended failure, not a flake.
-TL_TEST_COUNT_MINIMUM=1458
+#
+# +8 on the `fix/plan12-4-backend` branch (issues #251 finding 1, #253 finding 2): one SQL-shape
+# unit test and one end-to-end HTTP test for the provider-health average-latency decode, and six
+# unit tests for the OpenAPI import byte budget. **Derived, not measured** — this branch's tests
+# were run targeted rather than through a full `/usr/bin/make gates`, because five units were
+# working in parallel worktrees and a full gate run each would have serialised them. 1458 + 8
+# is therefore the arithmetic on the last measured figure, and it is safe in the direction that
+# matters: a floor below the truth leaves slack, never a false red. Re-measure at the next
+# `/usr/bin/make gates` and, if this line is under the real count, move it up.
+TL_TEST_COUNT_MINIMUM=1466
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
