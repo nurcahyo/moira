@@ -2395,6 +2395,206 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* Containerised Claude runners (issue #275/#272 workstream R3)               */
+/* -------------------------------------------------------------------------- */
+//
+// `/api/v1/admin/runners*` — PR #282's frozen contract. The console never sees
+// a token: `ClaudeRunnerRecord` has no token-shaped field, matching the
+// invariant `src/domain/runners.rs` pins with its own generated-schema test.
+//
+// `credential_id` is the one field here that trips
+// `SECRET_DTO_FIELD_PATTERN` (it contains `credential`) without being a secret
+// — it is a bare UUID *reference* to the credential row the runner's token
+// became, never the token or anything derived from it. It is exempted BY NAME
+// in `tests/unit/architecture/server-only-guards.test.ts`'s `EXEMPT_DTO_FIELDS`,
+// the same mechanism `token_url` and `setup_token` already use for the same
+// reason: the field name matches a pattern built to catch secrets, and this
+// field is not one.
+
+/** `#/components/schemas/ClaudeRunnerState`. */
+export type ClaudeRunnerState =
+  | "provisioning"
+  | "awaiting_authorization"
+  | "exchanging"
+  | "ready"
+  | "linked"
+  | "failed"
+  | "expired";
+
+/**
+ * `ClaudeRunnerState`s a live poll (`GET /runners/{id}`) could still move on
+ * from. Mirrors `ClaudeRunnerState::is_terminal` in `src/domain/runners.rs` —
+ * `linked`, `failed` and `expired` are the only settled states; `ready` is
+ * deliberately NOT terminal, because finalize acts on it.
+ */
+export const CLAUDE_RUNNER_TERMINAL_STATES: ReadonlySet<ClaudeRunnerState> = new Set([
+  "linked",
+  "failed",
+  "expired",
+]);
+
+/**
+ * `#/components/schemas/CredentialScope`, restricted to what THIS console may
+ * render for a runner.
+ *
+ * ============================================================================
+ * WHY THIS IS NOT AN IMPORT OF `CredentialScope`
+ * ============================================================================
+ *
+ * `lib/moira-credential-types.ts` already declares the real `CredentialScope`
+ * union — but that module is server-only and CONTAINED (see its header), and
+ * `ClaudeRunnerRecord.scope` has to reach a CLIENT component: CONVENTIONS' own
+ * requirement here is "the UI must make it obvious which one a runner belongs
+ * to — in the list and on the detail view", which is a rendering job, not a
+ * server-only one. Importing the contained module from here would drag it (and
+ * every module server-only-derivation considers reachable from it) into a
+ * browser bundle, and `server-only-guards.test.ts` refuses exactly that.
+ *
+ * So this is a structural mirror, not a spread: the same four variants, kept in
+ * step by hand because `CredentialScope` itself carries no `*_CONTRACT` (its
+ * spec node is a bare `oneOf` with no `properties`/`required` — see that type's
+ * own header) and therefore nothing here can weld the two together at compile
+ * time either.
+ */
+export type ClaudeRunnerScope =
+  | { readonly type: "global" }
+  | { readonly type: "tenant"; readonly external_tenant_id: string }
+  | {
+      readonly type: "application";
+      readonly application_id: string;
+      readonly external_tenant_id?: string | null;
+    }
+  | {
+      readonly type: "user";
+      readonly external_user_id: string;
+      readonly application_id?: string | null;
+      readonly external_tenant_id?: string | null;
+    };
+
+/** The runner service's charset for `label` — it becomes a container name. */
+export const CLAUDE_RUNNER_LABEL_PATTERN = /^[a-z0-9-]{1,64}$/;
+
+export const CLAUDE_RUNNER_TTL_SECONDS_MIN = 60;
+export const CLAUDE_RUNNER_TTL_SECONDS_MAX = 3600;
+/** The contract's own default (`default_ttl_seconds` in `src/domain/runners.rs`). */
+export const CLAUDE_RUNNER_TTL_SECONDS_DEFAULT = 900;
+
+/** `#/components/schemas/ClaudeRunnerProvisionRequest`. `additionalProperties: false`. */
+export interface ClaudeRunnerProvisionRequest {
+  label: string;
+  metadata?: JsonValue;
+  scope?: ClaudeRunnerScope | null;
+  ttl_seconds?: number;
+}
+
+export const CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerProvisionRequest",
+  required: ["label"],
+  optional: ["metadata", "scope", "ttl_seconds"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerProvisionRequest,
+    (typeof CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ClaudeRunnerAuthorizationCodeRequest`. */
+export interface ClaudeRunnerAuthorizationCodeRequest {
+  code: string;
+}
+
+export const CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerAuthorizationCodeRequest",
+  required: ["code"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerAuthorizationCodeRequest,
+    (typeof CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ClaudeRunnerFinalizeRequest`.
+ *
+ * NO `scope` FIELD, DELIBERATELY. The scope is fixed at provisioning time and
+ * sealed into the credential's AAD; `deny_unknown_fields` on the Moira side
+ * refuses one sent here, and this type cannot even express sending it —
+ * `assertRunnerFinalizeRequestIsSafe` in `lib/moira-client.ts` re-checks that
+ * for callers that reached the wire through an `any`.
+ */
+export interface ClaudeRunnerFinalizeRequest {
+  provider_id: string;
+  display_name?: string | null;
+  metadata?: JsonValue;
+}
+
+export const CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerFinalizeRequest",
+  required: ["provider_id"],
+  optional: ["display_name", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerFinalizeRequest,
+    (typeof CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ClaudeRunnerRecord`. NO TOKEN-SHAPED FIELD — see this
+ * section's header. `credential_id` is a reference only.
+ */
+export interface ClaudeRunnerRecord {
+  id: string;
+  label: string;
+  runner_reference: string;
+  state: ClaudeRunnerState;
+  scope: ClaudeRunnerScope;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  authorization_url?: string | null;
+  error_code?: string | null;
+  expires_at?: string | null;
+  credential_id?: string | null;
+  provider_id?: string | null;
+}
+
+export const CLAUDE_RUNNER_RECORD_CONTRACT = {
+  schema: "ClaudeRunnerRecord",
+  required: [
+    "id",
+    "label",
+    "runner_reference",
+    "state",
+    "scope",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["authorization_url", "error_code", "expires_at", "credential_id", "provider_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerRecord,
+    (typeof CLAUDE_RUNNER_RECORD_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Error envelope (server-side shape — never crosses to the browser)          */
 /* -------------------------------------------------------------------------- */
 
@@ -3248,6 +3448,10 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   GRAPH_NODE_CONTRACT,
   GRAPH_EDGE_CONTRACT,
   GRAPH_RESPONSE_CONTRACT,
+  CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_RECORD_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
   // --- the playground (issue #261) ---------------------------------------

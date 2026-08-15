@@ -69,6 +69,10 @@ export const INVITE_ROUTE_FIXTURE_TOKEN = "invite-e2e-fixture-token-0f3c2a91";
  */
 export const DYNAMIC_ROUTE_FIXTURES: Readonly<Record<string, string>> = {
   "/invite/[token]": `/invite/${INVITE_ROUTE_FIXTURE_TOKEN}`,
+  // Gated (inside `(console)`), so the walker only asserts the redirect to
+  // `/login` — the id need not resolve to a real runner. See `a11y.e2e.ts`'s
+  // `ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E`.
+  "/runners/[id]": "/runners/00000000-0000-4000-8000-000000000000",
 };
 
 const PAGE_FILES = new Set(["page.tsx", "page.ts", "page.jsx", "page.js", "page.mjs"]);

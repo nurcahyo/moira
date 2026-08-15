@@ -20,6 +20,8 @@ import {
   assertProviderCreateIsSafe,
   assertProviderModelCreateIsSafe,
   assertRoutingPolicyCreateIsSafe,
+  assertRunnerFinalizeRequestIsSafe,
+  assertRunnerProvisionRequestIsSafe,
   assertTrustedIssuerCreateIsSafe,
   ifMatchFor,
   type MoiraOperationName,
@@ -171,7 +173,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly twenty of the registry's operations declare a key", () => {
+  test("exactly twenty-one of the registry's operations declare a key", () => {
     // Every entry is read off the spec, not assumed;
     // `tests/contract/openapi-contract.test.ts` re-derives each flag from
     // `docs/openapi.json` on every run.
@@ -209,6 +211,14 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     // first answer), which is legal since the header is declared, not
     // required. `streamResponse` is NOT in this list: the spec explicitly
     // rejects `Idempotency-Key` on the streaming operation.
+    //
+    // ONE MORE WITH ISSUE #275/#272 R3, and the ABSENCE beside it is the same
+    // lesson repeated: `provisionRunner` declares a key, but `finalizeRunner` and
+    // `submitRunnerAuthorizationCode` — right next to it in the same family —
+    // declare NEITHER header, despite `src/http/runners.rs`'s own doc comment
+    // describing an `Idempotency-Key` parameter for finalize. The GENERATED
+    // `docs/openapi.json` is ground truth here, not the handler's prose; see the
+    // registry's own comment on these three entries.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
@@ -230,6 +240,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
       "deleteAdminIdentity",
       "importSkills",
       "patchAdminIdentity",
+      "provisionRunner",
       "redeemAdminInvite",
       "revokeAdminInvite",
       "rotateProviderCredential",
@@ -774,6 +785,21 @@ const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
   "deleteFlow",
   "listFlowRuns",
   "listAgentProfiles",
+  // Issue #275/#272 workstream R3. Containerised Claude runners are a
+  // PROVISIONING WORKFLOW over the runner service, not LLM runtime
+  // CONFIGURATION: none of them names a provider, model, credential or
+  // routing knob to CHANGE directly — `finalizeRunner` writes a credential as
+  // a SIDE EFFECT of linking a token, which is a different thing from what
+  // `LLM_CONFIG_OPERATION_NAMES`'s provider/model/credential/routing PATH
+  // SEGMENTS classify. Their own path segment (`runners`) is not in
+  // `LLM_CONFIG_COLLECTIONS` either, so `collectionSegmentOf` would not have
+  // classified them there by accident. Not an auth-provider operation.
+  "provisionRunner",
+  "listRunners",
+  "getRunner",
+  "submitRunnerAuthorizationCode",
+  "finalizeRunner",
+  "deleteRunner",
   // Issue #261 (the playground). The public execution surface — chat, its
   // streaming twin, the post-run execution summary, and the admin-only
   // diagnostic — is EXECUTION, not LLM runtime CONFIGURATION: none of them
@@ -1265,6 +1291,163 @@ describe("a refused LLM write maps through lib/errors.ts like every other failur
 });
 
 /* -------------------------------------------------------------------------- */
+/* Claude runners (issue #275/#272 workstream R3)                             */
+/* -------------------------------------------------------------------------- */
+
+describe("the runner surface is six operations, transcribed from PR #282's generated spec", () => {
+  test("provisionRunner declares an optional Idempotency-Key and no If-Match", () => {
+    expect(MOIRA_OPERATIONS.provisionRunner.declaresIdempotencyKey).toBe(true);
+    expect(MOIRA_OPERATIONS.provisionRunner.requiresIfMatch).toBe(false);
+  });
+
+  test("listRunners and getRunner declare neither header", () => {
+    expect(MOIRA_OPERATIONS.listRunners.declaresIdempotencyKey).toBe(false);
+    expect(MOIRA_OPERATIONS.listRunners.requiresIfMatch).toBe(false);
+    expect(MOIRA_OPERATIONS.getRunner.declaresIdempotencyKey).toBe(false);
+    expect(MOIRA_OPERATIONS.getRunner.requiresIfMatch).toBe(false);
+  });
+
+  test("submitRunnerAuthorizationCode and finalizeRunner declare neither header — NOT what the family shape would predict", () => {
+    // `provisionRunner` right next to these declares Idempotency-Key, and
+    // `src/http/runners.rs`'s own doc comment on `finalize_runner` describes one
+    // too. The GENERATED spec disagrees, and the registry follows the spec.
+    expect(MOIRA_OPERATIONS.submitRunnerAuthorizationCode.declaresIdempotencyKey).toBe(false);
+    expect(MOIRA_OPERATIONS.submitRunnerAuthorizationCode.requiresIfMatch).toBe(false);
+    expect(MOIRA_OPERATIONS.finalizeRunner.declaresIdempotencyKey).toBe(false);
+    expect(MOIRA_OPERATIONS.finalizeRunner.requiresIfMatch).toBe(false);
+  });
+
+  test("deleteRunner requires If-Match and declares no key — the one operation that destroys the container", () => {
+    expect(MOIRA_OPERATIONS.deleteRunner.declaresIdempotencyKey).toBe(false);
+    expect(MOIRA_OPERATIONS.deleteRunner.requiresIfMatch).toBe(true);
+  });
+
+  test("deleteRunner refuses an empty version, exactly like every other If-Match operation", async () => {
+    const { client } = clientWith({});
+    await expect(client.deleteRunner("runner-1", "")).rejects.toThrow(MoiraClientContractError);
+  });
+});
+
+describe("the runner client methods put the right thing on the wire", () => {
+  const RUNNER_RECORD = {
+    id: "runner-1",
+    label: "claude-1",
+    runner_reference: "ref-1",
+    state: "provisioning",
+    scope: { type: "global" },
+    metadata: {},
+    created_at: "2026-08-16T00:00:00Z",
+    updated_at: "2026-08-16T00:00:00Z",
+    version: 3,
+  };
+
+  test("provisionRunner sends exactly the supplied fields", async () => {
+    const { stub, client } = clientWith({
+      "POST /api/v1/admin/runners": () => ({ status: 201, body: RUNNER_RECORD }),
+    });
+    await client.provisionRunner(
+      { label: "claude-1", ttl_seconds: 600, scope: { type: "tenant", external_tenant_id: "acme" } },
+      { idempotencyKey: "runner-provision:claude-1" },
+    );
+    expect(stub.bodyOf("POST /api/v1/admin/runners")).toEqual({
+      label: "claude-1",
+      ttl_seconds: 600,
+      scope: { type: "tenant", external_tenant_id: "acme" },
+    });
+    expect(stub.requestsFor("POST /api/v1/admin/runners")[0]?.headers["Idempotency-Key"]).toBe(
+      "runner-provision:claude-1",
+    );
+  });
+
+  test("listRunners forwards limit and cursor as query parameters", async () => {
+    const { stub, client } = clientWith({
+      "GET /api/v1/admin/runners": ok({ data: [], pagination: { has_more: false, next_cursor: null } }),
+    });
+    await client.listRunners({ limit: 50, cursor: "cur-1" });
+    expect(stub.requests[0]?.url).toContain("limit=50");
+    expect(stub.requests[0]?.url).toContain("cursor=cur-1");
+  });
+
+  test("getRunner hits the flat by-id path", async () => {
+    const { stub, client } = clientWith({
+      "GET /api/v1/admin/runners/runner-1": ok(RUNNER_RECORD),
+    });
+    await client.getRunner("runner-1");
+    expect(stub.routes()).toEqual(["GET /api/v1/admin/runners/runner-1"]);
+  });
+
+  test("submitRunnerAuthorizationCode sends only the code, on the nested path", async () => {
+    const { stub, client } = clientWith({
+      "POST /api/v1/admin/runners/runner-1/authorization-code": () => ({
+        status: 200,
+        body: RUNNER_RECORD,
+      }),
+    });
+    await client.submitRunnerAuthorizationCode("runner-1", { code: "auth-code-abc" });
+    expect(stub.bodyOf("POST /api/v1/admin/runners/runner-1/authorization-code")).toEqual({
+      code: "auth-code-abc",
+    });
+    expect(
+      stub.requestsFor("POST /api/v1/admin/runners/runner-1/authorization-code")[0]?.headers[
+        "Idempotency-Key"
+      ],
+    ).toBeUndefined();
+  });
+
+  test("finalizeRunner sends provider_id and omits display_name/metadata when absent", async () => {
+    const { stub, client } = clientWith({
+      "POST /api/v1/admin/runners/runner-1/finalize": () => ({ status: 200, body: RUNNER_RECORD }),
+    });
+    await client.finalizeRunner("runner-1", { provider_id: "prov-1" });
+    expect(stub.bodyOf("POST /api/v1/admin/runners/runner-1/finalize")).toEqual({
+      provider_id: "prov-1",
+    });
+  });
+
+  test("deleteRunner sends If-Match and no body, and resolves to nothing on 204", async () => {
+    const { stub, client } = clientWith({
+      "DELETE /api/v1/admin/runners/runner-1": () => ({ status: 204 }),
+    });
+    const result = await client.deleteRunner("runner-1", "3");
+    expect(result).toBeUndefined();
+    expect(stub.requests[0]?.headers["If-Match"]).toBe("3");
+    expect(stub.requests[0]?.body).toBeUndefined();
+  });
+});
+
+describe("assertRunnerProvisionRequestIsSafe", () => {
+  test("refuses a label outside [a-z0-9-]{1,64}", () => {
+    for (const bad of ["Not-Lowercase", "has spaces", "", "trailing_underscore_"]) {
+      expect(() => assertRunnerProvisionRequestIsSafe({ label: bad })).toThrow(/label/);
+    }
+  });
+
+  test("accepts a conforming label", () => {
+    expect(() => assertRunnerProvisionRequestIsSafe({ label: "claude-runner-1" })).not.toThrow();
+  });
+});
+
+describe("assertRunnerFinalizeRequestIsSafe", () => {
+  test("refuses a body carrying scope, even a well-formed one", () => {
+    expect(() =>
+      assertRunnerFinalizeRequestIsSafe({
+        provider_id: "prov-1",
+        scope: { type: "global" },
+      }),
+    ).toThrow(/scope/);
+  });
+
+  test("refuses a missing or empty provider_id", () => {
+    expect(() => assertRunnerFinalizeRequestIsSafe({})).toThrow(/provider_id/);
+    expect(() => assertRunnerFinalizeRequestIsSafe({ provider_id: "" })).toThrow(/provider_id/);
+  });
+
+  test("accepts a bare provider_id", () => {
+    expect(() => assertRunnerFinalizeRequestIsSafe({ provider_id: "prov-1" })).not.toThrow();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* THE GUARDS ARE INVOKED, NOT MERELY EXPORTED (issue #113)                    */
 /* -------------------------------------------------------------------------- */
 
@@ -1444,6 +1627,31 @@ const GUARD_PINS: readonly GuardPin[] = [
       "a policy is created with an empty foreign key on the one write that decides which provider " +
       "live traffic reaches",
   },
+  {
+    guard: "assertRunnerProvisionRequestIsSafe",
+    method: "provisionRunner",
+    route: "POST /api/v1/admin/runners",
+    call: (client) =>
+      client.provisionRunner({
+        label: "Not A Valid Label!",
+      } as unknown as Parameters<MoiraClient["provisionRunner"]>[0]),
+    consequence:
+      "a label that is not [a-z0-9-]{1,64} reaches Moira and becomes an invalid Docker container " +
+      "name, surfacing as a relayed 422 instead of a console-named rule",
+  },
+  {
+    guard: "assertRunnerFinalizeRequestIsSafe",
+    method: "finalizeRunner",
+    route: "POST /api/v1/admin/runners/runner-1/finalize",
+    call: (client) =>
+      client.finalizeRunner("runner-1", {
+        provider_id: "prov-1",
+        scope: { type: "tenant", external_tenant_id: "acme" },
+      } as unknown as Parameters<MoiraClient["finalizeRunner"]>[1]),
+    consequence:
+      "a scope is sent on finalize, which could silently disagree with the one already sealed into " +
+      "the credential's AAD at provisioning time",
+  },
 ];
 
 describe("every input guard is actually invoked by the method that owns it", () => {
@@ -1455,7 +1663,7 @@ describe("every input guard is actually invoked by the method that owns it", () 
     const exported = Object.keys(moiraClientModule)
       .filter((name) => /^assert[A-Za-z]*IsSafe$/.test(name))
       .sort();
-    expect(exported.length, "no guards were discovered — this rule would pass on nothing").toBe(9);
+    expect(exported.length, "no guards were discovered — this rule would pass on nothing").toBe(11);
     expect(
       GUARD_PINS.map((pin) => pin.guard).sort(),
       "a guard is exported with no pin below. Add one: a body only that guard refuses, sent " +

@@ -149,6 +149,19 @@ const EXEMPT_DTO_INTERFACE_NAMES = EXEMPT_DTO_INTERFACES.map((entry) => entry.na
  * accommodate two fields would un-guard `token_prefix`, `refresh_token` and
  * `access_token` on every DTO in the console, forever.
  *
+ * `credential_id` (issue #275/#272 workstream R3) is `ClaudeRunnerRecord`'s
+ * reference to the provider-credential row a runner's token became. It is a
+ * bare UUID, never the token or anything derived from it — the same shape as
+ * `provider_id` on the same record, which does not trip the pattern only
+ * because it does not contain the substring `credential`. Exempting the FIELD
+ * NAME, not the interface, follows the same reasoning `token_url` did: the
+ * alternative (a fourth `EXEMPT_DTO_INTERFACES` entry) was rejected there for
+ * being a cap already at three, and moving `ClaudeRunnerRecord` to a
+ * server-only module the way the credential family did would make it
+ * unreachable from the client components CONVENTIONS requires it for — the
+ * whole point of publishing `scope` on this record is that an operator must be
+ * able to tell a tenant's runner from the platform's IN THE BROWSER.
+ *
  * The reverse test below asserts each entry still matches something, so an
  * exemption cannot outlive the field it was granted for.
  */
@@ -157,13 +170,16 @@ const EXEMPT_DTO_FIELDS = [
   "setup_token",
   "maximum_input_tokens",
   "maximum_output_tokens",
-  // Issue #237 / plan 12 §5. A `provider_credentials` ROW REFERENCE, not a
-  // secret value — `SkillHttpExecutorRecord`/`SkillHttpExecutorPatchRequest`
-  // never carry the credential's contents, only the id of the row that holds
-  // it, matched by name against `SECRET_DTO_FIELD_PATTERN`'s `credential`
-  // alternative even though nothing about an id is a credential itself. Same
-  // trade as the two above: `lib/llm-view.ts`'s `LlmKeyRowView` already treats
-  // the LLM surface's own credential rows the same way.
+  // Issue #237 / plan 12 §5, AND issue #275/#272 workstream R3. A row
+  // REFERENCE, not a secret value, on two unrelated DTOs that happen to share
+  // the field name: `SkillHttpExecutorRecord`/`SkillHttpExecutorPatchRequest`
+  // never carry a `provider_credentials` row's contents, only the id of the
+  // row that holds it, and `ClaudeRunnerRecord` (this section's own header
+  // above) carries the same shape for the credential a runner's token became.
+  // Neither is a credential itself, matched by name against
+  // `SECRET_DTO_FIELD_PATTERN`'s `credential` alternative anyway. Same trade
+  // as the two above: `lib/llm-view.ts`'s `LlmKeyRowView` already treats the
+  // LLM surface's own credential rows the same way.
   "credential_id",
   // Plan 12 §6. An integer token BUDGET on `AgentProfileRecord`, the same shape
   // as `maximum_input_tokens`/`maximum_output_tokens` above — matched by the
@@ -225,7 +241,18 @@ describe("the client-safe modules really are client-safe", () => {
       // mention the header name because that module is server-only.
       const codeOnly = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
       expect(codeOnly).not.toContain("X-Moira-System-Key");
-      expect(codeOnly).not.toContain("Authorization");
+      // The `Authorization` HEADER, matched as its own quoted string token
+      // (`headers["Authorization"]`, `headers['Authorization']`) rather than as
+      // a bare substring. A plain `.not.toContain("Authorization")` also matches
+      // any identifier that happens to contain the word — `lib/types.ts`'s
+      // `ClaudeRunnerAuthorizationCodeRequest` (issue #275/#272 workstream R3,
+      // the OAuth AUTHORIZATION CODE a runner's operator pastes back, which is
+      // not a header and not a credential) is exactly such a false positive.
+      // The regex still catches the real failure mode — a client-safe module
+      // building or reading the `Authorization` header — because that is always
+      // written as the exact quoted string, never as a substring of a longer
+      // identifier.
+      expect(codeOnly).not.toMatch(/(["'`])Authorization\1/);
       expect(codeOnly).not.toMatch(/process\.env/);
     });
   }

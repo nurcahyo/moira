@@ -639,6 +639,13 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "The `<h1>` of the public `/invite/[token]` page. Deliberately says nothing about who sent " +
       "it or which deployment it is for — the page is reachable by anyone holding the link.",
   },
+  [K.page_runners_title]: {
+    key: K.page_runners_title,
+    message: "Claude CLI runners",
+    description:
+      "The `<h1>` of `/runners`. Distinct from `console.runners.list_heading`, which names the " +
+      "table region inside the page; the page also hosts the provisioning form.",
+  },
 
   /* --- sign-in ------------------------------------------------------------ */
   [K.sign_in_heading]: {
@@ -1704,6 +1711,14 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "Navigation link to `/admins`. Without it that route is reachable only by typing the URL, " +
       "which is why the (console) layout's own header scheduled the chrome for this wave.",
+  },
+  [K.chrome_nav_runners]: {
+    key: K.chrome_nav_runners,
+    message: "Runners",
+    description:
+      "Navigation link to `/runners` (issue #275/#272 workstream R3). Without it that route is " +
+      "reachable only by typing the URL, the same failure mode `/settings/llm` shipped a wave " +
+      "into before this chrome caught up to it.",
   },
   [K.chrome_nav_llm_settings]: {
     key: K.chrome_nav_llm_settings,
@@ -4620,6 +4635,430 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.playground_tool_outcome_label,
     message: "Outcome",
     description: "Label for a tool call's outcome (from `tool_result`).",
+  },
+
+  /* --- the /runners screen (issue #275/#272 workstream R3) ---------------- */
+  [K.runners_intro]: {
+    key: K.runners_intro,
+    message:
+      "Provision a container that runs the Claude CLI to mint a subscription token, then store " +
+      "it as a provider credential. The console never sees the token.",
+    description: "Rendered under the /runners page heading.",
+  },
+  [K.runners_load_failed]: {
+    key: K.runners_load_failed,
+    message: "The runner list could not be loaded.",
+    description: "Rendered on /runners when Moira could not be reached.",
+  },
+  [K.runners_request_failed]: {
+    key: K.runners_request_failed,
+    message: "The request could not be completed.",
+    description:
+      "Fallback used by modules/runners/request.ts when a fetch to this console's own BFF " +
+      "produced no readable response at all.",
+  },
+  [K.runners_request_body_invalid]: {
+    key: K.runners_request_body_invalid,
+    message: "The console could not read that runner request.",
+    description: "Emitted by every handler under app/api/runners/** for a body that is not JSON.",
+  },
+  [K.runners_list_heading]: {
+    key: K.runners_list_heading,
+    message: "Provisioned runners",
+    description: "Heading over the runner table on /runners.",
+  },
+  [K.runners_list_empty]: {
+    key: K.runners_list_empty,
+    message: "No runners have been provisioned yet.",
+    description: "Rendered instead of the table when the list is empty.",
+  },
+  [K.runners_table_label]: {
+    key: K.runners_table_label,
+    message: "Claude runners",
+    description: "The runner table's <caption>.",
+  },
+  [K.runners_column_label]: {
+    key: K.runners_column_label,
+    message: "Label",
+    description: "Column header for a runner's operator-facing label.",
+  },
+  [K.runners_column_scope]: {
+    key: K.runners_column_scope,
+    message: "Account",
+    description: "Column header for whose Claude account a runner belongs to.",
+  },
+  [K.runners_column_state]: {
+    key: K.runners_column_state,
+    message: "Lifecycle state",
+    description: "Column header for a runner's lifecycle state.",
+  },
+  [K.runners_column_created]: {
+    key: K.runners_column_created,
+    message: "Created",
+    description: "Column header for a runner's creation timestamp.",
+  },
+  [K.runners_column_actions]: {
+    key: K.runners_column_actions,
+    message: "Detail",
+    description: "Column header over the per-row link to a runner's detail page.",
+  },
+  [K.runners_view]: {
+    key: K.runners_view,
+    message: "View",
+    description: "Per-row link text from the runner table to that runner's detail page.",
+  },
+  [K.runners_scope_platform]: {
+    key: K.runners_scope_platform,
+    message: "Platform account",
+    description:
+      "Badge text for a runner provisioned with no scope, i.e. the platform-wide Claude " +
+      "account — the default and the behaviour of every deployment that never sets one.",
+  },
+  [K.runners_scope_tenant]: {
+    key: K.runners_scope_tenant,
+    message: "Tenant: {tenant_id}",
+    description:
+      "Badge text for a runner provisioned with a tenant scope, interpolated with its " +
+      "external_tenant_id — an operator must be able to tell a tenant's runner from the " +
+      "platform's at a glance, in the list and on the detail view.",
+  },
+  [K.runners_state_provisioning]: {
+    key: K.runners_state_provisioning,
+    message: "Provisioning",
+    description: "State badge: the runner service is starting the container.",
+  },
+  [K.runners_state_awaiting_authorization]: {
+    key: K.runners_state_awaiting_authorization,
+    message: "Awaiting authorization",
+    description: "State badge: the authorization URL is ready and waiting on the operator.",
+  },
+  [K.runners_state_exchanging]: {
+    key: K.runners_state_exchanging,
+    message: "Exchanging code",
+    description: "State badge: the pasted authorization code is being exchanged for a token.",
+  },
+  [K.runners_state_ready]: {
+    key: K.runners_state_ready,
+    message: "Ready to finalize",
+    description: "State badge: a token exists on the runner service and finalize may be called.",
+  },
+  [K.runners_state_linked]: {
+    key: K.runners_state_linked,
+    message: "Linked",
+    description: "State badge: the token was stored as a provider credential.",
+  },
+  [K.runners_state_failed]: {
+    key: K.runners_state_failed,
+    message: "Failed",
+    description: "State badge: the runner service reported a failure.",
+  },
+  [K.runners_state_expired]: {
+    key: K.runners_state_expired,
+    message: "Runner expired",
+    description: "State badge: the runner's time to live elapsed before it was finished.",
+  },
+  [K.runners_provision_heading]: {
+    key: K.runners_provision_heading,
+    message: "Provision a runner",
+    description: "Heading over the provisioning form on /runners.",
+  },
+  [K.runners_provision_intro]: {
+    key: K.runners_provision_intro,
+    message:
+      "This starts a container that runs `claude setup-token`. The account it is fixed to " +
+      "cannot be changed after this step.",
+    description: "Rendered under the provisioning form's heading.",
+  },
+  [K.runners_provision_label_label]: {
+    key: K.runners_provision_label_label,
+    message: "Runner label",
+    description: "Label of the provisioning form's label field.",
+  },
+  [K.runners_provision_label_hint]: {
+    key: K.runners_provision_label_hint,
+    message: "Lowercase letters, digits, and hyphens only, 1-64 characters. Becomes a container name.",
+    description: "Hint under the label field, stating the charset the runner service accepts.",
+  },
+  [K.runners_provision_label_required]: {
+    key: K.runners_provision_label_required,
+    message: "Enter a label using only lowercase letters, digits, and hyphens (1-64 characters).",
+    description:
+      "Emitted by POST /api/runners when the label is missing or does not match the runner " +
+      "service's charset.",
+  },
+  [K.runners_provision_ttl_label]: {
+    key: K.runners_provision_ttl_label,
+    message: "Time to live (seconds)",
+    description: "Label of the provisioning form's TTL field.",
+  },
+  [K.runners_provision_ttl_hint]: {
+    key: K.runners_provision_ttl_hint,
+    message: "60 to 3600 seconds. Defaults to 900 (15 minutes) if left blank.",
+    description: "Hint under the TTL field.",
+  },
+  [K.runners_provision_ttl_invalid]: {
+    key: K.runners_provision_ttl_invalid,
+    message: "Time to live must be a whole number of seconds between 60 and 3600.",
+    description: "Emitted by POST /api/runners when a supplied ttl_seconds is out of range.",
+  },
+  [K.runners_provision_scope_legend]: {
+    key: K.runners_provision_scope_legend,
+    message: "Whose Claude account is this?",
+    description: "Legend over the provisioning form's scope choice.",
+  },
+  [K.runners_provision_scope_platform_option]: {
+    key: K.runners_provision_scope_platform_option,
+    message: "The platform account (default)",
+    description: "Radio option: provision with no scope, i.e. the platform-wide account.",
+  },
+  [K.runners_provision_scope_tenant_option]: {
+    key: K.runners_provision_scope_tenant_option,
+    message: "A tenant's own subscription",
+    description: "Radio option: provision with a tenant scope, overriding the platform account.",
+  },
+  [K.runners_provision_scope_invalid]: {
+    key: K.runners_provision_scope_invalid,
+    message: "That account choice is not valid for a runner.",
+    description:
+      "Emitted by POST /api/runners when the scope in the request body is neither absent, " +
+      "the platform account, nor a tenant scope carrying a non-empty tenant id.",
+  },
+  [K.runners_provision_tenant_id_label]: {
+    key: K.runners_provision_tenant_id_label,
+    message: "Tenant ID",
+    description: "Label of the tenant-id field, shown only when the tenant scope is chosen.",
+  },
+  [K.runners_provision_tenant_id_hint]: {
+    key: K.runners_provision_tenant_id_hint,
+    message: "The tenant's external identifier, exactly as used elsewhere in this deployment.",
+    description: "Hint under the tenant-id field.",
+  },
+  [K.runners_provision_submit]: {
+    key: K.runners_provision_submit,
+    message: "Provision runner",
+    description: "Submit control for the provisioning form.",
+  },
+  [K.runners_provision_pending]: {
+    key: K.runners_provision_pending,
+    message: "Provisioning...",
+    description: "Announced politely while the provision request is in flight.",
+  },
+  [K.runners_detail_back]: {
+    key: K.runners_detail_back,
+    message: "Back to runners",
+    description: "Link from a runner's detail page back to /runners.",
+  },
+  [K.runners_detail_not_found]: {
+    key: K.runners_detail_not_found,
+    message: "This runner could not be found.",
+    description: "Rendered on the detail page when Moira answers 404 runner_not_found.",
+  },
+  [K.runners_detail_load_failed]: {
+    key: K.runners_detail_load_failed,
+    message: "This runner's details could not be loaded.",
+    description: "Rendered on the detail page for any other load failure.",
+  },
+  [K.runners_detail_scope_label]: {
+    key: K.runners_detail_scope_label,
+    message: "Claude account",
+    description: "Label before the scope badge on the detail page.",
+  },
+  [K.runners_detail_expires_label]: {
+    key: K.runners_detail_expires_label,
+    message: "Expires at",
+    description: "Label before a runner's expiry timestamp on the detail page.",
+  },
+  [K.runners_state_provisioning_body]: {
+    key: K.runners_state_provisioning_body,
+    message: "The container is starting. This page updates itself automatically.",
+    description: "Body copy shown while a runner's state is provisioning.",
+  },
+  [K.runners_state_exchanging_body]: {
+    key: K.runners_state_exchanging_body,
+    message: "Waiting for the runner service to exchange the authorization code for a token.",
+    description: "Body copy shown while a runner's state is exchanging.",
+  },
+  [K.runners_authorization_heading]: {
+    key: K.runners_authorization_heading,
+    message: "Authorize this runner",
+    description: "Heading shown while a runner is awaiting_authorization.",
+  },
+  [K.runners_authorization_intro]: {
+    key: K.runners_authorization_intro,
+    message:
+      "Open the link below in your own browser and approve the request. Anthropic will show " +
+      "you a code afterwards — paste it below.",
+    description: "Instructions shown alongside the authorization URL.",
+  },
+  [K.runners_authorization_url_label]: {
+    key: K.runners_authorization_url_label,
+    message: "Authorization URL",
+    description: "Label over the runner's authorization_url.",
+  },
+  [K.runners_authorization_code_label]: {
+    key: K.runners_authorization_code_label,
+    message: "Authorization code",
+    description: "Label of the field the operator pastes the authorization code into.",
+  },
+  [K.runners_authorization_code_hint]: {
+    key: K.runners_authorization_code_hint,
+    message: "The code shown after you approve the request at the link above.",
+    description: "Hint under the authorization-code field.",
+  },
+  [K.runners_authorization_code_required]: {
+    key: K.runners_authorization_code_required,
+    message: "Enter the authorization code Anthropic showed you.",
+    description:
+      "Emitted by POST /api/runners/[id]/authorization-code when the code field is missing " +
+      "or empty.",
+  },
+  [K.runners_authorization_submit]: {
+    key: K.runners_authorization_submit,
+    message: "Submit code",
+    description: "Submit control for the authorization-code form.",
+  },
+  [K.runners_authorization_pending]: {
+    key: K.runners_authorization_pending,
+    message: "Submitting...",
+    description: "Announced politely while the authorization-code request is in flight.",
+  },
+  [K.runners_finalize_heading]: {
+    key: K.runners_finalize_heading,
+    message: "Finalize this runner",
+    description: "Heading shown while a runner's state is ready.",
+  },
+  [K.runners_finalize_intro]: {
+    key: K.runners_finalize_intro,
+    message:
+      "Choose which provider this runner's token becomes a credential for. This cannot be " +
+      "changed afterwards.",
+    description: "Instructions shown alongside the finalize form.",
+  },
+  [K.runners_finalize_provider_label]: {
+    key: K.runners_finalize_provider_label,
+    message: "Target provider",
+    description: "Label of the finalize form's provider selector.",
+  },
+  [K.runners_finalize_provider_placeholder]: {
+    key: K.runners_finalize_provider_placeholder,
+    message: "Select a provider",
+    description: "Placeholder option of the finalize form's provider selector.",
+  },
+  [K.runners_finalize_no_providers]: {
+    key: K.runners_finalize_no_providers,
+    message: "No providers exist yet. Create one on the LLM settings screen first.",
+    description: "Rendered instead of the selector when no provider rows exist to choose from.",
+  },
+  [K.runners_finalize_provider_id_required]: {
+    key: K.runners_finalize_provider_id_required,
+    message: "Select a provider before finalizing.",
+    description: "Emitted by POST /api/runners/[id]/finalize when provider_id is missing.",
+  },
+  [K.runners_finalize_scope_forbidden]: {
+    key: K.runners_finalize_scope_forbidden,
+    message: "The finalize request must not include an account choice.",
+    description:
+      "Emitted by POST /api/runners/[id]/finalize when the body carries a scope: it is fixed " +
+      "at provisioning time and sealed into the credential's AAD.",
+  },
+  [K.runners_finalize_display_name_label]: {
+    key: K.runners_finalize_display_name_label,
+    message: "Credential display name (optional)",
+    description: "Label of the finalize form's optional display-name field.",
+  },
+  [K.runners_finalize_submit]: {
+    key: K.runners_finalize_submit,
+    message: "Finalize",
+    description: "Submit control for the finalize form.",
+  },
+  [K.runners_finalize_pending]: {
+    key: K.runners_finalize_pending,
+    message: "Finalizing...",
+    description: "Announced politely while the finalize request is in flight.",
+  },
+  [K.runners_linked_heading]: {
+    key: K.runners_linked_heading,
+    message: "Runner linked",
+    description: "Heading shown once a runner's state is linked.",
+  },
+  [K.runners_linked_body]: {
+    key: K.runners_linked_body,
+    message: "This runner's token is stored as a provider credential.",
+    description: "Body copy shown once a runner's state is linked.",
+  },
+  [K.runners_failed_heading]: {
+    key: K.runners_failed_heading,
+    message: "Provisioning failed",
+    description: "Heading shown once a runner's state is failed.",
+  },
+  [K.runners_failed_body]: {
+    key: K.runners_failed_body,
+    message: "The runner service reported a failure. Delete this runner and provision a new one.",
+    description: "Body copy shown once a runner's state is failed.",
+  },
+  [K.runners_expired_heading]: {
+    key: K.runners_expired_heading,
+    message: "This runner has expired",
+    description: "Heading shown once a runner's state is expired.",
+  },
+  [K.runners_expired_body]: {
+    key: K.runners_expired_body,
+    message: "This runner's time to live elapsed before it finished. Delete it and provision a new one.",
+    description: "Body copy shown once a runner's state is expired.",
+  },
+  [K.runners_token_unavailable_heading]: {
+    key: K.runners_token_unavailable_heading,
+    message: "This runner cannot be recovered",
+    description:
+      "Heading shown after a finalize attempt fails with runner_token_unavailable — a " +
+      "one-shot token read that was already spent and cannot be retried.",
+  },
+  [K.runners_token_unavailable_body]: {
+    key: K.runners_token_unavailable_body,
+    message:
+      "The token could not be retrieved, and the runner service will never offer it again — " +
+      "the read is one-shot by design. Delete this runner and provision a new one; retrying " +
+      "will not work.",
+    description: "Body copy shown alongside the token-unavailable heading.",
+  },
+  [K.runners_delete_button]: {
+    key: K.runners_delete_button,
+    message: "Delete runner",
+    description: "Control that opens the delete-confirmation dialog.",
+  },
+  [K.runners_delete_confirm_title]: {
+    key: K.runners_delete_confirm_title,
+    message: "Delete this runner?",
+    description: "Title of the delete-confirmation dialog.",
+  },
+  [K.runners_delete_confirm_body]: {
+    key: K.runners_delete_confirm_body,
+    message:
+      "This removes the runner's container on the runner service. Any credential it already " +
+      "produced is kept.",
+    description: "Consequence copy inside the delete-confirmation dialog.",
+  },
+  [K.runners_delete_confirm_action]: {
+    key: K.runners_delete_confirm_action,
+    message: "Delete",
+    description: "Destructive control inside the delete-confirmation dialog.",
+  },
+  [K.runners_delete_pending]: {
+    key: K.runners_delete_pending,
+    message: "Deleting...",
+    description: "Announced politely while the delete request is in flight.",
+  },
+  [K.runners_delete_not_found]: {
+    key: K.runners_delete_not_found,
+    message: "This runner was already deleted.",
+    description: "Rendered when a delete request finds the runner already gone.",
+  },
+  [K.runners_delete_conflict_exhausted]: {
+    key: K.runners_delete_conflict_exhausted,
+    message: "This runner kept changing while it was being deleted. Reload the page and try again.",
+    description:
+      "Rendered when deleteRunnerSafely exhausts its bounded re-read-and-retry attempts against " +
+      "repeated resource_version_conflict responses.",
   },
 };
 
