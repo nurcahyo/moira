@@ -1,0 +1,47 @@
+.builder {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+.heading {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.empty {
+  margin: 0;
+  color: #555;
+}
+
+.step {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 0.25rem;
+  padding: 0.5rem;
+}
+
+.input {
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.25rem;
+  border: 1px solid #d1d5db;
+}
+
+.orderInput {
+  width: 4rem;
+}
+
+.select {
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.25rem;
+  border: 1px solid #d1d5db;
+}
+
+.notice {
+  margin: 0;
+  color: #92600a;
+}

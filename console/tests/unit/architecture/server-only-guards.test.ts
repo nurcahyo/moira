@@ -157,6 +157,18 @@ const EXEMPT_DTO_FIELDS = [
   "setup_token",
   "maximum_input_tokens",
   "maximum_output_tokens",
+  // Issue #237 / plan 12 §5. A `provider_credentials` ROW REFERENCE, not a
+  // secret value — `SkillHttpExecutorRecord`/`SkillHttpExecutorPatchRequest`
+  // never carry the credential's contents, only the id of the row that holds
+  // it, matched by name against `SECRET_DTO_FIELD_PATTERN`'s `credential`
+  // alternative even though nothing about an id is a credential itself. Same
+  // trade as the two above: `lib/llm-view.ts`'s `LlmKeyRowView` already treats
+  // the LLM surface's own credential rows the same way.
+  "credential_id",
+  // Plan 12 §6. An integer token BUDGET on `AgentProfileRecord`, the same shape
+  // as `maximum_input_tokens`/`maximum_output_tokens` above — matched by the
+  // pattern's `token` alternative with no credential meaning under any reading.
+  "max_tokens",
 ] as const;
 
 describe("credential-carrying modules are marked and contained", () => {

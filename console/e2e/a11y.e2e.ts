@@ -162,6 +162,16 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // authenticated spec renders it, and the surface it hides is the one that
   // decides whether anybody can sign in at all.
   "/settings/auth",
+  // Plan 12 §5, issue #237 — the skill registry and OpenAPI import screen.
+  // Gated like the rest of `(console)`, so the walker asserts the redirect and
+  // audits nothing. A real gap: no authenticated spec renders this screen yet.
+  "/skills",
+  // Issue #83 — the provider health dashboard. Same gap shape as `/skills`.
+  "/providers/health",
+  // Plan 12 §3 — eval suites, cases and runs. Same gap shape as `/skills`.
+  "/evals",
+  // Plan 12 §6 — multi-agent flow authoring. Same gap shape as `/skills`.
+  "/flows",
 ];
 
 /** The pathname a route's fixture URL resolves to. */
