@@ -436,6 +436,28 @@ impl std::fmt::Debug for IdempotencySettings {
 pub struct ProviderSecuritySettings {
     pub allow_private_provider_urls: bool,
     pub allow_http_provider_urls: bool,
+    /// Explicit ToS risk-acceptance opt-in for `ProviderType::ChatgptOauth` (issue #216) —
+    /// rig-core 0.40's native `rig_core::providers::chatgpt` client against
+    /// `chatgpt.com/backend-api/codex`. **Default `false`, and that is the whole point of this
+    /// field, not a starting point meant to be flipped on casually.**
+    ///
+    /// ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no
+    /// carve-out for third-party, multi-tenant use analogous to Anthropic's reinstated
+    /// third-party agent usage (`docs/chatgpt-subscription-spike.md`). Turning this on is a
+    /// deployment operator's own explicit acceptance of that risk for their own subscription —
+    /// it is not a sanctioned integration path, and nothing this flag gates softens that framing
+    /// (see `orchestration::runtime_factory::require_chatgpt_subscription_opt_in`).
+    ///
+    /// **Unlike [`Self::allow_private_provider_urls`] / [`Self::allow_http_provider_urls`], this
+    /// is not rejected in production by [`Settings::validate_production`].** An operator's own
+    /// ChatGPT subscription is exactly as usable, and exactly as risky, in production as
+    /// anywhere else — refusing it there would not make the underlying ToS question go away,
+    /// only hide who made the call. What production gets instead is the same thing every other
+    /// deliberate risk acceptance in this file gets: a loud, unconditional startup `WARN`
+    /// (`main.rs::run`) whenever this is `true`, in every environment, including production —
+    /// not folded into [`Settings::unsafe_development_features`], which reports nothing at all
+    /// in production by design.
+    pub allow_chatgpt_subscription: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

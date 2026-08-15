@@ -38,7 +38,8 @@ pub use retrieval::{
 };
 pub use runtime_cache::{AuthProviderSettingsCache, RuntimeConfigCache};
 pub use runtime_factory::{
-    RigRuntimeFactory, RuntimeCompletionOutput, RuntimeFactory, RuntimeItemStream,
-    RuntimeModelHandle, RuntimeStreamItem, classify_completion_error, rig_chat_history,
+    CHATGPT_SUBSCRIPTION_OPT_IN_REQUIRED, RigRuntimeFactory, RuntimeCompletionOutput,
+    RuntimeFactory, RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem,
+    classify_completion_error, require_chatgpt_subscription_opt_in, rig_chat_history,
     usage_from_rig,
 };

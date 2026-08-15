@@ -1778,7 +1778,7 @@ impl TokenDirection {
 /// enum without a matching addition here would silently under-seed rather than fail to compile,
 /// which is why a test below pins this list's length against the number of arms
 /// `provider_type_label` has to stay exhaustive over.
-const ALL_PROVIDER_TYPES: [ProviderType; 8] = [
+const ALL_PROVIDER_TYPES: [ProviderType; 9] = [
     ProviderType::OpenAiCompatible,
     ProviderType::OpenAi,
     ProviderType::Anthropic,
@@ -1787,6 +1787,7 @@ const ALL_PROVIDER_TYPES: [ProviderType; 8] = [
     ProviderType::AzureOpenAi,
     ProviderType::Local,
     ProviderType::Custom,
+    ProviderType::ChatgptOauth,
 ];
 
 /// `job_name` as a label value, or `None` if Moira has never declared that job.
@@ -1878,6 +1879,7 @@ pub(crate) fn provider_type_label(provider_type: ProviderType) -> &'static str {
         ProviderType::AzureOpenAi => "azure_openai",
         ProviderType::Local => "local",
         ProviderType::Custom => "custom",
+        ProviderType::ChatgptOauth => "chatgpt_oauth",
     }
 }
 
@@ -2863,7 +2865,7 @@ mod tests {
         labels.dedup();
         assert_eq!(
             labels.len(),
-            8,
+            9,
             "ALL_PROVIDER_TYPES must carry one entry per ProviderType variant, no duplicates"
         );
     }

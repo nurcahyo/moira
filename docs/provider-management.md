@@ -19,6 +19,8 @@ Endpoints:
 
 Provider base URLs pass the outbound URL policy: HTTPS by default, no embedded credentials, no loopback/private/link-local/multicast/cloud metadata targets, and DNS resolution checks. HTTP/private URLs require explicit local development opt-ins.
 
+Creating a `chatgpt_oauth` provider (issue #216) additionally requires `provider_security.allow_chatgpt_subscription = true`. It is off by default in every environment, including production: ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms, and wiring one into a multi-tenant gateway is a deployment operator's own explicit ToS risk acceptance, never a silent default. Without the opt-in, `POST /api/v1/admin/providers` refuses the request with `403 chatgpt_subscription_opt_in_required`; the same gate is re-checked at execution time as defense in depth. See `docs/chatgpt-subscription-spike.md` and `docs/rig-integration.md`.
+
 Required scopes:
 
 - Providers read/write/delete: `moira:providers:*`

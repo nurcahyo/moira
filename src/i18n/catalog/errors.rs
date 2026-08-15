@@ -12,6 +12,11 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Generic client-side request validation or shape errors.",
     },
     I18nEntry {
+        key: "moira.error.chatgpt_subscription_opt_in_required",
+        default_message: "This provider requires an explicit ToS risk-acceptance opt-in that this deployment has not enabled.",
+        description: "Used when a chatgpt_oauth provider is created, or would be executed, while provider_security.allow_chatgpt_subscription is false. ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no carve-out for third-party, multi-tenant use. Enabling the flag is a deployment operator's own explicit acceptance of that risk for their own subscription, not a sanctioned integration path (docs/chatgpt-subscription-spike.md, issue #216).",
+    },
+    I18nEntry {
         key: "moira.error.cluster_lease_denied",
         default_message: "This replica does not hold a valid cluster admission lease.",
         description: "Used by GET /health/ready when the replica's row in cluster_replica_leases has been lost or reclaimed mid-run, so the replica is outside the configured cluster.max_replicas ceiling and must stop receiving traffic. Denial at process startup is a fatal log and a non-zero exit, not a response, so it carries no key.",

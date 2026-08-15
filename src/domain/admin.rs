@@ -112,6 +112,19 @@ pub enum ProviderType {
     AzureOpenAi,
     Local,
     Custom,
+    /// rig-core 0.40's native `rig_core::providers::chatgpt` client against
+    /// `chatgpt.com/backend-api/codex` (issue #216). Spelled `Chatgpt`, not `ChatGpt` or
+    /// `ChatGPT`, so `#[serde(rename_all = "snake_case")]` derives the wire/DB value
+    /// `chatgpt_oauth` directly — the same convention `CredentialType::Oauth2` already uses for
+    /// "OAuth" in this file.
+    ///
+    /// **Refused unless `provider_security.allow_chatgpt_subscription` is explicitly `true`.**
+    /// ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no
+    /// carve-out for third-party, multi-tenant use. Wiring this provider is this deployment
+    /// operator's own explicit ToS risk acceptance for their own subscription, never a silent
+    /// default — see `orchestration::runtime_factory::require_chatgpt_subscription_opt_in` and
+    /// `docs/chatgpt-subscription-spike.md`.
+    ChatgptOauth,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]

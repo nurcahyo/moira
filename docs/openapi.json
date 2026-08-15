@@ -7361,7 +7361,8 @@
           "deep_seek",
           "azure_open_ai",
           "local",
-          "custom"
+          "custom",
+          "chatgpt_oauth"
         ],
         "type": "string"
       },

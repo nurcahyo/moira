@@ -85,6 +85,9 @@ prefix_length = 20
 [provider_security]
 allow_private_provider_urls = false
 allow_http_provider_urls = false
+# ToS risk-acceptance opt-in for the chatgpt_oauth provider (issue #216). Off by default in
+# every environment, including production; see ProviderSecuritySettings::allow_chatgpt_subscription.
+allow_chatgpt_subscription = false
 
 [cors]
 allowed_origins = ["*"]

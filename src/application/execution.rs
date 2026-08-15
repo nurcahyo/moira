@@ -62,11 +62,13 @@ pub struct MoiraExecutionService {
 impl MoiraExecutionService {
     pub fn new(state: AppState) -> Result<Self, AppError> {
         let pool = state.pool()?.clone();
+        let allow_chatgpt_subscription =
+            state.settings.provider_security.allow_chatgpt_subscription;
         Ok(Self {
             state,
             runtime_repo: PgRuntimeRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool),
-            factory: RigRuntimeFactory::new(),
+            factory: RigRuntimeFactory::new(allow_chatgpt_subscription),
         })
     }
 
@@ -2596,11 +2598,23 @@ const STRUCTURED_OUTPUT_CAPABILITY: &str = "structured_output";
 /// `output_schema` natively onto their own request shapes (`anthropic/completion.rs`
 /// `output_config`, `gemini/completion.rs` `generation_config`) and expose no constant to read.
 /// `true` is restated for those two and pinned by
-/// `the_two_native_providers_still_map_output_schema` below; that test is the thing that reds if
-/// a bump makes the restatement false.
+/// `rig_0_40_still_drops_the_schema_for_deepseek_and_sends_it_for_everyone_else` below; that
+/// test is the thing that reds if a bump makes the restatement false.
 ///
 /// `Custom` never constructs a model at all — `build_completion_model` returns
 /// `AppError::Config` — so no schema can reach any provider on that arm.
+///
+/// **`ChatgptOauth` (issue #216) is `false` for a third, distinct reason from `Custom` and
+/// `DeepSeek`: it *does* construct a real model, on the same Responses-API engine `openai`
+/// itself uses (`openai::responses_api::GenericResponsesCompletionModel<ChatGPTExt, H>`), and
+/// that engine populates `output_schema` onto `additional_parameters.text`
+/// (`responses_api/mod.rs:1202-1214`). But `chatgpt::ResponsesCompletionModel::create_request`
+/// unconditionally wipes it straight back out —
+/// `request.additional_parameters.text = None;` (`rig-core-0.40.0/src/providers/chatgpt/mod.rs:415`)
+/// — alongside `temperature`, `max_output_tokens`, and several other fields, on every request,
+/// with no `warn!` at all. `SUPPORTS_RESPONSE_FORMAT` cannot be read for it (`ChatGPTExt` does
+/// not implement `OpenAICompatibleProvider` — it is not on the chat-completions engine), so this
+/// has to be a restated `false`, not a read-from-Rig `true`/`false` like the OpenAI family.
 fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
     use rig_core::providers::openai::OpenAICompatibleProvider;
 
@@ -2615,7 +2629,7 @@ fn provider_emits_output_schema(provider_type: ProviderType) -> bool {
             <rig_core::providers::deepseek::DeepSeekExt as OpenAICompatibleProvider>::SUPPORTS_RESPONSE_FORMAT
         }
         ProviderType::Anthropic | ProviderType::Gemini => true,
-        ProviderType::Custom => false,
+        ProviderType::Custom | ProviderType::ChatgptOauth => false,
     }
 }
 
@@ -2685,6 +2699,11 @@ fn supported_credential_types(
         ProviderType::Anthropic | ProviderType::Gemini | ProviderType::DeepSeek => {
             &[CredentialType::ApiKey]
         }
+        // Mirrors workstream B's Claude subscription-token storage: the ChatGPT/Codex
+        // subscription access token lives in the same `credential_type = 'oauth2'` shape,
+        // `secret_from_credential_payload` reading it out of the `"access_token"` field
+        // (`crate::security::credential_secret_field`).
+        ProviderType::ChatgptOauth => &[CredentialType::Oauth2],
         ProviderType::Custom => &[],
     }
 }
@@ -3064,6 +3083,11 @@ mod tests {
             !provider_emits_output_schema(ProviderType::Custom),
             "custom providers never construct a model, so no schema can reach a wire"
         );
+        assert!(
+            !provider_emits_output_schema(ProviderType::ChatgptOauth),
+            "rig-core changed: chatgpt::ResponsesCompletionModel::create_request no longer wipes \
+             additional_parameters.text — re-read the chatgpt wire-shape review (issue #216)"
+        );
         for provider_type in [
             ProviderType::OpenAi,
             ProviderType::OpenAiCompatible,
@@ -3241,6 +3265,10 @@ mod tests {
         assert_eq!(
             supported_credential_types(ProviderType::OpenAiCompatible),
             &[CredentialType::ApiKey, CredentialType::BearerToken]
+        );
+        assert_eq!(
+            supported_credential_types(ProviderType::ChatgptOauth),
+            &[CredentialType::Oauth2]
         );
     }
 

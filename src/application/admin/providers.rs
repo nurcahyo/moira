@@ -27,6 +27,7 @@ use crate::{
     },
     error::AppError,
     infra::repositories::{AdminRepository, PgAdminRepository},
+    orchestration::require_chatgpt_subscription_opt_in,
     security::Actor,
 };
 
@@ -60,10 +61,19 @@ impl<'a> ProviderAdminService<'a> {
             .settings
             .provider_security
             .allow_http_provider_urls;
+        let allow_chatgpt_subscription = self
+            .state
+            .settings
+            .provider_security
+            .allow_chatgpt_subscription;
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     require_non_empty("display_name", &request.display_name)?;
+                    require_chatgpt_subscription_opt_in(
+                        request.provider_type,
+                        allow_chatgpt_subscription,
+                    )?;
                     let base_url = match request.base_url.as_deref() {
                         Some(value) => Some(validate_provider_base_url(
                             value,

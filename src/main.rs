@@ -73,6 +73,20 @@ async fn run(mode: ProcessMode, settings: Settings) -> anyhow::Result<()> {
         );
     }
 
+    // Deliberately not folded into `unsafe_development_features`: that list reports nothing at
+    // all in production, but a deployment's own ChatGPT subscription is exactly as usable — and
+    // exactly as risky — in production as anywhere else, so this warns unconditionally, in
+    // every environment, whenever the operator has opted in.
+    if settings.provider_security.allow_chatgpt_subscription {
+        warn!(
+            "chatgpt subscription provider opt-in is active \
+             (provider_security.allow_chatgpt_subscription=true): ChatGPT/Codex subscriptions \
+             are personal, single-user under OpenAI's terms, and wiring rig-core's native \
+             chatgpt provider into a multi-tenant gateway is this deployment's own explicit ToS \
+             risk acceptance, not a sanctioned integration path"
+        );
+    }
+
     match mode {
         ProcessMode::Migrate => {
             migrate(settings).await?;
