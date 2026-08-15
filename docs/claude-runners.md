@@ -148,13 +148,15 @@ scripts/build-claude-runner-image.sh 2.1.240   # re-pin, deliberately
   boundary issue #272's own evidence comment draws. Prove this before depending
   on it for a first real login.
 - ~~**Not measured**: the `moira-runner` binary itself.~~ **Superseded by R1
-  (issue #273).** The binary now exists, and it was run against this image: it
-  provisions a container, reaches `awaiting_authorization`, and returns the
-  complete authorization URL. What still is *not* measured is the step after
-  that — the CLI was never observed submitting a pasted code through the Engine
-  API attach endpoint, which contradicts #272's evidence comment and is not yet
-  explained. **`docs/moira-runner.md` is the authority on exactly what was and
-  was not verified**; read it before depending on the paste half.
+  (issue #273).** The binary now exists and was run against this image end to end: it
+  provisions a container, reaches `awaiting_authorization`, returns the complete
+  authorization URL, and **submits a pasted code** — the CLI performs the exchange and
+  returns `OAuth error: … status code 400` for a deliberately bogus one, reproduced
+  twice. The delivery sequence that achieves this is specific and measured (the
+  payload's own trailing carriage return is ignored; a second bare one a few seconds
+  later submits), so **`docs/moira-runner.md` is the authority** before anyone changes
+  it. What remains unmeasured is the same thing this document already flags above:
+  capturing a *minted* token on a **valid** code.
 
 ## Manually testing the image
 

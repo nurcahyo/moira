@@ -62,72 +62,72 @@ Verified on 2026-08-16 by running the built `moira-runner` binary against
 - `POST /v1/runners` creates and starts a hardened container.
 - `GET /v1/runners/{id}` reaches `awaiting_authorization` and returns the **complete**
   authorization URL, including `code_challenge` and `state`.
-- `POST /v1/runners/{id}/authorization-code` writes the code to the prompt — the CLI renders
-  it back masked, so the attach transport, the pty and the CLI's input handling all work.
+- `POST /v1/runners/{id}/authorization-code` submits the line and the CLI performs the
+  exchange — `OAuth error: … status code 400` for a deliberately bogus code, reproduced twice,
+  after which the runner reports `failed` / `oauth_exchange_failed`. See below: the delivery
+  sequence that achieves this is specific and measured.
 - The reaper removes an expired runner and `GET` then answers `404`.
 
 `bollard` against a real daemon is additionally covered by `tests/runner_docker_engine.rs`
 (container lifecycle, label discovery, rename, the attach write, and that a runner cannot see
 the Docker socket) — all three tests pass against a real daemon.
 
-### The open defect: submitting an authorization code does not work from this client
+### Code submission: the sequence is measured, not reasoned about
 
-**`POST /v1/runners/{id}/authorization-code` reports `202 exchanging` but the CLI never
-submits the line.** The code reaches the prompt — the CLI echoes it back masked — and the
-trailing `\r` does not take effect. Everything before that step works; everything after it is
-therefore also unverified, including capturing a minted token on a valid code (which was
-already unproven on #272).
+Code submission **works** end to end against the real image, and it works because of a specific
+and unintuitive sequence. Every plausible simplification has been tried and measured not to
+submit, so treat this as load-bearing.
 
-**The container and the payload are not at fault, and that is measured, not assumed.** A
-~40-line Node client performing a raw HTTP 101 upgrade over the same unix socket submits
-successfully **against a container this service created** — same image, same config, same
-payload — producing `OAuth error: Request failed with status code 400` for a bogus code.
-Stronger: after this service had typed a code into the prompt, that Node client sending a
-*bare* `\r` submitted that same already-typed code.
+`claude setup-token` does **not** submit on the carriage return glued to the end of the pasted
+text. The code appears masked at the prompt and the line just sits there — no error, no
+timeout, the runner stays in `awaiting_authorization` until its TTL. It submits on a **second,
+bare** carriage return delivered on the same still-open connection a few seconds later. So the
+shipped sequence is: attach and start draining; wait 1.5 s; write `code + "\r"` unchanged; wait
+5 s; write one bare `\r`; keep the connection open and draining for 30 s.
 
-**One real property was established**, and the code now honours it: the carriage return is
-only acted on **while the attach connection stays open**. Closing right after the write
-discards it. `ATTACH_HOLD` (30 s, with a compile-time floor and a unit test) and a read-half
-drain that starts at the moment of upgrade are what implement that.
+Verified twice, independently, against `moira-claude-runner:local` (`claude setup-token`
+2.1.233, Docker Desktop 29.6.2): both runs produced `OAuth error: Request failed with status
+code 400` for a deliberately bogus code, and the runner's own state machine then reported
+`failed` / `oauth_exchange_failed`.
 
-**It is necessary and not sufficient here.** The lifetime was tested against both Docker
-clients at both magnitudes, and all four cells fail from Rust:
+What does **not** work, so nobody tidies the code into one of them:
 
-| | hold ≈ 2 s | hold = 30 s, draining throughout |
-|---|---|---|
-| `bollard` attach | no submit | no submit |
-| hand-rolled HTTP 101 upgrade over the raw socket | no submit | no submit |
-
-The 30 s runs were instrumented rather than assumed — the drain reported 3 chunks received and
-the hold reported elapsing a full 30 s after the write — so the stream was genuinely live and
-the connection genuinely open. A Node client holding ~12 s on the same image submits. The
-hand-rolled client was reverted (twice, deliberately): it behaved identically to `bollard`, so
-shipping ~150 lines of bespoke HTTP plus two extra tokio features would have added surface for
-no measured benefit.
-
-Other things tried and ruled out, so nobody repeats them:
-
-| Attempt | Result |
+| Sequence | Result |
 |---|---|
-| `code + "\r"` in one write (the frozen contract's payload) | text lands, no submit |
-| code and `\r` as two writes, 100 ms and 250 ms apart | same |
+| `code + "\r"` in one write, connection closed straight after | text lands, no submit |
+| `code + "\r"` in one write, connection held open 30 s while draining | text lands, no submit |
+| `code` alone, then a bare `\r` after 2 s or after 5 s | text lands, no submit |
+| `code` and `\r` as two writes 100 ms / 250 ms apart | text lands, no submit |
 | bracketed paste `ESC[200~…ESC[201~` | worse — the terminator is typed literally, so this CLI does not implement it |
-| a settle delay before the first byte | same, and **kept** — the reference client does it |
-| `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same, and **kept** — it is the correct config, pinned by a test |
-| gating `awaiting_authorization` on the paste prompt rather than the URL | same, and **kept** — a genuine bug, see below |
 
-Two genuine bugs on this side *were* found by this investigation and are fixed:
+Row three kills the obvious theory: "deliver the carriage return as its own read" is not
+sufficient on its own — the payload's own trailing `\r` has to be there too. The mechanism
+inside the CLI was not chased further.
+
+Two theories were eliminated on the way, both worth recording:
+
+- **`bollard` was never at fault.** A hand-rolled HTTP 101 upgrade over the raw unix socket
+  behaved identically. It was reverted rather than shipped, since it added ~150 lines of
+  bespoke HTTP and two tokio features for no measured benefit.
+- **The write half was never half-closed.** A chunk count cannot test that — Docker delivers
+  only *new* output on attach, so a quiet CLI yields zero chunks whether or not the writer is
+  alive. What settled it: a diagnostic wrote `code + "\r"`, waited 5 s, then wrote a bare `\r`
+  on the *same* writer. The probe write returned `Ok`, proving the write half had been alive
+  throughout — and the container immediately performed the exchange. One run eliminated the
+  theory and revealed the working sequence at once.
+
+Three bugs on this side were found by the same investigation and are fixed:
 
 1. `awaiting_authorization` used to mean only "a URL has been scraped", which let a caller
    submit before the CLI's reader existed. It now also requires the paste prompt.
-2. The container was created with `AttachStdin: true`, which tells the daemon to expect a
-   client attached at start time. It is now created detached, exactly as `docker run -dit`.
+2. Containers were created with `AttachStdin: true`, which tells the daemon to expect a client
+   attached at start time. They are now created detached, exactly as `docker run -dit`.
+3. The attach was torn down as soon as the write resolved. It now outlives the call.
 
-**The next step is to diff the two clients at the syscall or socket level** — `dtruss`, or a
-proxy between client and daemon — which is the one thing that has not been done. **Not**
-another payload: the payload is settled, measured working twice from the reference client.
-`MOIRA_RUNNER__TOKEN_PREFIX` remains configurable (default `sk-ant-`) so the token-scraping
-half can be corrected without a rebuild once the write is fixed.
+**Still unproven:** capturing a *minted* token on a **valid** code. Every runner driven here
+used a deliberately bogus code, so the success path — the token's exact format — has never been
+seen. `MOIRA_RUNNER__TOKEN_PREFIX` is configurable (default `sk-ant-`) so it can be corrected
+without a rebuild, and the tests assert the scraping *mechanism* rather than the format.
 
 ## Configuration
 

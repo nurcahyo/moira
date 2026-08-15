@@ -175,26 +175,24 @@ impl<E: ContainerEngine> RunnerService<E> {
     /// The payload is `code + "\r"` in a single write, exactly as the frozen contract
     /// specifies. A pty delivers CR, not LF, when a human presses Return.
     ///
-    /// # The payload is settled. This path has an open defect that is NOT the payload.
+    /// # The payload is the contract's, and the delivery sequence is measured
     ///
-    /// `code + "\r"` is measured working twice from a reference client — once on issue #272's
-    /// spike and once independently against R4's hardened image under this contract's exact
-    /// attach flags. **Do not vary it.** An earlier revision of this comment listed payload
-    /// shapes that "did not submit" and invited the next reader to hunt for another; that
-    /// framing was wrong and is recorded here so nobody repeats it.
+    /// This method hands `code + "\r"` to the engine, exactly as the frozen contract
+    /// specifies. **Do not vary the payload.**
     ///
-    /// What is broken is the write itself, from this process. The text lands — the CLI echoes
-    /// it back masked — and the carriage return does not take effect. One real property was
-    /// established and is now honoured (the carriage return is only acted on while the attach
-    /// connection stays open), and it is necessary without being sufficient. The full account
-    /// — the 2×2 matrix of Docker client against connection lifetime, the instrumentation, and
-    /// everything ruled out — is in the [`super::docker_engine`] module docs. **Read them
-    /// before changing anything here.**
+    /// Getting the CLI to actually *submit* that line took nine attempts and depends on a
+    /// sequence that is not guessable: the payload is written unchanged, and then a **second,
+    /// bare** carriage return follows a few seconds later on the same still-open connection.
+    /// The carriage return glued to the end of the payload is, on its own, ignored. The full
+    /// account — including the four sequences that do not submit, and the two theories
+    /// (`bollard`, a half-closed write half) that were eliminated on the way — is in the
+    /// [`super::docker_engine`] module docs. **Read them before changing anything here or
+    /// there.**
     ///
-    /// One real bug on this side *was* found and fixed: `awaiting_authorization` used to mean
-    /// only "a URL has been scraped", which let a caller submit before the CLI's reader
-    /// existed. It now also requires the paste prompt — see [`super::state::derive_state`].
-    /// That was necessary and is not sufficient.
+    /// One bug on this side was found by the same investigation and fixed:
+    /// `awaiting_authorization` used to mean only "a URL has been scraped", which let a caller
+    /// submit before the CLI's reader existed. It now also requires the paste prompt — see
+    /// [`super::state::derive_state`].
     pub async fn submit_code(&self, id: Uuid, code: &str) -> Result<RunnerView, ServiceError> {
         validate_authorization_code(code)?;
 

@@ -47,18 +47,23 @@
 //!    as its visible text. [`scrape`] prefers the hyperlink and keeps the rejoin as a
 //!    fallback; its module docs carry the capture and the bug the incomplete version shipped.
 //!
-//! # What is NOT proven — the open defect
+//! # What is proven, and the one thing that is not
 //!
-//! **Submitting an authorization code does not work from this process.** The write reaches the
-//! prompt (the CLI echoes it back masked) and the carriage return that submits it does not take
-//! effect, so nothing past `awaiting_authorization` is verified — including capturing a minted
-//! token, which was already unproven on issue #272.
+//! Code submission **works** end to end against R4's real image, verified twice: the CLI
+//! performs the exchange and returns `OAuth error: … status code 400` for a deliberately bogus
+//! code. It works because of a specific, unintuitive delivery sequence — the payload's own
+//! trailing carriage return is ignored, and a **second, bare** one a few seconds later on the
+//! same still-open connection is what submits. [`docker_engine`]'s module docs carry the
+//! sequence, the four variants that do *not* submit, and the two theories eliminated on the
+//! way; `docs/moira-runner.md` is the operator-facing version. Do not simplify that sequence
+//! without re-measuring.
 //!
-//! The container and the payload are measured *not* to be at fault: a reference client submits
-//! successfully against a container this service created, and a bare carriage return from that
-//! client submits a code this service had already typed in. [`docker_engine`]'s module docs
-//! carry the full account, the eight things already tried, and the next diagnostic step.
-//! `docs/moira-runner.md` is the operator-facing version.
+//! **Still unproven: capturing a minted token on a *valid* code.** Every runner driven so far
+//! used a bogus code, so the success path has never been seen — the same boundary issue #272's
+//! own evidence draws. [`scrape::extract_token`] is therefore written against a configurable
+//! prefix ([`config::RunnerConfig::token_prefix`]) so an operator can correct it without a
+//! rebuild, and its unit tests assert the *mechanism* (ANSI stripping, line rejoining, one-shot
+//! handoff) rather than claiming the format is confirmed.
 //!
 //! # Module layout
 //!
