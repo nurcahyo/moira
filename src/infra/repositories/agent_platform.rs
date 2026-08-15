@@ -14,25 +14,32 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use secrecy::SecretString;
+use serde_json::Value;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
     domain::{
         AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
-        AgentFlowStepCreateRequest, AgentFlowStepRecord, AuditLogInsert, EvalCaseCreateRequest,
-        EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest, EvalSuitePatchRequest,
-        EvalSuiteRecord, ListCursor, SkillCreateRequest, SkillHttpExecutorPatchRequest,
-        SkillHttpExecutorRecord, SkillPatchRequest, SkillRecord,
+        AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentSkillBinding, AuditLogInsert,
+        EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalSuiteCreateRequest,
+        EvalSuitePatchRequest, EvalSuiteRecord, ListCursor, ResolvedCredential, SkillCreateRequest,
+        SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillPatchRequest, SkillRecord,
     },
     error::AppError,
     infra::pg_rows::{
         agent_flow_record_from_row, agent_flow_run_record_from_row,
-        agent_flow_step_record_from_row, eval_case_record_from_row, eval_run_record_from_row,
-        eval_suite_record_from_row, flow_step_on_failure_to_db, grading_kind_to_db,
-        http_method_to_db, skill_http_executor_record_from_row, skill_record_from_row,
+        agent_flow_step_record_from_row, credential_record_from_row, credential_type_to_db,
+        eval_case_record_from_row, eval_run_record_from_row, eval_suite_record_from_row,
+        flow_step_on_failure_to_db, grading_kind_to_db, http_method_to_db, scope_type_to_db,
+        skill_http_executor_record_from_row, skill_record_from_row,
     },
     orchestration::ParsedOperation,
+    security::{
+        CredentialAadParts, EncryptedSecret, LocalSecretCipher, SecretCipher, credential_aad,
+        credential_secret_field,
+    },
 };
 
 use super::admin::commit_with_audit;
@@ -328,6 +335,152 @@ impl PgAgentPlatformRepository {
         }
         commit_with_audit(tx, audit).await?;
         Ok((skills, executors))
+    }
+
+    /// Resolves an agent profile's `skill_refs` into the rows the rig tool loop needs
+    /// (issue #84), **in `skill_refs` order**.
+    ///
+    /// Order is part of the contract, not an accident of the query plan: `ToolSet` is an
+    /// `IndexMap`, so registration order is what a provider sees and what an idempotency
+    /// key over the advertised tool list would hash. Assembling in Rust from the array
+    /// rather than relying on `order by` over an `any($1)` result is what makes it stable.
+    ///
+    /// Three cheap statements rather than one `unnest ... left join` chain: `skills` and
+    /// `skill_http_executors` share four column names (`created_at`, `updated_at`, and the
+    /// `id`/`skill_id` pair), so a single joined row would need an aliasing scheme that
+    /// [`skill_record_from_row`] and [`skill_http_executor_record_from_row`] do not speak
+    /// — and duplicating those mappers to teach them aliases is exactly the drift this
+    /// module's shared column constants exist to prevent.
+    ///
+    /// A reference no live row answers comes back as [`AgentSkillBinding`] with
+    /// `skill: None` rather than being dropped: the caller must be able to tell "this
+    /// profile has no skills" from "this profile names a skill that is gone".
+    pub async fn resolve_agent_skills(
+        &self,
+        agent_profile_id: Uuid,
+    ) -> Result<Vec<AgentSkillBinding>, AppError> {
+        let skill_ids = sqlx::query_scalar::<_, Vec<Uuid>>(
+            "select skill_refs from agent_profiles where id = $1",
+        )
+        .bind(agent_profile_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or_default();
+        if skill_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let skill_rows = sqlx::query(&format!(
+            "select {SKILL_COLUMNS} from skills where id = any($1) and deleted_at is null"
+        ))
+        .bind(&skill_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let skills = skill_rows
+            .iter()
+            .map(skill_record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let executor_rows = sqlx::query(&format!(
+            "select {EXECUTOR_COLUMNS} from skill_http_executors where skill_id = any($1)"
+        ))
+        .bind(&skill_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let executors = executor_rows
+            .iter()
+            .map(skill_http_executor_record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(skill_ids
+            .into_iter()
+            .map(|skill_id| AgentSkillBinding {
+                skill_id,
+                skill: skills.iter().find(|row| row.id == skill_id).cloned(),
+                executor: executors
+                    .iter()
+                    .find(|row| row.skill_id == skill_id)
+                    .cloned(),
+            })
+            .collect())
+    }
+
+    /// Fetches and decrypts the `provider_credentials` row a `skill_http_executors` row
+    /// references (decision 21 — skills reuse that table rather than inventing a second
+    /// secret store).
+    ///
+    /// Deliberately **not** routed through `RuntimeRepository::resolve_runtime_credential`:
+    /// that method implements the provider-scoped precedence ladder (explicit id, then
+    /// user, application, tenant, global), and a skill's credential is none of those — the
+    /// executor row names one exact credential id, chosen by the operator who configured
+    /// the skill, and no caller-supplied scope may redirect it to a different row. The
+    /// active/not-expired/not-deleted filters are the same, so a revoked or expired
+    /// credential yields `None` here just as it yields no candidate there.
+    ///
+    /// Returns `Ok(None)` when the row is absent or unusable. The caller decides what that
+    /// means; this never falls back to an unauthenticated call.
+    pub async fn resolve_skill_credential(
+        &self,
+        cipher: &LocalSecretCipher,
+        credential_id: Uuid,
+    ) -> Result<Option<ResolvedCredential>, AppError> {
+        let Some(row) = sqlx::query(
+            "select id, provider_id, credential_type, scope_type, external_tenant_id, \
+                    application_id, external_user_id, encryption_algorithm, \
+                    encryption_version, encrypted_data_key, nonce, encrypted_payload, \
+                    secret_fingerprint, masked_secret, status, priority, expires_at, \
+                    last_validated_at, last_used_at, metadata, display_name, \
+                    created_at, updated_at, deleted_at, version \
+             from provider_credentials \
+             where id = $1 and status = 'active' and deleted_at is null \
+               and (expires_at is null or expires_at > now())",
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let record = credential_record_from_row(&row)?;
+        let encrypted = EncryptedSecret {
+            algorithm: row.try_get("encryption_algorithm")?,
+            version: row.try_get("encryption_version")?,
+            key_id: String::new(),
+            encrypted_data_key: row.try_get("encrypted_data_key")?,
+            nonce: row.try_get("nonce")?,
+            ciphertext: row.try_get("encrypted_payload")?,
+        };
+        let aad = credential_aad(CredentialAadParts {
+            credential_id: record.id,
+            provider_id: record.provider_id,
+            credential_type: credential_type_to_db(&record.credential_type),
+            scope_type: scope_type_to_db(&record.scope_type),
+            external_tenant_id: record.external_tenant_id.as_deref(),
+            application_id: record.application_id,
+            external_user_id: record.external_user_id.as_deref(),
+            encryption_version: record.encryption_version,
+        });
+        let plaintext = cipher.decrypt(&encrypted, aad.as_bytes())?;
+        let config: Value = serde_json::from_slice(&plaintext)
+            .map_err(|_| AppError::Config("provider credential payload is invalid".to_string()))?;
+        let Some(field) = credential_secret_field(record.credential_type) else {
+            return Ok(None);
+        };
+        let Some(secret) = config
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedCredential {
+            credential_id: record.id,
+            credential_version: record.version,
+            credential_type: record.credential_type,
+            secret: SecretString::new(secret.to_string()),
+            config,
+        }))
     }
 
     pub async fn get_executor(&self, skill_id: Uuid) -> Result<SkillHttpExecutorRecord, AppError> {

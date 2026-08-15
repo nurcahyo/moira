@@ -576,6 +576,22 @@ pub enum ExecutionFailureClass {
     AgentProfileNotFound,
     /// F50 / issue #79 — the selected route names an agent profile the operator disabled.
     AgentProfileDisabled,
+    /// Issue #84 — the resolved agent profile's `skill_refs` name a skill this execution
+    /// cannot use: no live row, not `enabled`, a `kind = 'tool'` row with no
+    /// `skill_http_executors` child, or a set of skills that cannot be assembled into a
+    /// tool list (a duplicate `skill_key`, a parameter schema no provider would accept, a
+    /// credential type with no HTTP form, or more tools than
+    /// `skill_execution.maximum_advertised_tools` allows).
+    ///
+    /// **Fail-closed, and one class for all of those**, unlike the
+    /// `AgentProfileNotFound`/`AgentProfileDisabled` pair. That split exists because a
+    /// route names exactly one profile, so "gone" and "switched off" are two different
+    /// one-field fixes for one id. A profile names a *list* of skills and the answer is the
+    /// same in every case here — an operator must fix the agent profile or the skill row
+    /// the server-side message names — so a second public code would carry no information
+    /// the first does not. The specific [`crate::domain::SkillUnusableReason`] travels in
+    /// the audit entry and the runtime event, not on the wire.
+    SkillUnavailable,
     ModelNotFound,
     ModelForbidden,
     ModelCapabilityMismatch,
@@ -644,13 +660,14 @@ impl ExecutionFailureClass {
     /// has a code; being listed here means it then fails the catalog test until it has a string.
     /// **Add new variants to this array** — a variant omitted here is invisible to the gate, which
     /// is the one way this can still rot.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::InvalidExecutionRequest,
         Self::ApplicationUnavailable,
         Self::RouteNotFound,
         Self::RouteForbidden,
         Self::AgentProfileNotFound,
         Self::AgentProfileDisabled,
+        Self::SkillUnavailable,
         Self::ModelNotFound,
         Self::ModelForbidden,
         Self::ModelCapabilityMismatch,
@@ -694,6 +711,7 @@ impl ExecutionFailureClass {
             Self::RouteForbidden => "route_forbidden",
             Self::AgentProfileNotFound => "agent_profile_not_found",
             Self::AgentProfileDisabled => "agent_profile_disabled",
+            Self::SkillUnavailable => "skill_unavailable",
             Self::ModelNotFound => "model_not_found",
             Self::ModelForbidden => "model_forbidden",
             Self::ModelCapabilityMismatch => "model_capability_mismatch",

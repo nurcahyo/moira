@@ -7,7 +7,8 @@ use rig_core::{
     client::CompletionClient,
     completion::{
         AssistantContent, CompletionError, CompletionModel as RigCompletionModel,
-        CompletionRequest, CompletionResponse, GetTokenUsage, Message, Usage, message::UserContent,
+        CompletionRequest, CompletionResponse, GetTokenUsage, Message, Usage,
+        message::{ToolCall, UserContent},
     },
     providers::{anthropic, azure, deepseek, gemini, openai},
     streaming::StreamedAssistantContent,
@@ -66,6 +67,15 @@ pub struct RuntimeCompletionOutput {
     pub text: String,
     pub usage: UsageSummary,
     pub provider_request_id: Option<String>,
+    /// Every `AssistantContent::ToolCall` in the choice, in the order the provider sent
+    /// them (issue #84).
+    ///
+    /// Until the tool loop landed, `text_from_choice` silently discarded these, so a model
+    /// that answered with a tool call produced an empty-string success. That was harmless
+    /// only because `CompletionRequest.tools` was hardcoded empty and no model could ever
+    /// call one; the moment an agent profile's `skill_refs` put tools on the wire, dropping
+    /// them would turn every tool-calling turn into a blank answer.
+    pub tool_calls: Vec<rig_core::completion::message::ToolCall>,
 }
 
 impl RigRuntimeFactory {
@@ -393,22 +403,31 @@ fn invalid_execution_request(message: &str) -> ExecutionFailure {
 }
 
 fn output_from_response<T>(response: CompletionResponse<T>) -> RuntimeCompletionOutput {
+    let (text, tool_calls) = split_choice(response.choice);
     RuntimeCompletionOutput {
-        text: text_from_choice(response.choice),
+        text,
         usage: usage_from_rig(response.usage),
         provider_request_id: response.message_id,
+        tool_calls,
     }
 }
 
-fn text_from_choice(choice: OneOrMany<AssistantContent>) -> String {
-    choice
-        .into_iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) => Some(text.text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+/// Splits an assistant turn into its text and its tool calls.
+///
+/// One pass rather than two filters so the two halves can never disagree about which
+/// content items were seen. Reasoning and any other content kind is still dropped here —
+/// that is unchanged and deliberate; only the tool calls stopped being discarded (#84).
+fn split_choice(choice: OneOrMany<AssistantContent>) -> (String, Vec<ToolCall>) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for content in choice {
+        match content {
+            AssistantContent::Text(part) => text.push_str(&part.text),
+            AssistantContent::ToolCall(tool_call) => tool_calls.push(tool_call),
+            _ => {}
+        }
+    }
+    (text, tool_calls)
 }
 
 pub fn usage_from_rig(usage: Usage) -> UsageSummary {

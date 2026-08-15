@@ -165,3 +165,17 @@ prometheus_enabled = false
 metrics_path = "/metrics"
 otel_enabled = false
 otel_endpoint = ""
+
+# How an agent profile's enabled `skill_refs` are executed as rig tools (issue #84,
+# plan 12 §5). A skill target is a third-party HTTP endpoint an operator imported, so
+# every value here bounds a call into someone else's infrastructure.
+[skill_execution]
+# Total model calls one tool-bearing execution may make. A tool call plus a final answer
+# needs at least 2.
+maximum_tool_turns = 4
+maximum_advertised_tools = 32
+maximum_response_bytes = 65536
+dns_timeout_ms = 5000
+# Dev only. Production start-up refuses to come up while this is true. Import never
+# honours it — only the execution-time SSRF re-check.
+allow_insecure_dev_urls = false

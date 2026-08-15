@@ -769,4 +769,14 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         default_message: "The skill has no HTTP executor.",
         description: "Used by GET/PATCH/DELETE /api/v1/admin/skills/{id}/executor (issue #237, plan 12 §5) when the named skill has no skill_http_executors row - either because the skill was hand-authored without one, or because the row was already deleted.",
     },
+    I18nEntry {
+        key: "moira.error.skill_unavailable",
+        default_message: "An agent skill this request needs is unavailable.",
+        description: "Used when the agent profile a route resolved to names a skill in skill_refs that this execution cannot use (issue #84, plan 12 §5): no live skills row answers the id, the row is not enabled (still draft and unreviewed, or switched off), a kind='tool' row has no skill_http_executors child, or the set cannot be assembled into a tool list - a duplicate skill_key, a params_schema that is not a JSON-Schema object, a required name absent from properties, a credential type with no HTTP form, or more tools than skill_execution.maximum_advertised_tools permits. Fail-closed and refused before any provider call, matching the posture issue #79 chose for a dangling agent_profile_id: an agent silently missing a skill it was configured with is worse than a loud refusal. One code covers every cause because the remedy is always the same - fix the agent profile or the skill row - and the specific reason is recorded in the audit entry and the runtime event rather than on the wire, so this response cannot be used to enumerate which skill ids exist. Mapped to 409 rather than 404: every cause is an operator-visible state on the admin plane, not a resource the caller named.",
+    },
+    I18nEntry {
+        key: "moira.error.skill_guard_denied",
+        default_message: "A guard refused this skill call.",
+        description: "Used when a kind='guard' skill listed in the agent profile's skill_refs refuses one tool call before it is dispatched (issue #84, plan 12 §5 skills-as-guards). Unlike skill_unavailable this is not a terminal execution failure: the denial is returned to the model as the tool's result so it can proceed without that tool, which costs one turn instead of failing a request whose output may already be committed. Guards narrow only - a guard can refuse a call Moira's own authorization permitted, never permit one it refused - so a denial never widens what a caller may do. The machine-readable reason (skill_not_allowed, skill_denied, missing_scope, policy_unreadable) travels in the tool result and the runtime event. policy_unreadable is the fail-closed arm: a guard whose metadata.guard object is missing or malformed denies everything it governs rather than silently ceasing to guard.",
+    },
 ];
