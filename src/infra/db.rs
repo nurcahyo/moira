@@ -15,7 +15,6 @@ use crate::{
     error::AppError,
     infra::{
         metrics::{InvalidationChannel, MetricsRegistry, RedisOperation},
-        migration_preflight,
         redis::RedisClient,
     },
     orchestration::{
@@ -48,48 +47,9 @@ pub async fn connect(settings: &DatabaseSettings) -> Result<Option<PgPool>, AppE
         .map_err(AppError::from)
 }
 
-/// The one entry point every migrating process goes through — `moira migrate`, a `serve` with
-/// `migrate_on_startup`, `bootstrap-system-key`, `execute-test`, and `src/test_support.rs`.
-///
-/// The preflight runs **before** the migrator, and that ordering is the entire reason it exists:
-/// `0030` adds a CHECK to `execution_attempts` in the validating form, which holds
-/// `ACCESS EXCLUSIVE` across a full scan of the highest-volume table in the schema, and nothing
-/// appended after `0030` can change what `0030` does. See
-/// [`crate::infra::migration_preflight`] for why that is a preflight and not a migration.
 pub async fn migrate(pool: &PgPool) -> Result<(), AppError> {
-    // One session for both halves, and one advisory lock held across both. `Migrator::run` takes a
-    // lock of its own, which serialises two migrators — but it cannot serialise a migrator against
-    // something that runs before it, and the preflight is exactly that. See
-    // [`migration_preflight::MIGRATE_LOCK_KEY`].
-    //
-    // One connection rather than two, so this does not deadlock a pool sized at one.
-    let mut conn = pool.acquire().await?;
-    sqlx::query("select pg_advisory_lock($1)")
-        .bind(migration_preflight::MIGRATE_LOCK_KEY)
-        .execute(&mut *conn)
-        .await?;
-
-    let outcome = migrate_under_lock(&mut conn).await;
-
-    // Unconditional: the connection goes back to the pool and would carry a session lock with it.
-    if let Err(error) = sqlx::query("select pg_advisory_unlock($1)")
-        .bind(migration_preflight::MIGRATE_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-    {
-        warn!(%error, "releasing the migration advisory lock failed");
-    }
-    outcome
-}
-
-/// `run_direct` rather than `run`: they do the same thing — `Migrator::run` acquires a connection
-/// and calls `run_direct` on it — but `run` is generic over `Acquire<'a>`, and passing it a
-/// `&mut PgConnection` leaves the resulting future `Send` only for a specific lifetime rather than
-/// for all of them, which breaks `tokio::spawn(db::migrate(…))` at the call site rather than here.
-async fn migrate_under_lock(conn: &mut sqlx::PgConnection) -> Result<(), AppError> {
-    migration_preflight::defuse_pending_hot_table_constraints(conn).await?;
     MIGRATOR
-        .run_direct(conn)
+        .run(pool)
         .await
         .map_err(|err| AppError::Internal(format!("run migrations: {err}")))
 }
