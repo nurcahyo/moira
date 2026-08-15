@@ -70,6 +70,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { href: "/evals", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_evals },
   { href: "/flows", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_flows },
   { href: "/playground", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_playground },
+  { href: "/runners", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_runners },
 ];
 
 export interface ConsoleHeaderProps {

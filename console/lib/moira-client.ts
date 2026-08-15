@@ -77,6 +77,10 @@ import type {
   AdminInviteRedeemRequest,
   AdminInviteSecretResponse,
   AuthProviderSettingsRecord,
+  ClaudeRunnerAuthorizationCodeRequest,
+  ClaudeRunnerFinalizeRequest,
+  ClaudeRunnerProvisionRequest,
+  ClaudeRunnerRecord,
   ConsoleAuthProviderCreateRequest,
   ConsoleClaimAdminIdentityRequest,
   ConsoleTrustedJwtIssuerCreateRequest,
@@ -117,6 +121,7 @@ import type {
   SkillRecord,
   TrustedJwtIssuerRecord,
 } from "./types";
+import { CLAUDE_RUNNER_LABEL_PATTERN } from "./types";
 
 /* -------------------------------------------------------------------------- */
 /* Operation registry                                                         */
@@ -1108,6 +1113,79 @@ export const MOIRA_OPERATIONS = {
     declaresIdempotencyKey: false,
     requiresIfMatch: false,
   }),
+
+  /**
+   * Containerised Claude runners (issue #275, workstream R3 of #272) —
+   * `/api/v1/admin/runners*`. PR #282's frozen contract, transcribed from the
+   * generated `docs/openapi.json` on that branch, not guessed from the shape
+   * of the other admin families:
+   *
+   *   `provisionRunner`   optional `Idempotency-Key`, no `If-Match`.
+   *   `listRunners`       neither.
+   *   `getRunner`         neither — but it WRITES (the runner service refresh),
+   *                       so its ETag advances on every call. Never cache one
+   *                       from here and reuse it for `deleteRunner`.
+   *   `submitRunnerAuthorizationCode`
+   *                       NEITHER header, unlike `provisionRunner` next to it —
+   *                       confirmed against the spec rather than assumed by
+   *                       family resemblance.
+   *   `finalizeRunner`    NEITHER header either, for the same reason: the spec
+   *                       declares no `Idempotency-Key` parameter on this
+   *                       operation, despite `src/http/runners.rs`'s own doc
+   *                       comment describing one — the generated spec is ground
+   *                       truth here, not the handler's prose.
+   *   `deleteRunner`      `If-Match` REQUIRED, no key — the one operation on
+   *                       this surface that needs a precondition, because it is
+   *                       the one that destroys the runner's container.
+   */
+  provisionRunner: op({
+    id: "provision_runner",
+    method: "POST",
+    path: "/api/v1/admin/runners",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  listRunners: op({
+    id: "list_runners",
+    method: "GET",
+    path: "/api/v1/admin/runners",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  getRunner: op({
+    id: "get_runner",
+    method: "GET",
+    path: "/api/v1/admin/runners/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  submitRunnerAuthorizationCode: op({
+    id: "submit_runner_authorization_code",
+    method: "POST",
+    path: "/api/v1/admin/runners/{id}/authorization-code",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  finalizeRunner: op({
+    id: "finalize_runner",
+    method: "POST",
+    path: "/api/v1/admin/runners/{id}/finalize",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  deleteRunner: op({
+    id: "delete_runner",
+    method: "DELETE",
+    path: "/api/v1/admin/runners/{id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: true,
+  }),
 } as const;
 
 export type MoiraOperationName = keyof typeof MOIRA_OPERATIONS;
@@ -1587,6 +1665,60 @@ export function assertRoutingPolicyCreateIsSafe(body: Record<string, unknown>): 
           "server-side: it selects which provider live traffic reaches",
       );
     }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Claude runners (issue #275/#272 workstream R3)                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `POST /api/v1/admin/runners` guard.
+ *
+ * `label` is re-validated here rather than trusted to Moira's own `422
+ * runner_label_invalid`, for the same reason `assertLlmProviderCreateIsSafe`
+ * re-checks `base_url`: the value ends up in a container name
+ * (`src/domain/runners.rs`'s own doc comment on the field), and a bad label
+ * caught here is a named rule instead of a relayed error a request round trip
+ * away.
+ */
+export function assertRunnerProvisionRequestIsSafe(body: Record<string, unknown>): void {
+  const label = body["label"];
+  if (typeof label !== "string" || !CLAUDE_RUNNER_LABEL_PATTERN.test(label)) {
+    throw new MoiraClientContractError(
+      "runner provision body requires a `label` matching [a-z0-9-]{1,64} — the value becomes a " +
+        "container name on the runner service",
+    );
+  }
+}
+
+/**
+ * `POST /api/v1/admin/runners/{id}/finalize` guard.
+ *
+ * `scope` MUST BE ABSENT. `ClaudeRunnerFinalizeRequest` cannot even express it
+ * (see that type's header), so this only catches a caller that built the body
+ * by hand or reached here through an `any` — but it is the one field on this
+ * surface where "Moira will refuse it anyway" is not a reason to skip the
+ * console-side check: the scope is sealed into the credential's AAD at
+ * provisioning time, and a value sent here silently disagreeing with the one
+ * already displayed would be exactly the kind of drift this console exists to
+ * prevent, even though `deny_unknown_fields` turns it into a loud 400 rather
+ * than a silent acceptance.
+ */
+export function assertRunnerFinalizeRequestIsSafe(body: Record<string, unknown>): void {
+  if ("scope" in body) {
+    throw new MoiraClientContractError(
+      "runner finalize body must not carry `scope`: it is fixed at provisioning time and sealed " +
+        "into the credential's AAD, so a value sent here could contradict the one already stored " +
+        "— Moira's own deny_unknown_fields refuses it too, but the console must not build it",
+    );
+  }
+  if (typeof body["provider_id"] !== "string" || body["provider_id"].length === 0) {
+    throw new MoiraClientContractError(
+      "runner finalize body requires a non-empty `provider_id`, resolved from a provider the " +
+        "operator selected — it decides which provider row the runner's token becomes a " +
+        "credential for",
+    );
   }
 }
 
@@ -2715,6 +2847,99 @@ export class MoiraClient {
    */
   async diagnoseRuntime(body: DiagnosticExecutionRequest): Promise<DiagnosticExecutionResponse> {
     return this.#request<DiagnosticExecutionResponse>("diagnoseRuntime", { body });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Claude runners (issue #275/#272 workstream R3)                        */
+  /* ---------------------------------------------------------------------- */
+  //
+  // The token never appears on this surface. Every method below returns
+  // `ClaudeRunnerRecord` (no token-shaped field — see its header in
+  // `lib/types.ts`), `ListResponse<ClaudeRunnerRecord>`, or nothing.
+
+  /**
+   * `POST /api/v1/admin/runners`.
+   *
+   * `idempotencyKey` should be derived from `label`: Moira itself refuses a
+   * duplicate label with `409 duplicate_runner_label`, and a deterministic key
+   * makes a double-submit of the SAME provisioning attempt replay instead of
+   * racing that refusal.
+   */
+  async provisionRunner(
+    body: ClaudeRunnerProvisionRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<ClaudeRunnerRecord> {
+    assertRunnerProvisionRequestIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<ClaudeRunnerRecord>("provisionRunner", {
+      body,
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  async listRunners(
+    options: { readonly limit?: number; readonly cursor?: string } = {},
+  ): Promise<ListResponse<ClaudeRunnerRecord>> {
+    return this.#request<ListResponse<ClaudeRunnerRecord>>("listRunners", {
+      query: { limit: options.limit, cursor: options.cursor },
+    });
+  }
+
+  /**
+   * `GET /api/v1/admin/runners/{id}`.
+   *
+   * THIS CALL WRITES. A runner that is not yet in a terminal state is
+   * refreshed from the runner service first — that is what surfaces
+   * `authorization_url` — so the returned `version` (and therefore any `ETag`
+   * built from it) ADVANCES on every poll. Never hold onto a version read from
+   * here and hand it to `deleteRunner` later; re-read immediately before
+   * deleting instead. See `lib/runners.ts`'s `deleteRunnerSafely`.
+   */
+  async getRunner(id: string): Promise<ClaudeRunnerRecord> {
+    return this.#request<ClaudeRunnerRecord>("getRunner", { pathParams: { id } });
+  }
+
+  /**
+   * `POST /api/v1/admin/runners/{id}/authorization-code`.
+   *
+   * The code is a single-use OAuth authorization code, not a token. It is
+   * forwarded to the runner service and dropped — never stored, logged, or
+   * echoed back by anything in this client.
+   */
+  async submitRunnerAuthorizationCode(
+    id: string,
+    body: ClaudeRunnerAuthorizationCodeRequest,
+  ): Promise<ClaudeRunnerRecord> {
+    return this.#request<ClaudeRunnerRecord>("submitRunnerAuthorizationCode", {
+      pathParams: { id },
+      body,
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/runners/{id}/finalize`.
+   *
+   * `409 runner_token_unavailable` means this runner is a write-off: the token
+   * read is one-shot, so a row still at `ready` after this fails can never
+   * yield it again. The caller must render that plainly and offer
+   * delete-and-reprovision — not a retry button that cannot work. See
+   * `modules/runners/RunnerDetail.tsx`.
+   */
+  async finalizeRunner(id: string, body: ClaudeRunnerFinalizeRequest): Promise<ClaudeRunnerRecord> {
+    assertRunnerFinalizeRequestIsSafe(body as unknown as Record<string, unknown>);
+    return this.#request<ClaudeRunnerRecord>("finalizeRunner", { pathParams: { id }, body });
+  }
+
+  /**
+   * `DELETE /api/v1/admin/runners/{id}`. `If-Match` REQUIRED.
+   *
+   * Removes the runner's container upstream AND soft-deletes Moira's mirror
+   * row; any credential the runner already produced is deliberately left in
+   * place. Use `ifMatchFor(record)` from a version read IMMEDIATELY before
+   * calling this — see `getRunner`'s header for why a poll's version is not
+   * safe to reuse here.
+   */
+  async deleteRunner(id: string, ifMatch: string): Promise<void> {
+    await this.#request<void>("deleteRunner", { pathParams: { id }, ifMatch });
   }
 
   /* ---------------------------------------------------------------------- */

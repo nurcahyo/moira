@@ -48,6 +48,8 @@
 //   console.llm.*     the /settings/llm screen — providers, models, routing
 //   console.graph.*   the /graph screen — the derived relationship graph (plan 12 §4)
 //   console.playground.* the /playground screen — test-chat with routing/tool-call transparency (issue #261)
+//   console.runners.* the /runners screen — containerised Claude runner
+//                      provisioning (issue #275/#272 workstream R3)
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -148,6 +150,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   page_admins_title: "console.page.admins_title",
   page_invite_title: "console.page.invite_title",
   page_graph_title: "console.page.graph_title",
+  page_runners_title: "console.page.runners_title",
 
   /* --- generic actions ---------------------------------------------------- */
   action_copy: "console.action.copy",
@@ -159,6 +162,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   chrome_nav_label: "console.chrome.nav_label",
   chrome_nav_home: "console.chrome.nav_home",
   chrome_nav_admins: "console.chrome.nav_admins",
+  chrome_nav_runners: "console.chrome.nav_runners",
   chrome_nav_llm_settings: "console.chrome.nav_llm_settings",
   chrome_nav_graph: "console.chrome.nav_graph",
   chrome_nav_keys: "console.chrome.nav_keys",
@@ -869,6 +873,95 @@ export const CONSOLE_MESSAGE_KEYS = {
   playground_tools_unavailable_note: "console.playground.tools_unavailable_note",
   playground_tool_arguments_label: "console.playground.tool_arguments_label",
   playground_tool_outcome_label: "console.playground.tool_outcome_label",
+
+  /* --- the /runners screen (issue #275/#272 workstream R3) ---------------- */
+  runners_intro: "console.runners.intro",
+  runners_load_failed: "console.runners.load_failed",
+  runners_request_failed: "console.runners.request_failed",
+  runners_request_body_invalid: "console.runners.request_body_invalid",
+  runners_list_heading: "console.runners.list_heading",
+  runners_list_empty: "console.runners.list_empty",
+  runners_table_label: "console.runners.table_label",
+  runners_column_label: "console.runners.column_label",
+  runners_column_scope: "console.runners.column_scope",
+  runners_column_state: "console.runners.column_state",
+  runners_column_created: "console.runners.column_created",
+  runners_column_actions: "console.runners.column_actions",
+  runners_view: "console.runners.view",
+
+  runners_scope_platform: "console.runners.scope_platform",
+  runners_scope_tenant: "console.runners.scope_tenant",
+
+  runners_state_provisioning: "console.runners.state_provisioning",
+  runners_state_awaiting_authorization: "console.runners.state_awaiting_authorization",
+  runners_state_exchanging: "console.runners.state_exchanging",
+  runners_state_ready: "console.runners.state_ready",
+  runners_state_linked: "console.runners.state_linked",
+  runners_state_failed: "console.runners.state_failed",
+  runners_state_expired: "console.runners.state_expired",
+
+  runners_provision_heading: "console.runners.provision_heading",
+  runners_provision_intro: "console.runners.provision_intro",
+  runners_provision_label_label: "console.runners.provision_label_label",
+  runners_provision_label_hint: "console.runners.provision_label_hint",
+  runners_provision_label_required: "console.runners.provision_label_required",
+  runners_provision_ttl_label: "console.runners.provision_ttl_label",
+  runners_provision_ttl_hint: "console.runners.provision_ttl_hint",
+  runners_provision_ttl_invalid: "console.runners.provision_ttl_invalid",
+  runners_provision_scope_legend: "console.runners.provision_scope_legend",
+  runners_provision_scope_platform_option: "console.runners.provision_scope_platform_option",
+  runners_provision_scope_tenant_option: "console.runners.provision_scope_tenant_option",
+  runners_provision_scope_invalid: "console.runners.provision_scope_invalid",
+  runners_provision_tenant_id_label: "console.runners.provision_tenant_id_label",
+  runners_provision_tenant_id_hint: "console.runners.provision_tenant_id_hint",
+  runners_provision_submit: "console.runners.provision_submit",
+  runners_provision_pending: "console.runners.provision_pending",
+
+  runners_detail_back: "console.runners.detail_back",
+  runners_detail_not_found: "console.runners.detail_not_found",
+  runners_detail_load_failed: "console.runners.detail_load_failed",
+  runners_detail_scope_label: "console.runners.detail_scope_label",
+  runners_detail_expires_label: "console.runners.detail_expires_label",
+
+  runners_state_provisioning_body: "console.runners.state_provisioning_body",
+  runners_state_exchanging_body: "console.runners.state_exchanging_body",
+
+  runners_authorization_heading: "console.runners.authorization_heading",
+  runners_authorization_intro: "console.runners.authorization_intro",
+  runners_authorization_url_label: "console.runners.authorization_url_label",
+  runners_authorization_code_label: "console.runners.authorization_code_label",
+  runners_authorization_code_hint: "console.runners.authorization_code_hint",
+  runners_authorization_code_required: "console.runners.authorization_code_required",
+  runners_authorization_submit: "console.runners.authorization_submit",
+  runners_authorization_pending: "console.runners.authorization_pending",
+
+  runners_finalize_heading: "console.runners.finalize_heading",
+  runners_finalize_intro: "console.runners.finalize_intro",
+  runners_finalize_provider_label: "console.runners.finalize_provider_label",
+  runners_finalize_provider_placeholder: "console.runners.finalize_provider_placeholder",
+  runners_finalize_no_providers: "console.runners.finalize_no_providers",
+  runners_finalize_provider_id_required: "console.runners.finalize_provider_id_required",
+  runners_finalize_scope_forbidden: "console.runners.finalize_scope_forbidden",
+  runners_finalize_display_name_label: "console.runners.finalize_display_name_label",
+  runners_finalize_submit: "console.runners.finalize_submit",
+  runners_finalize_pending: "console.runners.finalize_pending",
+
+  runners_linked_heading: "console.runners.linked_heading",
+  runners_linked_body: "console.runners.linked_body",
+  runners_failed_heading: "console.runners.failed_heading",
+  runners_failed_body: "console.runners.failed_body",
+  runners_expired_heading: "console.runners.expired_heading",
+  runners_expired_body: "console.runners.expired_body",
+  runners_token_unavailable_heading: "console.runners.token_unavailable_heading",
+  runners_token_unavailable_body: "console.runners.token_unavailable_body",
+
+  runners_delete_button: "console.runners.delete_button",
+  runners_delete_confirm_title: "console.runners.delete_confirm_title",
+  runners_delete_confirm_body: "console.runners.delete_confirm_body",
+  runners_delete_confirm_action: "console.runners.delete_confirm_action",
+  runners_delete_pending: "console.runners.delete_pending",
+  runners_delete_not_found: "console.runners.delete_not_found",
+  runners_delete_conflict_exhausted: "console.runners.delete_conflict_exhausted",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */
