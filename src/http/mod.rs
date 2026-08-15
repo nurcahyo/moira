@@ -545,6 +545,11 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(admin::enable_provider))
         .routes(routes!(admin::disable_provider))
+        // Issue #83. A literal path segment (`/providers/health`) rather than the `{id}`
+        // pattern above — axum's matchit router prefers a static match over a dynamic one
+        // regardless of registration order, so this and `get_provider` cannot collide, but
+        // the two are still worth keeping adjacent for a reader.
+        .routes(routes!(admin::get_provider_health))
         .routes(routes!(
             admin::get_provider_runtime_policy,
             admin::put_provider_runtime_policy
@@ -765,6 +770,7 @@ mod tests {
             "/api/v1/admin/providers/{id}",
             "/api/v1/admin/providers/{id}/enable",
             "/api/v1/admin/providers/{id}/disable",
+            "/api/v1/admin/providers/health",
             "/api/v1/admin/providers/{provider_id}/runtime-policy",
             "/api/v1/admin/applications/{id}/routing-defaults",
             "/api/v1/admin/providers/{provider_id}/models",
@@ -866,7 +872,8 @@ mod tests {
         //   eval-suites list/create/get/patch/delete = 5, cases list/create/delete = 3,
         //   eval-suite runs list = 1 (9); flows list/create/get/patch/delete = 5, flow
         //   runs list = 1 (6). No execution endpoint for either. 9 + 6 = 15.
-        assert_eq!(operation_count, 183);
+        // + issue #83's rolling provider-health read surface: GET /api/v1/admin/providers/health = 1.
+        assert_eq!(operation_count, 184);
     }
 
     #[test]

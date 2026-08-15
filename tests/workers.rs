@@ -1,6 +1,6 @@
-//! Workers, retention and cluster admission — five suites, one test binary.
+//! Workers, retention and cluster admission — six suites, one test binary.
 //!
-//! # Why these five, and why sharing a process is safe for them
+//! # Why these six, and why sharing a process is safe for them
 //!
 //! Every suite here takes its databases from [`support::TestDatabase`], and **every advisory
 //! lock any of them takes is taken inside its own private clone** — `pg_advisory_xact_lock`
@@ -10,7 +10,7 @@
 //! rather than merely convenient. It is also the property to re-check before adding anything
 //! here: a lock taken on the *maintenance* database is cluster-wide and does not qualify.
 //!
-//! None of the five takes [`support::TEMPLATE_LOCK_KEY`] other than through
+//! None of the six takes [`support::TEMPLATE_LOCK_KEY`] other than through
 //! `TestDatabase::create`, which takes it **shared**. That is load-bearing. A suite holding it
 //! *exclusively* would block every fixture creation in this binary, and each blocked fixture
 //! is already holding a `FIXTURE_BUDGET` permit while it waits — four of them behind one such
@@ -27,11 +27,11 @@
 //!   leak suites' needle scans and buffer their `TRACE` output unbounded.
 //! - **Anything that skips.** `support::announce_skip` writes straight to fd 2 to bypass
 //!   libtest's capture, and `scripts/test-log-lib.sh` reds the gate on *any* skip line. One
-//!   unset variable in a co-resident suite would red all five of these. That is the specific
+//!   unset variable in a co-resident suite would red all six of these. That is the specific
 //!   reason `tests/cluster_coordination.rs` — the only Redis-driving suite — is **not** here
-//!   despite being this group's obvious sixth member: a missing `MOIRA_TEST_REDIS_URL` would
+//!   despite being this group's obvious next member: a missing `MOIRA_TEST_REDIS_URL` would
 //!   stop being one small binary's problem and become this one's.
-//! - **A second `TestDatabase::create_with_max_connections` suite.** These five all use the
+//! - **A second `TestDatabase::create_with_max_connections` suite.** These six all use the
 //!   default 8-connection pool, so the worst case is `CONCURRENT_FIXTURES` × 8 = 32 of
 //!   PostgreSQL's 100. A 16-connection suite would take that to 64.
 //! - **Any fixture in this file.** This root owns nothing but module declarations — no
@@ -64,6 +64,8 @@ mod cluster_admission;
 mod coordination_default_path;
 #[path = "workers/job_dispatch.rs"]
 mod job_dispatch;
+#[path = "workers/latency_health_oauth.rs"]
+mod latency_health_oauth;
 #[path = "workers/retention_worker.rs"]
 mod retention_worker;
 #[path = "workers/worker_leader_election.rs"]

@@ -21,9 +21,9 @@
 //! 3. **A declared name with no registered handler** completes as a warned no-op. This is
 //!    deliberately *not* case 1: the name is legitimate (it is in `WORKER_JOB_NAMES`, so it
 //!    is a real metric label and a real queue row), this process simply has not been taught a
-//!    body for it yet. It is the seam later work plugs into — see [`default_dispatcher`]'s doc
-//!    comment for `oauth-token-refresh` (workstream B / plan 12 §1) and a future
-//!    latency-aggregation job (workstream D).
+//!    body for it yet. `default_dispatcher` uses this for the four plan-11 pipeline retry
+//!    names when unregistered would otherwise apply, and for `runtime-cache-warmer`, which
+//!    still has no handler.
 //!
 //! # What this module does not do
 //!
@@ -39,14 +39,25 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use reqwest::Client;
+use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::infra::{
-    repositories::ClaimedJob,
-    workers::{
-        self, CONVERSATION_SUMMARIZATION_RETRY_WORKER, DOCUMENT_INGESTION_RETRY_WORKER,
-        EMBEDDING_RETRY_WORKER, MEMORY_EXTRACTION_RETRY_WORKER, queue::JobDispatcher,
+use crate::{
+    config::WorkerSettings,
+    infra::{
+        metrics::MetricsRegistry,
+        repositories::ClaimedJob,
+        workers::{
+            self, CONVERSATION_SUMMARIZATION_RETRY_WORKER, DOCUMENT_INGESTION_RETRY_WORKER,
+            EMBEDDING_RETRY_WORKER, LATENCY_STATS_AGGREGATION_WORKER,
+            MEMORY_EXTRACTION_RETRY_WORKER, OAUTH_TOKEN_REFRESH_WORKER,
+            PROVIDER_HEALTH_CHECK_WORKER, latency_stats::LatencyStatsAggregationHandler,
+            oauth_refresh::OAuthTokenRefreshHandler,
+            provider_health_check::ProviderHealthCheckHandler, queue::JobDispatcher,
+        },
     },
+    security::LocalSecretCipher,
 };
 
 /// Executes one claimed job of a single, already-known `job_name`.
@@ -165,36 +176,27 @@ fn deferred_pipeline_handler(job_name: &'static str) -> Arc<dyn JobHandler> {
 /// documented no-op body until plan 11 extracts the pipeline it would call. See the module
 /// doc comment.
 ///
-/// `oauth-token-refresh`, `provider-health-check`, `runtime-cache-warmer` and
-/// `retention-cleanup` are declared in `WORKER_JOB_NAMES` but intentionally left
-/// unregistered here: `retention-cleanup` is dispatched outside this queue entirely (its own
-/// leader-gated timer arm in `run_supervisor`), and the other three have no handler yet —
-/// they fall through to [`RealJobDispatcher::dispatch`]'s case-3 no-op, which is exactly the
-/// seam described below.
+/// `latency-stats-aggregation`, `oauth-token-refresh` and `provider-health-check` get real
+/// handlers — [`LatencyStatsAggregationHandler`], [`OAuthTokenRefreshHandler`] and
+/// [`ProviderHealthCheckHandler`] respectively — whenever `pool` is `Some`. `pool` is `None`
+/// only when Moira runs with no database at all, in which case
+/// `WorkerRegistry::run_supervisor` also builds no [`super::queue::WorkerQueue`], so this
+/// dispatcher is never driven and the distinction is moot; the branch exists so a caller does
+/// not have to thread an `Option` through three handler constructors that all need a pool
+/// unconditionally.
 ///
-/// # The seam for workstream B — `oauth-token-refresh` (plan 12 §1)
-///
-/// `oauth-token-refresh` is already declared in `WORKER_JOB_NAMES` with
-/// `enabled_by_default: false` (`WorkerRegistry::new`), and `src/infra/metrics.rs` already
-/// seeds `moira_oauth_credential_status` and `moira_oauth_refresh_total` "ahead of the
-/// oauth-token-refresh JobDispatcher". Wiring it once that worker exists is one line here:
-///
-/// ```ignore
-/// .register("oauth-token-refresh", Arc::new(OAuthTokenRefreshHandler::new(/* … */)))
-/// ```
-///
-/// plus flipping its spec to `enabled_by_default: true` when the operator-facing feature is
-/// ready to advertise itself. Nothing else in this module or in `run_supervisor` changes.
-///
-/// # The seam for workstream D — a latency-aggregation job
-///
-/// No name for this exists in `WORKER_JOB_NAMES` yet — unlike `oauth-token-refresh`, it is
-/// not merely unregistered, it is undeclared. The first step is adding it there and to
-/// `WorkerRegistry::new`'s spec table (`worker_job_names_match_the_spec_table` in
-/// `src/infra/workers.rs` pins the two together), after which registering its handler here
-/// is the same one-line shape as the block above.
-pub fn default_dispatcher() -> RealJobDispatcher {
-    RealJobDispatcher::new()
+/// `runtime-cache-warmer` and `retention-cleanup` are declared in `WORKER_JOB_NAMES` but
+/// intentionally left unregistered here: `retention-cleanup` is dispatched outside this queue
+/// entirely (its own leader-gated timer arm in `run_supervisor`), and `runtime-cache-warmer`
+/// has no handler yet — it falls through to [`RealJobDispatcher::dispatch`]'s case-3 no-op.
+pub fn default_dispatcher(
+    pool: Option<PgPool>,
+    cipher: LocalSecretCipher,
+    http: Client,
+    metrics: MetricsRegistry,
+    settings: Arc<WorkerSettings>,
+) -> RealJobDispatcher {
+    let mut dispatcher = RealJobDispatcher::new()
         .register(
             MEMORY_EXTRACTION_RETRY_WORKER,
             deferred_pipeline_handler(MEMORY_EXTRACTION_RETRY_WORKER),
@@ -210,7 +212,34 @@ pub fn default_dispatcher() -> RealJobDispatcher {
         .register(
             DOCUMENT_INGESTION_RETRY_WORKER,
             deferred_pipeline_handler(DOCUMENT_INGESTION_RETRY_WORKER),
-        )
+        );
+    if let Some(pool) = pool {
+        dispatcher = dispatcher
+            .register(
+                LATENCY_STATS_AGGREGATION_WORKER,
+                Arc::new(LatencyStatsAggregationHandler::new(
+                    pool.clone(),
+                    settings.clone(),
+                )),
+            )
+            .register(
+                OAUTH_TOKEN_REFRESH_WORKER,
+                Arc::new(OAuthTokenRefreshHandler::new(
+                    pool.clone(),
+                    cipher,
+                    http.clone(),
+                    metrics.clone(),
+                    settings.clone(),
+                )),
+            )
+            .register(
+                PROVIDER_HEALTH_CHECK_WORKER,
+                Arc::new(ProviderHealthCheckHandler::new(
+                    pool, http, metrics, settings,
+                )),
+            );
+    }
+    dispatcher
 }
 
 #[cfg(test)]
@@ -221,6 +250,21 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    /// `default_dispatcher` with no database — the shape every test in this module needs,
+    /// since none of them exercises the three DB-backed handlers directly (that proof lives in
+    /// `tests/workers/latency_health_oauth.rs` against a real Postgres). With `pool: None`
+    /// this still registers the four plan-11 `DeferredPipelineHandler`s, so every assertion
+    /// below about those four is unaffected.
+    fn default_dispatcher_without_db() -> RealJobDispatcher {
+        default_dispatcher(
+            None,
+            LocalSecretCipher::new([7; 32], "dispatch-test"),
+            Client::new(),
+            MetricsRegistry::new("dispatch-test", None),
+            Arc::new(WorkerSettings::default()),
+        )
+    }
 
     fn job(name: &str) -> ClaimedJob {
         ClaimedJob {
@@ -340,7 +384,7 @@ mod tests {
     /// names are declared rather than by inspecting a private field.
     #[tokio::test]
     async fn default_dispatcher_completes_every_plan_11_retry_name() {
-        let dispatcher = default_dispatcher();
+        let dispatcher = default_dispatcher_without_db();
         for name in [
             MEMORY_EXTRACTION_RETRY_WORKER,
             CONVERSATION_SUMMARIZATION_RETRY_WORKER,
@@ -354,35 +398,30 @@ mod tests {
         }
     }
 
-    /// The unregistered seam is still live even on the dispatcher `run_supervisor` ships —
-    /// `oauth-token-refresh` and `provider-health-check` have no handler yet and must not
-    /// dead-letter for that reason.
+    /// With no database, `latency-stats-aggregation`, `oauth-token-refresh` and
+    /// `provider-health-check` all fall through to the unregistered no-op path — the same
+    /// path `runtime-cache-warmer` always takes — rather than dead-lettering for lack of a
+    /// handler. `tests/workers/latency_health_oauth.rs` proves the opposite: with a real
+    /// pool, `default_dispatcher` registers a real handler for all three.
     #[tokio::test]
-    async fn default_dispatcher_no_ops_the_not_yet_wired_declared_names() {
-        let dispatcher = default_dispatcher();
-        assert!(
-            dispatcher
-                .dispatch(&job("oauth-token-refresh"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            dispatcher
-                .dispatch(&job("provider-health-check"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            dispatcher
-                .dispatch(&job("runtime-cache-warmer"))
-                .await
-                .is_ok()
-        );
+    async fn default_dispatcher_no_ops_the_three_db_backed_names_when_there_is_no_pool() {
+        let dispatcher = default_dispatcher_without_db();
+        for name in [
+            "latency-stats-aggregation",
+            "oauth-token-refresh",
+            "provider-health-check",
+            "runtime-cache-warmer",
+        ] {
+            assert!(
+                dispatcher.dispatch(&job(name)).await.is_ok(),
+                "{name} must no-op rather than dead-letter with no pool"
+            );
+        }
     }
 
     #[tokio::test]
     async fn default_dispatcher_still_rejects_an_undeclared_name() {
-        let dispatcher = default_dispatcher();
+        let dispatcher = default_dispatcher_without_db();
         assert!(
             dispatcher
                 .dispatch(&job("not-a-declared-job"))

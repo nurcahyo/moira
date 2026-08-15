@@ -43,6 +43,23 @@ fn queue(pool: &PgPool) -> WorkerQueue {
     )
 }
 
+/// `default_dispatcher` against this file's real fixture pool. The three DB-backed handlers
+/// this constructs (`latency-stats-aggregation`, `oauth-token-refresh`,
+/// `provider-health-check`) are exercised end to end in
+/// `tests/workers/latency_health_oauth.rs`; every test in *this* file only cares about the
+/// four plan-11 stub names and the dispatch-routing mechanics, so a pool is threaded through
+/// here purely to match the exact object `run_supervisor` builds — nothing below asserts on
+/// what the three DB-backed handlers do.
+fn default_dispatcher_for(pool: &PgPool) -> RealJobDispatcher {
+    default_dispatcher(
+        Some(pool.clone()),
+        moira::security::LocalSecretCipher::new([11; 32], "job-dispatch-test"),
+        reqwest::Client::new(),
+        metrics(),
+        Arc::new(moira::config::WorkerSettings::default()),
+    )
+}
+
 async fn status_of(pool: &PgPool, id: Uuid) -> (String, i32) {
     let row = sqlx::query("select status, attempts from worker_jobs where id = $1")
         .bind(id)
@@ -76,7 +93,7 @@ async fn default_dispatcher_completes_a_memory_extraction_retry_job_end_to_end()
         .expect("enqueue a plan-11 retry job");
 
     let outcome = queue
-        .run_once(&default_dispatcher(), &metrics)
+        .run_once(&default_dispatcher_for(&pool), &metrics)
         .await
         .expect("poll the queue");
     assert_eq!(outcome.claimed, 1);
@@ -100,7 +117,7 @@ async fn default_dispatcher_completes_every_plan_11_retry_name_end_to_end() {
     let pool = database.pool.clone();
     let queue = queue(&pool);
     let metrics = metrics();
-    let dispatcher = default_dispatcher();
+    let dispatcher = default_dispatcher_for(&pool);
 
     for name in [
         MEMORY_EXTRACTION_RETRY_WORKER,
@@ -125,10 +142,12 @@ async fn default_dispatcher_completes_every_plan_11_retry_name_end_to_end() {
 }
 
 /// A name Moira has declared (so `WorkerQueue::enqueue` accepts it) but that
-/// `default_dispatcher` has not registered a handler for. This is the seam
-/// `dispatch::default_dispatcher`'s doc comment describes for `oauth-token-refresh` and a
-/// future latency-aggregation job: it must complete as a no-op, not dead-letter for lack of
-/// a body nobody has written yet.
+/// `default_dispatcher` has not registered a handler for. `runtime-cache-warmer` is the one
+/// name left in this state even against a real pool — `latency-stats-aggregation`,
+/// `oauth-token-refresh` and `provider-health-check` all get real handlers the moment a pool
+/// is present (`tests/workers/latency_health_oauth.rs` proves those three end to end), which
+/// is exactly why this test no longer uses `provider-health-check` as its example. This one
+/// must still complete as a no-op, not dead-letter for lack of a body nobody has written yet.
 #[tokio::test]
 async fn an_unregistered_but_declared_job_name_completes_as_a_noop_end_to_end() {
     let Some(database) = TestDatabase::create().await else {
@@ -139,12 +158,12 @@ async fn an_unregistered_but_declared_job_name_completes_as_a_noop_end_to_end() 
     let metrics = metrics();
 
     let job_id = queue
-        .enqueue("provider-health-check", json!({}), None, &metrics)
+        .enqueue("runtime-cache-warmer", json!({}), None, &metrics)
         .await
-        .expect("provider-health-check is declared, so enqueue accepts it");
+        .expect("runtime-cache-warmer is declared, so enqueue accepts it");
 
     let outcome = queue
-        .run_once(&default_dispatcher(), &metrics)
+        .run_once(&default_dispatcher_for(&pool), &metrics)
         .await
         .expect("poll the queue");
     assert_eq!(outcome.claimed, 1);

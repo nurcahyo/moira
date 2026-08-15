@@ -687,6 +687,51 @@ pub struct WorkerSettings {
     /// symptom is unrelated latency. Refusing at a known depth converts that into
     /// an error with a name.
     pub queue_max_pending_jobs: i64,
+    /// How often each replica checks whether the periodic maintenance jobs
+    /// (`latency-stats-aggregation`, `oauth-token-refresh`, `provider-health-check`)
+    /// need a fresh queue row.
+    ///
+    /// These three job names have no leader-gated producer (unlike the retention
+    /// sweep) and no caller that enqueues them on demand (unlike a future
+    /// request-triggered job) — they are periodic maintenance with nothing to
+    /// enqueue *for*. Every replica ticks this interval and enqueues a row only
+    /// when [`WorkerRegistry::is_configured`] says the name is on **and** no
+    /// `pending`/`running` row for that name already exists
+    /// (`WorkerJobRepository::enqueue_if_idle`), so duplicate rows across replicas
+    /// are a rare race rather than the steady state. Every handler these three
+    /// names dispatch to is safe under that rare duplicate: aggregation
+    /// recomputes idempotently, a health probe is additive by design, and the
+    /// refresh handler uses `provider_credentials.version` as an optimistic lock
+    /// (`src/infra/workers/oauth_refresh.rs`). This is deliberately **not**
+    /// leader-gated like the retention sweep — see that module's doc comment for
+    /// why a perfectly-exclusive singleton was worth building there and is not
+    /// worth building here.
+    pub maintenance_enqueue_interval_seconds: u64,
+    /// How many hours of `execution_attempts` history `latency-stats-aggregation`
+    /// scans to find which provider/model pairs have recent traffic worth
+    /// aggregating. Bounds the "which pairs are active" query; the "last N"
+    /// sample itself is bounded separately by [`Self::latency_stats_sample_size`].
+    pub latency_stats_lookback_hours: i64,
+    /// `N` in "naive last-N" (plan 12 §2, consolidated decision 7): how many of
+    /// the most recent successful attempts per provider/model pair feed the
+    /// p50/p95 computation.
+    pub latency_stats_sample_size: i64,
+    /// How far ahead of `provider_credentials.expires_at` `oauth-token-refresh`
+    /// treats a credential as due. Wide enough that a job which only runs every
+    /// [`Self::maintenance_enqueue_interval_seconds`] still catches an expiry
+    /// before it lapses.
+    pub oauth_refresh_lead_seconds: i64,
+    /// Per-provider timeout for `provider-health-check`'s reachability probe.
+    /// Short by design — a slow provider is exactly what "degraded" exists to
+    /// report, and a probe that itself blocks for the request timeout would make
+    /// one unreachable provider stall every other provider's probe in the same
+    /// job run.
+    pub provider_health_probe_timeout_ms: u64,
+    /// How long a `provider_health_snapshots` row survives before
+    /// `provider-health-check` prunes it. The rolling window `GET
+    /// /api/v1/admin/providers/health` reports never looks further back than
+    /// this, so raising it widens the window and raises table growth together.
+    pub provider_health_snapshot_retention_hours: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1725,6 +1770,20 @@ impl Default for WorkerSettings {
             // 10k pending rows is roughly where the claim's `(status, run_at)`
             // index scan stops being free on commodity hardware.
             queue_max_pending_jobs: 10_000,
+            // 1 minute: frequent enough that a `provider-health-check` reader sees
+            // a window that is never more than a couple of minutes stale, cheap
+            // enough (one `exists` check per configured name) to run on every
+            // replica without a second thought.
+            maintenance_enqueue_interval_seconds: 60,
+            latency_stats_lookback_hours: 24,
+            latency_stats_sample_size: 50,
+            // 15 minutes. Wide relative to the 1-minute maintenance-enqueue
+            // cadence, so a token is refreshed several polls before it would
+            // actually lapse rather than on the one poll that happens to land
+            // first.
+            oauth_refresh_lead_seconds: 900,
+            provider_health_probe_timeout_ms: 3_000,
+            provider_health_snapshot_retention_hours: 24,
         }
     }
 }

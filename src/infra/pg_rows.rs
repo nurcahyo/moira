@@ -14,13 +14,14 @@ use crate::{
         FlowRunStatus, FlowStepGraphRow, FlowStepOnFailure, GradingKind, HistoryStrategy,
         HttpMethod, KeyStatus, MemoryConsentMode, MemoryPolicyRecord, MemoryRecord, MemoryScope,
         MemorySensitivity, MemoryStatus, MemoryType, NamedStatusGraphRow, OwnerScope,
-        ProviderConfig, ProviderKind, ProviderModelRecord, ProviderModelRuntimeConfig,
-        ProviderRecord, ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord,
-        PublicResponseStatus, PublicUsageSummary, RagCollectionRecord, RagCollectionStatus,
-        RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus, RagIngestionStatus,
-        ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
-        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
-        SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
+        ProviderConfig, ProviderHealthStatus, ProviderKind, ProviderModelRecord,
+        ProviderModelRuntimeConfig, ProviderRecord, ProviderRuntimePolicyRecord, ProviderType,
+        PublicResponseRecord, PublicResponseStatus, PublicUsageSummary, RagCollectionRecord,
+        RagCollectionStatus, RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus,
+        RagIngestionStatus, ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord,
+        RouteDefinitionRecord, RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus,
+        ScopeType, SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus,
+        TrustedJwtIssuerRecord,
     },
     error::AppError,
     security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
@@ -1605,6 +1606,20 @@ pub fn provider_type_to_db(provider_type: &ProviderType) -> &'static str {
         ProviderType::AzureOpenAi => "azure_openai",
         ProviderType::Local => "local",
         ProviderType::Custom => "custom",
+    }
+}
+
+/// Never fails: an unrecognised or absent value reads as [`ProviderHealthStatus::Unknown`],
+/// exactly the meaning `ProviderObservabilityRepository::provider_health_summaries`'s own
+/// `coalesce(latest.status, 'unknown')` already gives an unprobed provider. Unlike
+/// [`provider_type_from_db`], a bad value here is not a programming error worth failing a
+/// whole admin response over — it is the same "no recent data" fact `Unknown` already means.
+pub fn provider_health_status_from_db(value: &str) -> ProviderHealthStatus {
+    match value {
+        "healthy" => ProviderHealthStatus::Healthy,
+        "degraded" => ProviderHealthStatus::Degraded,
+        "unhealthy" => ProviderHealthStatus::Unhealthy,
+        _ => ProviderHealthStatus::Unknown,
     }
 }
 
