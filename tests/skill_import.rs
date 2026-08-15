@@ -10,15 +10,19 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use moira::{app::AppState, config::Settings};
+use moira::{
+    app::AppState, config::Settings, domain::SkillCredentialOutcome,
+    infra::repositories::PgAgentPlatformRepository,
+};
 use serde_json::{Map, Value, json};
+use sqlx::Row;
 use tokio::time::timeout;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -37,6 +41,16 @@ const RESOLVABLE_TEST_HOST: &str = "8.8.8.8";
 struct Fixture {
     router: Router,
     suffix: String,
+    /// Only the legacy-row and inventory tests use this, and only to *create* pre-rule state
+    /// — a `skill_http_executors` row whose binding no admin route would accept today, or a
+    /// `providers.base_url` the admin write path normalises away. That state is by definition
+    /// unreachable through the routes, so writing it any other way would be testing a shape
+    /// the fixture invented rather than the one a real upgrade inherits. The inventory test
+    /// also runs the documented operator query through it.
+    pool: sqlx::PgPool,
+    /// Kept so a test can reach `AppState::cipher` and call the execution-path resolver
+    /// directly; the router owns its own clone.
+    state: AppState,
     _database: TestDatabase,
 }
 
@@ -56,13 +70,15 @@ impl Fixture {
         let database = TestDatabase::create().await?;
         let pool = database.pool.clone();
         let settings = Settings::default();
-        let state = AppState::new(settings, Some(pool))
+        let state = AppState::new(settings, Some(pool.clone()))
             .await
             .expect("test app state");
-        let router = moira::build_router(state).expect("test router");
+        let router = moira::build_router(state.clone()).expect("test router");
         Some(Self {
             router,
             suffix: Uuid::now_v7().simple().to_string(),
+            pool,
+            state,
             _database: database,
         })
     }
@@ -157,8 +173,800 @@ fn sample_document(host: &str, suffix: &str) -> Value {
     })
 }
 
+/// A second public IP literal, so a test can name a host that is legitimate as far as the
+/// SSRF guard is concerned but is *not* [`RESOLVABLE_TEST_HOST`]. Standing in for issue #253
+/// finding 1's `collector.attacker.example`: the whole point is that it passes
+/// `validate_outbound_url`, because a public host always does.
+const OTHER_PUBLIC_TEST_HOST: &str = "1.1.1.1";
+/// A third public IP literal, for the legacy-row test: it needs a host that is neither the
+/// executor's own nor the one the already-bound foreign credential's provider serves, so that
+/// "cannot be repointed" is proved against a genuinely new destination.
+const THIRD_PUBLIC_TEST_HOST: &str = "9.9.9.9";
+
 fn skill_id_of(record: &Value) -> Uuid {
     Uuid::parse_str(record["id"].as_str().expect("skill id")).expect("UUID id")
+}
+
+impl Fixture {
+    /// Creates a provider whose `base_url` is `https://{host}` and one `api_key` credential
+    /// on it, returning the credential id. Both go through the real admin routes, so the
+    /// credential is stored and encrypted exactly as a real one is.
+    async fn credential_on_provider_at(&self, host: &str, label: &str) -> Uuid {
+        let provider = self
+            .request(
+                "POST",
+                "/api/v1/admin/providers",
+                None,
+                Some(json!({
+                    "provider_type": "custom",
+                    "display_name": format!("{label} provider {}", self.suffix),
+                    "base_url": format!("https://{host}"),
+                    "metadata": {}
+                })),
+            )
+            .await;
+        assert_eq!(
+            provider.status,
+            StatusCode::CREATED,
+            "create provider: {}",
+            provider.body
+        );
+        let provider_id = provider.body["id"]
+            .as_str()
+            .expect("provider id")
+            .to_string();
+
+        let credential = self
+            .request(
+                "POST",
+                "/api/v1/admin/provider-credentials",
+                None,
+                Some(json!({
+                    "provider_id": provider_id,
+                    "credential_type": "api_key",
+                    "scope": {"type": "global"},
+                    "secret": {"api_key": format!("sk-{label}-{}", self.suffix)},
+                    "display_name": format!("{label} credential"),
+                    "priority": 100,
+                    "metadata": {}
+                })),
+            )
+            .await;
+        assert_eq!(
+            credential.status,
+            StatusCode::CREATED,
+            "create credential: {}",
+            credential.body
+        );
+        Uuid::parse_str(credential.body["id"].as_str().expect("credential id"))
+            .expect("UUID credential id")
+    }
+
+    /// Imports [`sample_document`] at `host` and returns `(skill_id, executor_etag)`.
+    async fn imported_executor(&self, host: &str, label: &str) -> (Uuid, String) {
+        let document = sample_document(host, &format!("{label}{}", self.suffix));
+        let imported = self
+            .request(
+                "POST",
+                "/api/v1/admin/skills/import",
+                None,
+                Some(json!({ "document": document })),
+            )
+            .await;
+        assert_eq!(
+            imported.status,
+            StatusCode::CREATED,
+            "import: {}",
+            imported.body
+        );
+        let skill_id = skill_id_of(&imported.body["skills"][0]);
+        let fetched = self
+            .request(
+                "GET",
+                &format!("/api/v1/admin/skills/{skill_id}/executor"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(fetched.status, StatusCode::OK, "get: {}", fetched.body);
+        assert_eq!(fetched.body["allowed_host"], json!(host));
+        (skill_id, fetched.etag.expect("GET must return an ETag"))
+    }
+}
+
+/// Issue #253 finding 1. `skill_http_executors.credential_id` is decrypted at call time and
+/// sent as `Authorization: Bearer <plaintext>`, and the only check on it was that the row
+/// existed — so `moira:skills:write` was silently equivalent to reading every provider secret
+/// in the deployment, by binding one to an attacker-controlled *public* host.
+///
+/// Both directions of the attack are pinned here, because either half alone moves the secret:
+/// binding a foreign credential to this executor's host, and moving a bound credential's host
+/// after the fact.
+#[tokio::test]
+async fn a_skill_executor_may_only_carry_a_credential_its_own_provider_issued() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "bind")
+        .await;
+    let executor_path = format!("/api/v1/admin/skills/{skill_id}/executor");
+
+    // The attack: a credential belonging to a provider that talks to a different host.
+    // `1.1.1.1` is an ordinary public host, so the SSRF guard has no objection to it and
+    // never sees this request at all — the refusal has to come from the binding rule.
+    let foreign = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "foreign")
+        .await;
+    let refused = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&etag),
+            Some(json!({ "credential_id": foreign })),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"], "skill_credential_host_mismatch",
+        "body: {}",
+        refused.body
+    );
+
+    // The refusal is a refusal, not a partial write.
+    let after = fixture.request("GET", &executor_path, None, None).await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert_eq!(
+        after.body["credential_id"],
+        Value::Null,
+        "a refused bind must leave credential_id unset"
+    );
+    assert_eq!(
+        after.etag.as_deref(),
+        Some(etag.as_str()),
+        "a refused bind must not bump updated_at"
+    );
+
+    // A credential whose provider does serve this executor's host binds normally.
+    let own = fixture
+        .credential_on_provider_at(RESOLVABLE_TEST_HOST, "own")
+        .await;
+    let bound = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&etag),
+            Some(json!({ "credential_id": own })),
+        )
+        .await;
+    assert_eq!(bound.status, StatusCode::OK, "body: {}", bound.body);
+    assert_eq!(bound.body["credential_id"], json!(own.to_string()));
+    let bound_etag = bound.etag.expect("PATCH must return an ETag");
+
+    // The other direction: leave the credential alone and move the *host* under it. The new
+    // URL is a perfectly good public https URL, so `validate_skill_url` allows it; only the
+    // binding rule stands between a bound secret and a new destination.
+    let moved = fixture
+        .request(
+            "PATCH",
+            &executor_path,
+            Some(&bound_etag),
+            Some(json!({
+                "url_template": format!("https://{OTHER_PUBLIC_TEST_HOST}/v1/orders")
+            })),
+        )
+        .await;
+    assert_eq!(
+        moved.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        moved.body
+    );
+    assert_eq!(
+        moved.body["error"]["code"], "skill_credential_host_mismatch",
+        "body: {}",
+        moved.body
+    );
+
+    let final_state = fixture.request("GET", &executor_path, None, None).await;
+    assert_eq!(
+        final_state.body["allowed_host"],
+        json!(RESOLVABLE_TEST_HOST),
+        "a refused host move must leave allowed_host where it was"
+    );
+    assert_eq!(final_state.body["credential_id"], json!(own.to_string()));
+}
+
+/// A provider left on its vendor default has no `base_url`, so there is no host to compare
+/// against and nothing it can entitle. Fail-closed — see
+/// `domain::credential_binding_permits_host` for why inventing the vendor default would be
+/// worse than refusing.
+#[tokio::test]
+async fn a_credential_whose_provider_has_no_base_url_cannot_be_bound_at_all() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "nobase")
+        .await;
+
+    let provider = fixture
+        .request(
+            "POST",
+            "/api/v1/admin/providers",
+            None,
+            Some(json!({
+                "provider_type": "custom",
+                "display_name": format!("Vendor-default provider {}", fixture.suffix),
+                "base_url": Value::Null,
+                "metadata": {}
+            })),
+        )
+        .await;
+    assert_eq!(
+        provider.status,
+        StatusCode::CREATED,
+        "body: {}",
+        provider.body
+    );
+    let credential = fixture
+        .request(
+            "POST",
+            "/api/v1/admin/provider-credentials",
+            None,
+            Some(json!({
+                "provider_id": provider.body["id"],
+                "credential_type": "api_key",
+                "scope": {"type": "global"},
+                "secret": {"api_key": format!("sk-default-{}", fixture.suffix)},
+                "display_name": "Vendor-default credential",
+                "priority": 100,
+                "metadata": {}
+            })),
+        )
+        .await;
+    assert_eq!(
+        credential.status,
+        StatusCode::CREATED,
+        "body: {}",
+        credential.body
+    );
+
+    let refused = fixture
+        .request(
+            "PATCH",
+            &format!("/api/v1/admin/skills/{skill_id}/executor"),
+            Some(&etag),
+            Some(json!({ "credential_id": credential.body["id"] })),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
+}
+
+/// The repair to round one's own admitted defect: a `skill_http_executors` row stored **before**
+/// the binding rule existed must stay editable.
+///
+/// Round one re-validated on every patch, so a legacy row was un-patchable even for an
+/// unrelated `timeout_ms` edit. That is not a security property. The row's credential is
+/// already refused at execution time (`resolve_skill_credential` returns `HostNotEntitled`
+/// before it decrypts anything), so the write refusal moved no secret — it only stopped an
+/// operator cleaning up, on the same endpoint that told them to.
+///
+/// The rule is now "do not make it worse": the binding may stay exactly where it is, and
+/// everything else about the row is free. Both refusals below prove the security half is
+/// intact, and the last step proves the documented repair actually lands.
+#[tokio::test]
+async fn a_row_that_predates_the_binding_rule_stays_editable_but_cannot_be_repointed() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, _etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "legacy")
+        .await;
+    let path = format!("/api/v1/admin/skills/{skill_id}/executor");
+
+    // The pre-rule state: a credential whose provider serves a different host, bound straight
+    // in the table the way a pre-rule admin write, a migration or a restore left it.
+    let foreign = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "legacyforeign")
+        .await;
+    sqlx::query("update skill_http_executors set credential_id = $1 where skill_id = $2")
+        .bind(foreign)
+        .bind(skill_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed the pre-rule binding");
+
+    let current = fixture.request("GET", &path, None, None).await;
+    assert_eq!(current.status, StatusCode::OK, "body: {}", current.body);
+    assert_eq!(current.body["credential_id"], json!(foreign.to_string()));
+    let etag = current.etag.expect("GET must return an ETag");
+
+    // 1. An unrelated field edit lands. This is the assertion round one fails.
+    let edited = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "timeout_ms": 4_321 })),
+        )
+        .await;
+    assert_eq!(
+        edited.status,
+        StatusCode::OK,
+        "a legacy row must stay editable for fields that are not the binding: {}",
+        edited.body
+    );
+    assert_eq!(edited.body["timeout_ms"], json!(4_321));
+    assert_eq!(
+        edited.body["credential_id"],
+        json!(foreign.to_string()),
+        "the unrelated edit must not have quietly re-bound anything"
+    );
+    let etag = edited.etag.expect("PATCH must return an ETag");
+
+    // 2. The binding itself still cannot move to another non-entitled credential.
+    let other = fixture
+        .credential_on_provider_at(THIRD_PUBLIC_TEST_HOST, "legacyother")
+        .await;
+    let repointed = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "credential_id": other })),
+        )
+        .await;
+    assert_eq!(
+        repointed.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a broken row is not a licence to point it somewhere new: {}",
+        repointed.body
+    );
+    assert_eq!(
+        repointed.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
+
+    // 3. …and neither can the host move under it.
+    let moved = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({
+                "url_template": format!("https://{THIRD_PUBLIC_TEST_HOST}/v1/orders")
+            })),
+        )
+        .await;
+    assert_eq!(
+        moved.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        moved.body
+    );
+    assert_eq!(
+        moved.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
+
+    // 4. The documented repair — bind a credential the executor's host is entitled to — works.
+    let own = fixture
+        .credential_on_provider_at(RESOLVABLE_TEST_HOST, "legacyrepair")
+        .await;
+    let repaired = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "credential_id": own })),
+        )
+        .await;
+    assert_eq!(
+        repaired.status,
+        StatusCode::OK,
+        "the repair path must land: {}",
+        repaired.body
+    );
+    assert_eq!(repaired.body["credential_id"], json!(own.to_string()));
+}
+
+/// The pre-deploy inventory query, read out of `docs/agent-platform.md` itself so the query
+/// this test proves and the query an operator is handed cannot drift apart.
+fn documented_inventory_query() -> String {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/agent-platform.md"
+    ))
+    .expect("docs/agent-platform.md is readable");
+    let mut blocks: Vec<String> = Vec::new();
+    let mut open: Option<String> = None;
+    for line in doc.lines() {
+        let Some(body) = open.as_mut() else {
+            if line.trim_end() == "```sql" {
+                open = Some(String::new());
+            }
+            continue;
+        };
+        if line.trim_end() == "```" {
+            blocks.push(open.take().expect("an open block"));
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    assert_eq!(
+        blocks.len(),
+        1,
+        "docs/agent-platform.md must carry exactly one ```sql block: the pre-deploy inventory \
+         query this test executes. If you added a second one, teach this helper which block to \
+         run rather than dropping the check — an inventory query nothing executes is how the \
+         soft-deleted-provider case went unreported in the first place."
+    );
+    // `fetch_all` speaks the extended protocol, which takes one statement; the document ends
+    // the query with a semicolon because an operator pastes it into `psql`.
+    blocks
+        .pop()
+        .expect("one block")
+        .trim()
+        .trim_end_matches(';')
+        .to_string()
+}
+
+impl Fixture {
+    async fn provider_of(&self, credential_id: Uuid) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>("select provider_id from provider_credentials where id = $1")
+            .bind(credential_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the credential's provider id")
+    }
+
+    /// Soft-deletes a provider through the real admin route, so the row ends in exactly the
+    /// state a real `DELETE` leaves — `deleted_at` set, and its credentials untouched.
+    async fn soft_delete_provider(&self, provider_id: Uuid) {
+        let path = format!("/api/v1/admin/providers/{provider_id}");
+        let current = self.request("GET", &path, None, None).await;
+        assert_eq!(current.status, StatusCode::OK, "body: {}", current.body);
+        let etag = current.etag.expect("GET must return an ETag");
+        let deleted = self.request("DELETE", &path, Some(&etag), None).await;
+        assert!(
+            deleted.status.is_success(),
+            "soft delete the provider: {} {}",
+            deleted.status,
+            deleted.body
+        );
+    }
+
+    /// Writes a `providers.base_url` the admin write path would never store — it refuses
+    /// userinfo outright and trims whitespace — because that is precisely the population the
+    /// inventory query exists for: rows from a migration, a restore or a direct `psql` edit.
+    async fn force_provider_base_url(&self, provider_id: Uuid, base_url: &str) {
+        sqlx::query("update providers set base_url = $1 where id = $2")
+            .bind(base_url)
+            .bind(provider_id)
+            .execute(&self.pool)
+            .await
+            .expect("overwrite the provider base_url");
+    }
+
+    /// Writes an `allowed_host` no import could produce, because the SSRF guard resolves the
+    /// destination and `.example` does not resolve. The certifier that disproved this
+    /// section's old "cannot miss a row" claim used `api.vendor.example`, and the shapes at
+    /// issue are only fully reproducible on a host whose first character is a letter: a
+    /// digit cannot begin a URL scheme, so `1.1.1.1:8443/v1` fails to parse for a different
+    /// reason than `api.vendor.example:8443/v1`, which parses into a scheme with no host.
+    async fn force_allowed_host(&self, skill_id: Uuid, allowed_host: &str) {
+        sqlx::query("update skill_http_executors set allowed_host = $1 where skill_id = $2")
+            .bind(allowed_host)
+            .bind(skill_id)
+            .execute(&self.pool)
+            .await
+            .expect("overwrite the executor allowed_host");
+    }
+
+    /// Seeds one executor that was entitled when it was bound and is not any more, by
+    /// rewriting both sides of the rule to a state only a migration, a restore or a direct
+    /// `psql` edit can reach. Returns `(skill_id, credential_id)` so the caller can ask the
+    /// documented query and `resolve_skill_credential` about the very same row.
+    async fn executor_forced_to(
+        &self,
+        label: &str,
+        base_url: &str,
+        allowed_host: &str,
+    ) -> (Uuid, Uuid) {
+        let (skill_id, etag) = self.imported_executor(OTHER_PUBLIC_TEST_HOST, label).await;
+        let credential_id = self
+            .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, label)
+            .await;
+        self.bind_credential(skill_id, &etag, credential_id).await;
+        self.force_provider_base_url(self.provider_of(credential_id).await, base_url)
+            .await;
+        self.force_allowed_host(skill_id, allowed_host).await;
+        (skill_id, credential_id)
+    }
+
+    /// Binds a credential to a skill's executor through the admin route, which enforces the
+    /// entitlement rule — so anything bound this way was entitled at bind time.
+    async fn bind_credential(&self, skill_id: Uuid, etag: &str, credential_id: Uuid) {
+        let bound = self
+            .request(
+                "PATCH",
+                &format!("/api/v1/admin/skills/{skill_id}/executor"),
+                Some(etag),
+                Some(json!({ "credential_id": credential_id })),
+            )
+            .await;
+        assert_eq!(
+            bound.status,
+            StatusCode::OK,
+            "bind the credential: {}",
+            bound.body
+        );
+    }
+
+    async fn resolve_skill_credential(
+        &self,
+        credential_id: Uuid,
+        allowed_host: &str,
+    ) -> SkillCredentialOutcome {
+        PgAgentPlatformRepository::new(self.pool.clone())
+            .resolve_skill_credential(&self.state.cipher, credential_id, allowed_host)
+            .await
+            .expect("resolving a skill credential is not an error")
+    }
+}
+
+/// A public IPv6 literal, so an executor can be created at a bracketed host without DNS and
+/// without tripping the SSRF address rules. Its only job is to make the inventory query's
+/// host extraction meet the one form a `split_part(…, ':', 1)` cannot survive.
+const PUBLIC_IPV6_TEST_HOST: &str = "[2001:4860:4860::8888]";
+
+/// The host the certifier's disproof used, kept verbatim. Nothing here reaches the network:
+/// every row carrying it is written straight to the database, because none of these shapes
+/// can be written through the admin API and `.example` resolves nowhere. It has to begin with
+/// a letter — a scheme cannot start with a digit, so an IP literal could not demonstrate the
+/// `host:port/path` shape parsing into a *scheme* with no host.
+const UNPARSEABLE_TEST_HOST: &str = "api.vendor.example";
+
+/// The pre-deploy inventory query is the **only** tool an operator has for finding the rows
+/// this rule breaks, so it is executed here rather than trusted, against every shape it has
+/// to classify. Each seeded row is put to the query *and* to `resolve_skill_credential`, so
+/// the two are compared against each other rather than against a second reading of the SQL.
+///
+/// 1. **A soft-deleted provider (`reason = 'provider_deleted'`).** The execution-time lookup
+///    requires the owning `providers` row to be live, so the credential is refused — a
+///    whole-execution failure, because `skill_refs` resolution is fail-closed. Its own row is
+///    still active and unexpired, and its `base_url` still names the executor's host, so the
+///    host comparison the query used to be cannot see it at all. Recovery already worked; the
+///    row was simply undiscoverable, and that was the whole defect.
+/// 2. **Two rows the code accepts and a string-based host extraction reports anyway** — a
+///    `base_url` carrying userinfo and stray whitespace, and one carrying a bracketed IPv6
+///    literal with a port. `credential_binding_permits_host` parses both with
+///    `Url::host_str()` and permits them. A false positive is the safe direction for *finding*
+///    rows, but it is not free here: repair 1 in the same document moves a live completion
+///    endpoint, so sending an operator to a row that was never broken has a cost.
+/// 3. **Four rows the code refuses and a string extraction happily reports as fine
+///    (`reason = 'base_url_unparseable'`).** These are the false negatives, and they are the
+///    reason the document no longer claims the query "cannot miss a row the code refuses":
+///    each `base_url` spells the executor's `allowed_host` clearly enough for the SQL to
+///    return it, while `Url::parse` produces no such host — no scheme at all, a scheme that
+///    is really the host, a non-numeric port, a port out of range. An operator running the
+///    query saw nothing, deployed, and the skill broke. This direction has no safe side.
+///
+/// The last is the ordinary host mismatch the query already found, kept so a fix to the
+/// others cannot quietly cost the original coverage.
+#[tokio::test]
+async fn the_documented_inventory_query_finds_every_row_the_binding_rule_refuses() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // 1. Entitled at bind time, then its provider is soft-deleted out from under it.
+    let (deleted_skill, deleted_etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "invdeleted")
+        .await;
+    let deleted_credential = fixture
+        .credential_on_provider_at(RESOLVABLE_TEST_HOST, "invdeleted")
+        .await;
+    fixture
+        .bind_credential(deleted_skill, &deleted_etag, deleted_credential)
+        .await;
+    let deleted_provider = fixture.provider_of(deleted_credential).await;
+    fixture.soft_delete_provider(deleted_provider).await;
+
+    // 2. Entitled, and stays entitled — but stored in a form a naive extraction mangles.
+    let (userinfo_skill, userinfo_etag) = fixture
+        .imported_executor(OTHER_PUBLIC_TEST_HOST, "invuserinfo")
+        .await;
+    let userinfo_credential = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "invuserinfo")
+        .await;
+    fixture
+        .bind_credential(userinfo_skill, &userinfo_etag, userinfo_credential)
+        .await;
+    fixture
+        .force_provider_base_url(
+            fixture.provider_of(userinfo_credential).await,
+            &format!("  https://api.vendor.example@{OTHER_PUBLIC_TEST_HOST}/v1  "),
+        )
+        .await;
+
+    // 3. The same, for a bracketed IPv6 literal with an explicit port.
+    let (ipv6_skill, ipv6_etag) = fixture
+        .imported_executor(PUBLIC_IPV6_TEST_HOST, "invipv6")
+        .await;
+    let ipv6_credential = fixture
+        .credential_on_provider_at(PUBLIC_IPV6_TEST_HOST, "invipv6")
+        .await;
+    fixture
+        .bind_credential(ipv6_skill, &ipv6_etag, ipv6_credential)
+        .await;
+    fixture
+        .force_provider_base_url(
+            fixture.provider_of(ipv6_credential).await,
+            &format!("https://{PUBLIC_IPV6_TEST_HOST}:8443/v1"),
+        )
+        .await;
+
+    // 4. The false negatives: `base_url` values that spell UNPARSEABLE_TEST_HOST plainly and
+    //    that `Url::parse` nevertheless yields no host for. Both schemeless shapes are the
+    //    certifier's own rows, reproduced verbatim.
+    let unparseable: Vec<(&str, Uuid, Uuid)> = {
+        let mut seeded = Vec::new();
+        for (label, base_url) in [
+            // No scheme, so not an absolute URL at all.
+            ("invnoscheme", format!("{UNPARSEABLE_TEST_HOST}/v1")),
+            // Parses — as a scheme named api.vendor.example with an opaque path and no host.
+            ("invschemeport", format!("{UNPARSEABLE_TEST_HOST}:8443/v1")),
+            // Has a scheme, but the port is not a port.
+            (
+                "invbadport",
+                format!("https://{UNPARSEABLE_TEST_HOST}:nope/v1"),
+            ),
+            // Has a scheme and a numeric port, and 99999 is not a port either.
+            (
+                "invbigport",
+                format!("https://{UNPARSEABLE_TEST_HOST}:99999/v1"),
+            ),
+        ] {
+            let (skill, credential) = fixture
+                .executor_forced_to(label, &base_url, UNPARSEABLE_TEST_HOST)
+                .await;
+            seeded.push((label, skill, credential));
+        }
+        seeded
+    };
+
+    // 5. The plain host mismatch — bound the way an upgrade inherits it, since no admin route
+    //    accepts this binding today.
+    let (mismatch_skill, _) = fixture
+        .imported_executor(THIRD_PUBLIC_TEST_HOST, "invmismatch")
+        .await;
+    let mismatch_credential = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "invmismatch")
+        .await;
+    sqlx::query("update skill_http_executors set credential_id = $1 where skill_id = $2")
+        .bind(mismatch_credential)
+        .bind(mismatch_skill)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed the pre-rule binding");
+
+    // What the code itself does with each, so the query is being checked against behaviour
+    // rather than against another reading of the same SQL.
+    assert!(
+        matches!(
+            fixture
+                .resolve_skill_credential(deleted_credential, RESOLVABLE_TEST_HOST)
+                .await,
+            SkillCredentialOutcome::ProviderDeleted
+        ),
+        "a live credential on a soft-deleted provider must resolve to ProviderDeleted, not to \
+         the Unusable that told the operator it was 'missing, expired or revoked'"
+    );
+    assert!(
+        matches!(
+            fixture
+                .resolve_skill_credential(userinfo_credential, OTHER_PUBLIC_TEST_HOST)
+                .await,
+            SkillCredentialOutcome::Resolved(_)
+        ),
+        "Url::host_str() puts a userinfo value in the userinfo, so this binding is entitled \
+         and the inventory query must not claim otherwise"
+    );
+    assert!(
+        matches!(
+            fixture
+                .resolve_skill_credential(ipv6_credential, PUBLIC_IPV6_TEST_HOST)
+                .await,
+            SkillCredentialOutcome::Resolved(_)
+        ),
+        "a bracketed IPv6 host with a port is entitled; only the port differs"
+    );
+    assert!(
+        matches!(
+            fixture
+                .resolve_skill_credential(mismatch_credential, THIRD_PUBLIC_TEST_HOST)
+                .await,
+            SkillCredentialOutcome::HostNotEntitled
+        ),
+        "the plain mismatch must still be refused"
+    );
+    for (label, _, credential) in &unparseable {
+        assert!(
+            matches!(
+                fixture
+                    .resolve_skill_credential(*credential, UNPARSEABLE_TEST_HOST)
+                    .await,
+                SkillCredentialOutcome::HostNotEntitled
+            ),
+            "{label}: Url::parse yields no host for this base_url, so the execution path \
+             refuses it — that is the premise the query below has to match"
+        );
+    }
+
+    let rows = sqlx::query(&documented_inventory_query())
+        .fetch_all(&fixture.pool)
+        .await
+        .expect("the documented inventory query must run as written");
+    let reported: HashMap<Uuid, String> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<Uuid, _>("skill_id"),
+                row.get::<String, _>("reason"),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        reported.get(&deleted_skill).map(String::as_str),
+        Some("provider_deleted"),
+        "the one discovery tool an operator has must find the row whose provider was deleted; \
+         its base_url still names the executor's host, so nothing else can. Reported: {reported:?}"
+    );
+    assert_eq!(
+        reported.get(&mismatch_skill).map(String::as_str),
+        Some("host_mismatch"),
+        "the original coverage must survive the fix. Reported: {reported:?}"
+    );
+    assert!(
+        !reported.contains_key(&userinfo_skill),
+        "a base_url whose real host is the executor's must not be reported just because it \
+         carries userinfo and whitespace — repair 1 moves a live completion endpoint, so a \
+         false positive here is not free. Reported: {reported:?}"
+    );
+    assert!(
+        !reported.contains_key(&ipv6_skill),
+        "splitting a bracketed IPv6 authority on ':' yields '[' and reports every IPv6 \
+         provider as broken. Reported: {reported:?}"
+    );
+    for (label, skill, _) in &unparseable {
+        assert_eq!(
+            reported.get(skill).map(String::as_str),
+            Some("base_url_unparseable"),
+            "{label}: the execution path refuses this row, so the only discovery tool an \
+             operator has must name it. Silence here is what made the document's earlier \
+             'it cannot miss a row the code refuses' false — and false in the unsafe \
+             direction, because the operator reads it as clearance to deploy. \
+             Reported: {reported:?}"
+        );
+    }
 }
 
 #[tokio::test]

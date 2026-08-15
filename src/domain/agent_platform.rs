@@ -285,6 +285,91 @@ impl SkillResolution {
     }
 }
 
+// =====================================================================================
+// Which stored credential a skill executor may carry (issue #253 finding 1).
+// =====================================================================================
+
+/// Whether a stored `provider_credentials` row may be bound to — and therefore sent to — a
+/// skill executor whose SSRF-validated destination host is `allowed_host`.
+///
+/// # What this closes
+///
+/// `skill_http_executors.credential_id` is dereferenced at call time, decrypted, and
+/// attached as `Authorization: Bearer <plaintext>` by
+/// [`crate::orchestration::HttpSkillTool`]. Before this rule the only check on that id was
+/// that the row existed, so a holder of `moira:skills:write` could bind *any* provider
+/// credential in the deployment to *any* host that passes the SSRF guard — and
+/// `https://collector.attacker.example` passes it, because it is an ordinary public host.
+/// That made `moira:skills:write` silently equivalent to reading the plaintext of every row
+/// in `provider_credentials`, a capability no other admin scope grants: the credentials
+/// surface only ever returns masked values.
+///
+/// The rule is entitlement by destination: a credential belongs to a provider, that provider
+/// declares where it talks (`providers.base_url`), and the secret may only be sent to that
+/// same host. Binding then moves no secret anywhere it was not already going.
+///
+/// # Why a provider with no `base_url` is refused
+///
+/// `providers.base_url` is `Option`: a provider left on its vendor default (`openai`,
+/// `anthropic`, …) has none, and the default endpoint is Rig's business, not a value stored
+/// here. There is therefore no host this function could compare against, and the fail-closed
+/// answer is the only safe one — inventing the vendor default would make this rule's
+/// correctness depend on a table of hostnames kept in step with `rig-core`. An operator who
+/// genuinely wants such a credential on a skill sets that provider's `base_url` explicitly,
+/// which is a visible, audited admin write.
+///
+/// Comparison is on the parsed host only — never on the URL string — so
+/// `https://api.vendor.example@evil.example/` cannot masquerade as `api.vendor.example`:
+/// `Url` puts that value in the userinfo and reports the host as `evil.example`. Case is
+/// folded because hostnames are case-insensitive and `allowed_host` is stored as the
+/// `url` crate produced it.
+pub fn credential_binding_permits_host(
+    provider_base_url: Option<&str>,
+    allowed_host: &str,
+) -> bool {
+    let Some(base_url) = provider_base_url else {
+        return false;
+    };
+    let Ok(parsed) = url::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    !allowed_host.is_empty() && host.eq_ignore_ascii_case(allowed_host)
+}
+
+/// What resolving a `skill_http_executors.credential_id` produced.
+///
+/// Four outcomes rather than `Option`, because "there is no usable row", "the row is real but
+/// its provider is gone" and "the row is real but is not entitled to this destination" call
+/// for different operator remedies and must not collapse into one message. They did once:
+/// a soft-deleted provider arrived as [`Unusable`](Self::Unusable), so the operator was told
+/// the credential was "missing, expired or revoked" while the `provider_credentials` row sat
+/// there active and unexpired, pointing them at the one table that was fine.
+#[derive(Debug)]
+pub enum SkillCredentialOutcome {
+    Resolved(Box<crate::domain::ResolvedCredential>),
+    /// No live, active, unexpired `provider_credentials` row answers the id, or it carries
+    /// no secret field with an HTTP form.
+    Unusable,
+    /// The credential row itself is live, but its owning `providers` row is soft-deleted.
+    ///
+    /// A provider that no longer exists declares nothing, so it entitles no destination —
+    /// and a credential nobody can see on the admin plane must not keep being sent by a
+    /// skill. Distinct from [`Unusable`](Self::Unusable) because the remedy is on the
+    /// provider or the executor, not on the credential, and distinct from
+    /// [`HostNotEntitled`](Self::HostNotEntitled) because such a row's `base_url` may name
+    /// the executor's host exactly: no host comparison can find it. Reported separately by
+    /// the pre-deploy inventory query in `docs/agent-platform.md`, which is the only tool an
+    /// operator has for finding these before an upgrade turns them into failed executions.
+    ProviderDeleted,
+    /// The row exists, but its provider's configured `base_url` host is not the executor's
+    /// `allowed_host` — see [`credential_binding_permits_host`]. Refused **before**
+    /// decryption: a secret that is not going to be sent is not worth unsealing.
+    HostNotEntitled,
+}
+
 /// A deterministic guard policy, parsed from a `kind = 'guard'` skill's `metadata.guard`
 /// object (plan 12 §5, "skills as guards").
 ///
@@ -731,6 +816,123 @@ pub struct AgentFlowRunResult {
 pub struct EvalRunRequest {
     #[serde(default)]
     pub agent_profile_id: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod credential_binding_tests {
+    use super::credential_binding_permits_host;
+
+    #[test]
+    fn a_credential_may_be_bound_to_its_own_providers_host() {
+        assert!(credential_binding_permits_host(
+            Some("https://api.vendor.example/v1"),
+            "api.vendor.example"
+        ));
+    }
+
+    /// Hostnames are case-insensitive, and `allowed_host` is stored as the `url` crate
+    /// produced it rather than as the operator typed it.
+    ///
+    /// The empty and boundary ports are the counterpart to
+    /// [`an_unparseable_or_hostless_base_url_entitles_nothing`]: `Url::parse` accepts both,
+    /// so the port check the documented inventory query grew must not report them either.
+    #[test]
+    fn the_host_comparison_folds_case_and_ignores_path_port_and_whitespace() {
+        for base in [
+            "  https://API.Vendor.Example:8443/v1/chat  ",
+            "https://api.vendor.example:/v1",
+            "https://api.vendor.example:65535/v1",
+        ] {
+            assert!(
+                credential_binding_permits_host(Some(base), "api.vendor.example"),
+                "{base} names api.vendor.example and must stay entitled"
+            );
+        }
+    }
+
+    /// The whole point of the rule: issue #253 finding 1's exfiltration destination.
+    #[test]
+    fn a_credential_may_not_be_bound_to_an_unrelated_public_host() {
+        assert!(!credential_binding_permits_host(
+            Some("https://api.openai.com/v1"),
+            "collector.attacker.example"
+        ));
+    }
+
+    /// `https://api.vendor.example@evil.example/` parses with host `evil.example` and
+    /// `api.vendor.example` as userinfo. Comparing the parsed host rather than the string is
+    /// what makes that a refusal instead of a match.
+    #[test]
+    fn a_userinfo_prefix_cannot_impersonate_the_allowed_host() {
+        assert!(!credential_binding_permits_host(
+            Some("https://api.vendor.example@evil.example/v1"),
+            "api.vendor.example"
+        ));
+        assert!(credential_binding_permits_host(
+            Some("https://api.vendor.example@evil.example/v1"),
+            "evil.example"
+        ));
+    }
+
+    /// A suffix or prefix of the allowed host is a different host.
+    #[test]
+    fn a_neighbouring_hostname_is_not_the_allowed_host() {
+        for base in [
+            "https://evil-api.vendor.example",
+            "https://api.vendor.example.evil.test",
+            "https://vendor.example",
+        ] {
+            assert!(
+                !credential_binding_permits_host(Some(base), "api.vendor.example"),
+                "{base} must not satisfy api.vendor.example"
+            );
+        }
+    }
+
+    /// Fail-closed: a provider left on its vendor default has no stored host to compare
+    /// against, so no credential of its may be bound anywhere.
+    #[test]
+    fn a_provider_with_no_base_url_entitles_nothing() {
+        assert!(!credential_binding_permits_host(None, "api.openai.com"));
+    }
+
+    /// The shapes here are also the ones the documented inventory query in
+    /// `docs/agent-platform.md` used to miss, so this list and that query's `has_authority`
+    /// and port checks describe the same set. Each spells `api.vendor.example` plainly
+    /// enough for a string extraction to return it, and each is refused:
+    ///
+    /// * `api.vendor.example/v1` has no scheme, so it is not an absolute URL at all.
+    /// * `api.vendor.example:8443/v1` *does* parse — as a scheme named `api.vendor.example`
+    ///   carrying the opaque path `8443/v1`, with no host for `host_str()` to return.
+    /// * `:nope` and `:99999` are not ports `Url::parse` accepts, so neither value parses,
+    ///   and the host the operator can read in the string is never produced.
+    #[test]
+    fn an_unparseable_or_hostless_base_url_entitles_nothing() {
+        for base in [
+            "not-a-url",
+            "/relative/path",
+            "mailto:ops@vendor.example",
+            "api.vendor.example/v1",
+            "api.vendor.example:8443/v1",
+            "https://api.vendor.example:nope/v1",
+            "https://api.vendor.example:99999/v1",
+        ] {
+            assert!(
+                !credential_binding_permits_host(Some(base), "api.vendor.example"),
+                "{base} must entitle nothing"
+            );
+        }
+    }
+
+    /// An executor row with an empty `allowed_host` must not become a wildcard, whatever
+    /// wrote it.
+    #[test]
+    fn an_empty_allowed_host_is_never_satisfied() {
+        assert!(!credential_binding_permits_host(
+            Some("https://api.vendor.example"),
+            ""
+        ));
+    }
 }
 
 #[cfg(test)]

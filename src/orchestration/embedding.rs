@@ -43,7 +43,8 @@ use serde_json::Value;
 use crate::{
     domain::{CredentialType, ProviderType, ResolvedCredential, ResolvedProviderConfiguration},
     error::AppError,
-    orchestration::normalize_openai_base_url,
+    orchestration::{normalize_openai_base_url, runtime_factory::guard_endpoint},
+    security::ProviderEndpointPolicy,
 };
 
 /// Error code returned when the configured embedding provider cannot embed at all.
@@ -77,18 +78,22 @@ pub trait EmbeddingFactory: Send + Sync {
     ) -> Result<EmbeddingModelHandle, AppError>;
 }
 
-#[derive(Debug, Clone)]
-pub struct RigEmbeddingFactory;
-
-impl RigEmbeddingFactory {
-    pub fn new() -> Self {
-        Self
-    }
+#[derive(Debug, Clone, Default)]
+pub struct RigEmbeddingFactory {
+    /// The address space this deployment permits a provider credential to be sent to.
+    ///
+    /// This factory is the *second* site that reads an `azure_openai` credential's
+    /// `config["endpoint"]` in preference to `providers.base_url` and then sends the
+    /// decrypted API key there — the completion factory is the first. Both are members of
+    /// issue #251's class and both are guarded; a fix applied to only one of them would have
+    /// left RAG ingestion as the open path. See
+    /// [`crate::security::provider_endpoint`].
+    endpoint_policy: ProviderEndpointPolicy,
 }
 
-impl Default for RigEmbeddingFactory {
-    fn default() -> Self {
-        Self::new()
+impl RigEmbeddingFactory {
+    pub fn new(endpoint_policy: ProviderEndpointPolicy) -> Self {
+        Self { endpoint_policy }
     }
 }
 
@@ -171,6 +176,10 @@ impl EmbeddingFactory for RigEmbeddingFactory {
         dimension: usize,
     ) -> Result<EmbeddingModelHandle, AppError> {
         let secret = credential.secret.expose_secret();
+        // Same use-time guard, same reason, as `RigRuntimeFactory::build_completion_model`.
+        if let Some(base_url) = provider.base_url.as_deref() {
+            guard_endpoint(self.endpoint_policy, "provider base_url", base_url)?;
+        }
         match provider.provider_type {
             ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
                 require_credential_type(
@@ -203,6 +212,11 @@ impl EmbeddingFactory for RigEmbeddingFactory {
                             "azure_openai provider requires a configured endpoint".to_string(),
                         )
                     })?;
+                guard_endpoint(
+                    self.endpoint_policy,
+                    "azure_openai credential endpoint",
+                    endpoint,
+                )?;
                 let api_version = credential
                     .config
                     .get("api_version")

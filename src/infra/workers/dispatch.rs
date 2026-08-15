@@ -52,9 +52,11 @@ use crate::{
             self, CONVERSATION_SUMMARIZATION_RETRY_WORKER, DOCUMENT_INGESTION_RETRY_WORKER,
             EMBEDDING_RETRY_WORKER, LATENCY_STATS_AGGREGATION_WORKER,
             MEMORY_EXTRACTION_RETRY_WORKER, OAUTH_TOKEN_REFRESH_WORKER,
-            PROVIDER_HEALTH_CHECK_WORKER, latency_stats::LatencyStatsAggregationHandler,
-            oauth_refresh::OAuthTokenRefreshHandler,
-            provider_health_check::ProviderHealthCheckHandler, queue::JobDispatcher,
+            PROVIDER_HEALTH_CHECK_WORKER,
+            latency_stats::LatencyStatsAggregationHandler,
+            oauth_refresh::{OAuthTokenRefreshHandler, TokenEndpointPolicy},
+            provider_health_check::ProviderHealthCheckHandler,
+            queue::JobDispatcher,
         },
     },
     security::LocalSecretCipher,
@@ -189,12 +191,20 @@ fn deferred_pipeline_handler(job_name: &'static str) -> Arc<dyn JobHandler> {
 /// intentionally left unregistered here: `retention-cleanup` is dispatched outside this queue
 /// entirely (its own leader-gated timer arm in `run_supervisor`), and `runtime-cache-warmer`
 /// has no handler yet — it falls through to [`RealJobDispatcher::dispatch`]'s case-3 no-op.
+///
+/// `http` is the shared `AppState::http` and reaches only [`ProviderHealthCheckHandler`].
+/// [`OAuthTokenRefreshHandler`] deliberately does not take it — it builds its own
+/// no-redirect client, because its request body is a decrypted refresh token and
+/// `AppState::http` follows up to ten redirects. `token_endpoint_policy` carries this
+/// deployment's answer to whether that handler may talk to a non-public address at all; see
+/// [`TokenEndpointPolicy`].
 pub fn default_dispatcher(
     pool: Option<PgPool>,
     cipher: LocalSecretCipher,
     http: Client,
     metrics: MetricsRegistry,
     settings: Arc<WorkerSettings>,
+    token_endpoint_policy: TokenEndpointPolicy,
 ) -> RealJobDispatcher {
     let mut dispatcher = RealJobDispatcher::new()
         .register(
@@ -227,9 +237,9 @@ pub fn default_dispatcher(
                 Arc::new(OAuthTokenRefreshHandler::new(
                     pool.clone(),
                     cipher,
-                    http.clone(),
                     metrics.clone(),
                     settings.clone(),
+                    token_endpoint_policy,
                 )),
             )
             .register(
@@ -263,6 +273,7 @@ mod tests {
             Client::new(),
             MetricsRegistry::new("dispatch-test", None),
             Arc::new(WorkerSettings::default()),
+            TokenEndpointPolicy::default(),
         )
     }
 

@@ -312,6 +312,10 @@ readiness signal.
 
 - `plans/12-feature-expansion-brainstorm.md` §1 — the decision record this
   document implements.
+- [`claude-runners.md`](claude-runners.md) — the containerised-runner path
+  (issue #272) that mints an `oauth2` Claude credential the same way a manual
+  `claude setup-token` run does here, but inside a locked-down, provisioned
+  container instead of on the operator's own machine.
 - `docs/provider-credential-management.md` — the credential endpoints this
   flow calls; no new Moira endpoint was added for it.
 - `docs/project-structure.md` and `docs/console-architecture.md` — where the

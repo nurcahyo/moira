@@ -210,6 +210,11 @@ struct SkillSeed {
     /// Written verbatim, so a test can store an `allowed_host` the URL does not name.
     allowed_host: Option<String>,
     with_credential: bool,
+    /// `base_url` of the provider the seeded credential hangs off. `None` means the skill
+    /// target itself, which is the only configuration
+    /// `domain::credential_binding_permits_host` permits; a test that wants the *refused*
+    /// shape sets some other host here.
+    credential_provider_base_url: Option<String>,
     executor: bool,
 }
 
@@ -229,6 +234,7 @@ impl SkillSeed {
             path_template: path_template.to_string(),
             allowed_host: None,
             with_credential: false,
+            credential_provider_base_url: None,
             executor: true,
         }
     }
@@ -244,6 +250,7 @@ impl SkillSeed {
             path_template: "/unused".to_string(),
             allowed_host: None,
             with_credential: false,
+            credential_provider_base_url: None,
             executor: false,
         }
     }
@@ -350,7 +357,11 @@ impl SkillFixture {
                 .clone()
                 .unwrap_or_else(|| "127.0.0.1".to_string());
             let credential_id = if seed.with_credential {
-                Some(self.seed_skill_credential().await)
+                let base_url = seed
+                    .credential_provider_base_url
+                    .clone()
+                    .unwrap_or_else(|| self.target.origin());
+                Some(self.seed_skill_credential(base_url).await)
             } else {
                 None
             };
@@ -383,7 +394,7 @@ impl SkillFixture {
     /// reuse that table's envelope rather than a second secret store). Written through the
     /// admin service so the secret is sealed exactly as production seals it, which is what
     /// makes the decrypt-at-call-time path real.
-    async fn seed_skill_credential(&self) -> Uuid {
+    async fn seed_skill_credential(&self, provider_base_url: String) -> Uuid {
         use moira::domain::{
             CredentialCreateRequest, CredentialScope, CredentialSecret, CredentialType,
             ProviderCreateRequest, ProviderType,
@@ -394,6 +405,13 @@ impl SkillFixture {
         // A provider of its own: the skill's credential must not be reachable through the
         // completion provider's own resolution ladder, and giving it a separate provider row
         // is what proves the executor's explicit `credential_id` is what selected it.
+        //
+        // `base_url` names the skill target because a credential may only be sent to the
+        // host its own provider declares (issue #253 finding 1,
+        // `domain::credential_binding_permits_host`). This fixture models the legitimate
+        // configuration — the operator registered the third-party endpoint as a provider and
+        // put its key on that row — so that the negative case, a credential borrowed from
+        // some *other* provider, is a refusal rather than the default.
         let provider = admin
             .create_provider(
                 &self.fixture.actor,
@@ -401,7 +419,7 @@ impl SkillFixture {
                 ProviderCreateRequest {
                     provider_type: ProviderType::Custom,
                     display_name: format!("Skill target {suffix}"),
-                    base_url: None,
+                    base_url: Some(provider_base_url),
                     metadata: json!({ "test_fixture": true }),
                 },
             )
@@ -629,6 +647,71 @@ async fn a_skill_credential_reaches_the_target_and_nothing_else() {
             "the skill secret must never be sent to the model"
         );
     }
+
+    fixture.shutdown().await;
+}
+
+/// Issue #253 finding 1, at execution time. A `skill_http_executors` row that names a
+/// credential belonging to a provider which does not serve the executor's `allowed_host` is
+/// refused before the credential is decrypted, so the secret is never assembled, never sent,
+/// and the skill target is never called.
+///
+/// `AgentPlatformService::patch_executor` refuses that binding on the way in, so the only way
+/// such a row exists is the way this test makes one — written straight to the table, which is
+/// also how a row stored before that rule existed would look. That is exactly why the rule is
+/// enforced in both places: a write-time-only check leaves every pre-existing row live.
+///
+/// The refusal is terminal rather than in-band, unlike the `allowed_host` mismatch below: a
+/// missing or unusable skill credential fails the execution (`skill_credential`'s doc comment
+/// gives the reasoning — calling unauthenticated would at best 401), and this is the same
+/// class of "this skill cannot be used at all" as a dangling `skill_refs` entry.
+#[tokio::test]
+async fn a_skill_credential_from_a_provider_that_does_not_serve_the_host_is_never_sent() {
+    let Some(fixture) = SkillFixture::new(
+        vec![ProviderScript::Completion {
+            text: "unreachable".to_string(),
+        }],
+        json!({ "state": "never-reached" }),
+    )
+    .await
+    else {
+        return;
+    };
+    let mut seed = SkillSeed::tool("orders_get", "/orders/{order_id}");
+    seed.with_credential = true;
+    // A public https host that is not the skill target — the SSRF guard has no objection to
+    // it, which is the whole point: passing that guard is not entitlement.
+    seed.credential_provider_base_url = Some("https://collector.elsewhere.test".to_string());
+    fixture.seed_skill(seed).await;
+
+    let outcome = fixture.execute().await;
+    assert_eq!(
+        outcome.status,
+        ExecutionStatus::Failed,
+        "an executor bound to a credential its provider cannot entitle must refuse the \
+         execution rather than call unauthenticated"
+    );
+    assert_eq!(
+        outcome.failure.as_ref().map(|failure| failure.class),
+        Some(ExecutionFailureClass::SkillUnavailable),
+        "{:?}",
+        outcome.failure
+    );
+    assert!(
+        fixture.target.calls().is_empty(),
+        "the skill target must never be called"
+    );
+    assert_eq!(
+        fixture.provider.call_count().await,
+        0,
+        "the tool set is built before the candidate loop, so this is refused before any \
+         provider is contacted"
+    );
+    let outcome_text = format!("{outcome:?}");
+    assert!(
+        !outcome_text.contains(SKILL_SECRET),
+        "the refused credential's plaintext must not appear anywhere in the outcome"
+    );
 
     fixture.shutdown().await;
 }

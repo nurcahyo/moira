@@ -27,8 +27,8 @@ use crate::{
         ExecutionOutcome, ExecutionStatus, ExecutionStreamHandle, ModelCandidate, ModelDecision,
         ModelSelectionReason, ProviderAttemptSummary, ProviderRuntimePolicyRecord, ProviderType,
         ResolvedCredential, ResolvedProviderConfiguration, RouteDecision, RouteSelectionReason,
-        RuntimeEventEnvelope, RuntimeEventType, SkillGuard, SkillResolution, SkillUnusableReason,
-        UsageSummary,
+        RuntimeEventEnvelope, RuntimeEventType, SkillCredentialOutcome, SkillGuard,
+        SkillResolution, SkillUnusableReason, UsageSummary,
     },
     error::AppError,
     infra::{
@@ -70,12 +70,17 @@ impl MoiraExecutionService {
         let pool = state.pool()?.clone();
         let allow_chatgpt_subscription =
             state.settings.provider_security.allow_chatgpt_subscription;
+        // Resolved before `state` moves into `Self`, and captured once for the same reason
+        // `allow_chatgpt_subscription` is: it is a deployment posture, not a per-request one.
+        let endpoint_policy = crate::security::ProviderEndpointPolicy::from_provider_security(
+            &state.settings.provider_security,
+        );
         Ok(Self {
             state,
             runtime_repo: PgRuntimeRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool.clone()),
             agent_platform_repo: PgAgentPlatformRepository::new(pool),
-            factory: RigRuntimeFactory::new(allow_chatgpt_subscription),
+            factory: RigRuntimeFactory::new(allow_chatgpt_subscription, endpoint_policy),
         })
     }
 
@@ -1434,8 +1439,13 @@ impl MoiraExecutionService {
                 SkillResolution::Tool { skill, executor } => {
                     let credential = match executor.credential_id {
                         Some(credential_id) => Some(
-                            self.skill_credential(profile, &skill.skill_key, credential_id)
-                                .await?,
+                            self.skill_credential(
+                                profile,
+                                &skill.skill_key,
+                                credential_id,
+                                &executor.allowed_host,
+                            )
+                            .await?,
                         ),
                         None => None,
                     };
@@ -1512,32 +1522,95 @@ impl MoiraExecutionService {
     /// to an unauthenticated call: the operator attached that credential because the target
     /// requires it, and calling without it would at best 401 and at worst succeed against
     /// an endpoint that should have refused.
+    ///
+    /// `allowed_host` is the executor's SSRF-validated destination, and the credential is
+    /// only handed over when its owning provider is entitled to that host — see
+    /// [`crate::domain::credential_binding_permits_host`]. That rule is also enforced on the
+    /// admin write path (`application::agent_platform::patch_executor`); it is re-checked
+    /// here because a row written before the rule existed, or by anything that reaches the
+    /// table without going through that handler, would otherwise still send the secret.
+    ///
+    /// The owning provider must also still be live. Each of the three refusals below names a
+    /// different table, because each has a different remedy and an operator sent to the wrong
+    /// one finds nothing wrong there — `docs/agent-platform.md` carries the pre-deploy
+    /// inventory query that finds all three before an upgrade turns them into failures.
     async fn skill_credential(
         &self,
         profile: &AgentProfileRecord,
         skill_key: &str,
         credential_id: Uuid,
+        allowed_host: &str,
     ) -> Result<SkillCredential, ExecutionFailure> {
-        let resolved = self
+        let outcome = self
             .agent_platform_repo
-            .resolve_skill_credential(&self.state.cipher, credential_id)
+            .resolve_skill_credential(&self.state.cipher, credential_id, allowed_host)
             .await
             .map_err(|_| {
                 ExecutionFailure::new(
                     ExecutionFailureClass::CredentialDecryptionFailed,
                     "skill credential could not be decrypted",
                 )
-            })?
-            .ok_or_else(|| {
-                ExecutionFailure::new(
+            })?;
+        let resolved = match outcome {
+            SkillCredentialOutcome::Resolved(resolved) => resolved,
+            SkillCredentialOutcome::Unusable => {
+                return Err(ExecutionFailure::new(
                     ExecutionFailureClass::CredentialNotFound,
                     format!(
                         "agent profile '{}' needs skill '{skill_key}', whose credential \
                          {credential_id} is missing, expired or revoked",
                         profile.profile_key
                     ),
-                )
-            })?;
+                ));
+            }
+            SkillCredentialOutcome::ProviderDeleted => {
+                // Not `CredentialNotFound`, and not the "missing, expired or revoked" wording
+                // above: the `provider_credentials` row is active, unexpired and present, and
+                // an operator sent to look at it finds nothing wrong. What changed is one
+                // table over. Same class as `HostNotEntitled` because the remedy has the same
+                // shape — an admin-plane edit — and the same reason for being fail-closed: a
+                // provider nobody can see must not keep having its secrets sent.
+                tracing::warn!(
+                    profile_key = %profile.profile_key,
+                    skill_key,
+                    %credential_id,
+                    allowed_host,
+                    "refusing to send a skill credential whose owning provider is soft-deleted"
+                );
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} belongs to a provider that has been deleted; the \
+                         credential itself is still live",
+                        profile.profile_key
+                    ),
+                ));
+            }
+            SkillCredentialOutcome::HostNotEntitled => {
+                // `SkillUnavailable`, not `CredentialNotFound`: the credential is fine, the
+                // binding is not, and the remedy is an admin-plane edit to the skill rather
+                // than anything to do with the credential row. The public code carries no
+                // detail — the server-side message below is where an operator reads why.
+                tracing::warn!(
+                    profile_key = %profile.profile_key,
+                    skill_key,
+                    %credential_id,
+                    allowed_host,
+                    "refusing to send a skill credential to a host its provider does not \
+                     declare as its base_url"
+                );
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} belongs to a provider that does not declare \
+                         '{allowed_host}' as its base_url",
+                        profile.profile_key
+                    ),
+                ));
+            }
+        };
         Ok(SkillCredential {
             credential_type: resolved.credential_type,
             secret: resolved.secret,
