@@ -183,19 +183,85 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
     ).toBeNull();
   });
 
+  // Capability off: the deployment turned Mode A on, but this host cannot
+  // actually run the interactive step (`cliInteractiveAvailable` defaults to
+  // `false`, the same fail-closed default `ptyIsAvailable()` itself has
+  // today). This is the state the panel used to get wrong — see
+  // `ConnectClaudeSubscriptionPanel.tsx`'s own header.
+  describe("capability off: this host cannot run the interactive sign-in", () => {
+    test("renders the calm guidance notice instead of the promise paragraph, and no button", () => {
+      render(
+        <ConnectClaudeSubscriptionPanel
+          fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+          cliAcquisitionEnabled
+          subscriptionStatus={NOT_CONNECTED}
+        />,
+      );
+      expect(
+        screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice)),
+      ).toBeDefined();
+      expect(screen.queryByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_intro))).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+      ).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+      ).toBeNull();
+    });
+
+    test("the guidance is informational, not an error — no alert role, not the .problem treatment", () => {
+      const { container } = render(
+        <ConnectClaudeSubscriptionPanel
+          fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+          cliAcquisitionEnabled
+          subscriptionStatus={NOT_CONNECTED}
+        />,
+      );
+      const notice = screen.getByText(
+        copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice),
+      );
+      expect(notice.getAttribute("role")).not.toBe("alert");
+      // Nothing in the whole panel is in an alert role in this state — there
+      // was never a failed action to report, only guidance offered up front.
+      expect(container.querySelectorAll('[role="alert"]').length).toBe(0);
+    });
+
+    test("explicitly passing cliInteractiveAvailable={false} renders identically to omitting it", () => {
+      render(
+        <ConnectClaudeSubscriptionPanel
+          fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+          cliAcquisitionEnabled
+          cliInteractiveAvailable={false}
+          subscriptionStatus={NOT_CONNECTED}
+        />,
+      );
+      expect(
+        screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice)),
+      ).toBeDefined();
+    });
+  });
+
+  // Capability on: BOTH the deployment flag and the host's own capability are
+  // true — the only state where the promise paragraph and an enabled button
+  // are shown together, because only here can this host keep the promise.
   test("when enabled and nothing is connected, the button reads 'acquire', not 'reacquire'", () => {
     render(
       <ConnectClaudeSubscriptionPanel
         fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={NOT_CONNECTED}
       />,
     );
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_intro))).toBeDefined();
     expect(
       screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
     ).toBeDefined();
     expect(
       screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+    ).toBeNull();
+    expect(
+      screen.queryByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice)),
     ).toBeNull();
   });
 
@@ -204,11 +270,28 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
       <ConnectClaudeSubscriptionPanel
         fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={CONNECTED_ACTIVE}
       />,
     );
     expect(
       screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+    ).toBeDefined();
+  });
+
+  test("enabled but this host cannot run it: the button never appears, even when already connected", () => {
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        cliAcquisitionEnabled
+        subscriptionStatus={CONNECTED_ACTIVE}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+    ).toBeNull();
+    expect(
+      screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice)),
     ).toBeDefined();
   });
 
@@ -221,6 +304,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
       <ConnectClaudeSubscriptionPanel
         fetchImpl={send}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={NOT_CONNECTED}
         cliPollIntervalMs={1}
       />,
@@ -245,6 +329,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
       <ConnectClaudeSubscriptionPanel
         fetchImpl={send}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={NOT_CONNECTED}
         onConnected={() => connected.push("yes")}
         cliPollIntervalMs={1}
@@ -280,6 +365,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
         <ConnectClaudeSubscriptionPanel
           fetchImpl={send}
           cliAcquisitionEnabled
+          cliInteractiveAvailable
           subscriptionStatus={NOT_CONNECTED}
           cliPollIntervalMs={1}
         />,
@@ -318,6 +404,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
       <ConnectClaudeSubscriptionPanel
         fetchImpl={send}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={NOT_CONNECTED}
         cliPollIntervalMs={1}
       />,
@@ -346,6 +433,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
       <ConnectClaudeSubscriptionPanel
         fetchImpl={send}
         cliAcquisitionEnabled
+        cliInteractiveAvailable
         subscriptionStatus={NOT_CONNECTED}
         cliPollIntervalMs={1}
       />,

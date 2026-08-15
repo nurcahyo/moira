@@ -36,6 +36,7 @@
 // choosing. The page says so instead.
 
 import { consoleRuntime } from "@/lib/auth-runtime";
+import { ptyIsAvailable } from "@/lib/claude-cli";
 import {
   loadClaudeApiKeyStatus,
   loadClaudeSubscriptionStatus,
@@ -109,6 +110,7 @@ export default async function LlmSettingsPage() {
             defaultBaseUrl={LOCAL_VLLM_BASE_URL}
             providers={data.settings.providers}
             cliAcquisitionEnabled={consoleEnv().allowLocalCliCredentials}
+            cliInteractiveAvailable={ptyIsAvailable()}
             claudeSubscriptionStatus={data.claudeSubscriptionStatus}
             claudeKeyStatus={data.claudeApiKeyStatus}
           />
