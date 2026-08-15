@@ -1727,11 +1727,23 @@ export class MoiraClient {
   // client component cannot even name the shapes.
 
   /**
-   * `GET /api/v1/admin/provider-credentials`, optionally filtered by provider.
+   * `GET /api/v1/admin/provider-credentials`.
    *
-   * `provider_id` is a documented query parameter on this operation — filtering
-   * server-side rather than listing everything and matching in the console keeps
-   * other providers' credential rows out of this process entirely.
+   * CALLER'S OBLIGATION: RE-CHECK `provider_id` ON EVERY ROW. `provider_id` is
+   * a documented query parameter on this operation and Moira **silently
+   * ignores it** — `CredentialAdminService::list_credentials`
+   * (`src/application/admin/credentials.rs`) forwards only cursor and limit,
+   * the SQL in `src/infra/repositories/admin.rs` has no filter clause, and
+   * `PageQuery`'s own docstring (`src/domain/admin.rs`) states that filters on
+   * these list endpoints are accepted and then dropped. This method therefore
+   * returns the newest `limit` credentials in the WHOLE deployment, whatever
+   * `options.providerId` says; `status` is inert for the same reason.
+   *
+   * `options.providerId` is still sent, so callers become correct for free if
+   * the server ever honours it, but nothing may depend on that today. A caller
+   * that matches on `credential_type` or `id` alone will match another
+   * provider's row — and a rotate against that row overwrites its sealed
+   * secret in place, unrecoverably.
    */
   async listProviderCredentials(
     options: {

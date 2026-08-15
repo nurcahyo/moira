@@ -4,6 +4,17 @@
 // tests that matter are about what actually goes on the wire — the order of the
 // requests, which headers are attached, and what is in each body. A fake client
 // would let all three drift.
+//
+// HANDLERS ARE KEYED ON `"<METHOD> <path>"`, QUERY EXCLUDED, ON PURPOSE.
+// Moira's twelve admin list endpoints accept all 26 `PageQuery` fields and
+// silently ignore the ones they do not implement — `provider_id` on
+// `GET /api/v1/admin/provider-credentials` is one of them (`src/domain/admin.rs`
+// documents the behaviour; the SQL in `src/infra/repositories/admin.rs` has no
+// filter clause). A stub that honoured the query would be MORE capable than the
+// server and would green-light a caller that trusts the filter; that is exactly
+// how the credential-reuse bug in `lib/claude-subscription.ts` reached main.
+// A fixture that wants to prove a filter works must model the filtering itself,
+// and the raw query is available to every handler on `RecordedRequest.url`.
 
 export interface RecordedRequest {
   readonly method: string;

@@ -169,6 +169,12 @@ export function isClaudeSubscriptionError(value: unknown): value is ClaudeSubscr
  * rather than a shared import: that function's signature carries
  * `llm-settings.ts`'s own `ConnectStepName`/`ConnectState` trace shape, which
  * this simpler, two-step chain has no use for.
+ *
+ * On the credential list this refusal fires more often than the page size
+ * suggests, because `has_more` there reflects the deployment-wide credential
+ * count rather than this provider's (the `provider_id` filter is inert — see
+ * step 2). Refusing is still the correct outcome: the alternative is writing a
+ * token against a row this page cannot prove is the right one.
  */
 function findFirstOnPage<T>(
   page: { readonly data: readonly T[]; readonly pagination: { readonly has_more: boolean } },
@@ -230,13 +236,29 @@ export async function connectClaudeSubscription(
   }
 
   /* --- 2. the oauth2 credential, created or rotated in place -------------- */
+  //
+  // THE `provider_id` QUERY FILTER IS INERT. Moira declares it on this
+  // operation and then ignores it: `CredentialAdminService::list_credentials`
+  // (`src/application/admin/credentials.rs`) forwards only cursor and limit,
+  // and the SQL (`src/infra/repositories/admin.rs`) has no filter clause —
+  // `PageQuery`'s own docstring (`src/domain/admin.rs`) says so in plain
+  // English. So this page is the newest `LIST_PAGE_LIMIT` credentials in the
+  // WHOLE deployment, and the predicate below MUST re-check `provider_id`
+  // client-side, exactly as `lib/llm-settings.ts` and
+  // `app/api/llm/providers/[id]/credentials/[credentialId]/route.ts` do.
+  // Without that check a global `oauth2` row on an unrelated provider matches
+  // first, and the rotate below overwrites ITS sealed secret with the Claude
+  // subscription token — unrecoverably, since rotation replaces the ciphertext
+  // in place — while this provider ends up with no credential at all.
+  const providerId = provider.id;
   const credentialPage = await client.listProviderCredentials({
-    providerId: provider.id,
+    providerId,
     limit: LIST_PAGE_LIMIT,
   });
   const existingCredential = findFirstOnPage(
     credentialPage,
-    (row) => row.credential_type === "oauth2" && row.status !== "deleted",
+    (row) =>
+      row.provider_id === providerId && row.credential_type === "oauth2" && row.status !== "deleted",
   );
 
   if (existingCredential === null) {
@@ -244,15 +266,15 @@ export async function connectClaudeSubscription(
       {
         // Resolved from the provider record THIS function created or found —
         // never from a request body.
-        provider_id: provider.id,
+        provider_id: providerId,
         credential_type: "oauth2",
         scope: { type: "global" },
         secret: oauth2CredentialSecret(options.accessToken),
         display_name: CLAUDE_SUBSCRIPTION_CREDENTIAL_DISPLAY_NAME,
       },
-      { idempotencyKey: `claude-subscription-credential:${provider.id}:${crypto.randomUUID()}` },
+      { idempotencyKey: `claude-subscription-credential:${providerId}:${crypto.randomUUID()}` },
     );
-    return { providerId: provider.id, credentialId: created.id, outcome: "created" };
+    return { providerId, credentialId: created.id, outcome: "created" };
   }
 
   const rotated = await client.rotateProviderCredential(
@@ -264,5 +286,5 @@ export async function connectClaudeSubscription(
     rotated.status === "active"
       ? rotated
       : await client.enableProviderCredential(rotated.id, ifMatchFor(rotated));
-  return { providerId: provider.id, credentialId: active.id, outcome: "rotated" };
+  return { providerId, credentialId: active.id, outcome: "rotated" };
 }

@@ -29,6 +29,7 @@ import { createMoiraStub, MOIRA_STUB_BASE_URL, type StubHandler } from "../../su
 const PROVIDER_ID = "aaaaaaaa-1111-4111-8111-111111111111";
 const OTHER_PROVIDER_ID = "aaaaaaaa-2222-4222-8222-222222222222";
 const CREDENTIAL_ID = "bbbbbbbb-1111-4111-8111-111111111111";
+const FOREIGN_CREDENTIAL_ID = "bbbbbbbb-2222-4222-8222-222222222222";
 
 /** Unmistakable, and asserted absent from every returned/serialised shape. */
 const TOKEN = "sk-ant-oat01-unmistakable-subscription-token-4f9c2b";
@@ -40,6 +41,13 @@ const CREDENTIAL_LIST = "GET /api/v1/admin/provider-credentials";
 const CREDENTIAL_CREATE = "POST /api/v1/admin/provider-credentials";
 const CREDENTIAL_ROTATE = `POST /api/v1/admin/provider-credentials/${CREDENTIAL_ID}/rotate`;
 const CREDENTIAL_ENABLE = `POST /api/v1/admin/provider-credentials/${CREDENTIAL_ID}/enable`;
+
+// Registered so that a chain which mis-targets another provider's credential
+// gets RECORDED and fails on an assertion, instead of dying inside the stub on
+// "no handler registered" — a stack trace that says nothing about which row was
+// about to be overwritten.
+const FOREIGN_ROTATE = `POST /api/v1/admin/provider-credentials/${FOREIGN_CREDENTIAL_ID}/rotate`;
+const FOREIGN_ENABLE = `POST /api/v1/admin/provider-credentials/${FOREIGN_CREDENTIAL_ID}/enable`;
 
 function page(rows: readonly unknown[], hasMore = false) {
   return { data: rows, pagination: { has_more: hasMore, next_cursor: null } };
@@ -77,15 +85,45 @@ function credentialRecord(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * An `oauth2` credential belonging to a DIFFERENT provider — the row that makes
+ * these tests model the real server.
+ *
+ * `GET /api/v1/admin/provider-credentials` declares `provider_id` and then
+ * ignores it (`PageQuery`'s docstring at `src/domain/admin.rs` says so;
+ * `CredentialAdminService::list_credentials` forwards only cursor and limit),
+ * so every credential page the console sees is the newest N rows in the WHOLE
+ * deployment. A user-scoped `oauth2` credential on some unrelated provider is
+ * an ordinary thing for a deployment to hold, and it lands on this page.
+ *
+ * The stub keys handlers on the bare `"<METHOD> <path>"` for exactly this
+ * reason — filtering the fixture by the query string would make the stub MORE
+ * capable than Moira and hide the bug this row exists to catch. The query is
+ * still recorded on `RecordedRequest.url` for tests that want to assert it.
+ */
+function foreignOauth2Record(overrides: Record<string, unknown> = {}) {
+  return credentialRecord({
+    id: FOREIGN_CREDENTIAL_ID,
+    provider_id: OTHER_PROVIDER_ID,
+    credential_type: "oauth2",
+    display_name: "Someone else's OAuth2 credential",
+    ...overrides,
+  });
+}
+
 function handlers(overrides: Record<string, StubHandler> = {}): Record<string, StubHandler> {
   return {
     [PROVIDER_LIST]: () => ({ status: 200, body: page([]) }),
     [PROVIDER_CREATE]: () => ({ status: 201, body: providerRecord() }),
     [PROVIDER_ENABLE]: () => ({ status: 200, body: providerRecord({ status: "active", version: 2 }) }),
-    [CREDENTIAL_LIST]: () => ({ status: 200, body: page([]) }),
+    // NOT an empty page: the unfiltered global list realistically carries other
+    // providers' rows, and the chain must ignore them.
+    [CREDENTIAL_LIST]: () => ({ status: 200, body: page([foreignOauth2Record()]) }),
     [CREDENTIAL_CREATE]: () => ({ status: 201, body: credentialRecord() }),
     [CREDENTIAL_ROTATE]: () => ({ status: 200, body: credentialRecord({ version: 2 }) }),
     [CREDENTIAL_ENABLE]: () => ({ status: 200, body: credentialRecord({ status: "active", version: 3 }) }),
+    [FOREIGN_ROTATE]: () => ({ status: 200, body: foreignOauth2Record({ version: 2 }) }),
+    [FOREIGN_ENABLE]: () => ({ status: 200, body: foreignOauth2Record({ status: "active", version: 3 }) }),
     ...overrides,
   };
 }
@@ -198,6 +236,44 @@ describe("connectClaudeSubscription — the oauth2 credential", () => {
     await connectClaudeSubscription(client, { accessToken: TOKEN });
     expect(stub.routes()).toContain(CREDENTIAL_CREATE);
     expect(stub.routes()).not.toContain(CREDENTIAL_ROTATE);
+  });
+
+  test("never rotates another provider's oauth2 row — the server's provider_id filter is inert", async () => {
+    // The only oauth2 row on the page belongs to OTHER_PROVIDER_ID. Rotating it
+    // would overwrite that credential's sealed secret with the Claude
+    // subscription token, in place and unrecoverably, and leave the dedicated
+    // provider with none. The chain must create instead.
+    const { stub, client } = clientFor({
+      [CREDENTIAL_LIST]: () => ({ status: 200, body: page([foreignOauth2Record()]) }),
+    });
+    const result = await connectClaudeSubscription(client, { accessToken: TOKEN });
+
+    expect(stub.routes()).not.toContain(FOREIGN_ROTATE);
+    expect(stub.routes()).not.toContain(FOREIGN_ENABLE);
+    expect(stub.routes()).toContain(CREDENTIAL_CREATE);
+    expect((stub.bodyOf(CREDENTIAL_CREATE) as Record<string, unknown>)["provider_id"]).toBe(PROVIDER_ID);
+    expect(result).toEqual({
+      providerId: PROVIDER_ID,
+      credentialId: CREDENTIAL_ID,
+      outcome: "created",
+    });
+    // The filter is still sent, so the console becomes correct for free if
+    // Moira ever honours it — but nothing above depends on that.
+    const listed = stub.requestsFor(CREDENTIAL_LIST)[0];
+    expect(new URL(listed!.url).searchParams.get("provider_id")).toBe(PROVIDER_ID);
+  });
+
+  test("a foreign oauth2 row does not shadow this provider's own row", async () => {
+    // Ordering matters: the foreign row is FIRST on the page, so a predicate
+    // that matches on credential_type alone picks it and rotates the wrong row.
+    const { stub, client } = clientFor({
+      [CREDENTIAL_LIST]: () => ({ status: 200, body: page([foreignOauth2Record(), credentialRecord()]) }),
+    });
+    const result = await connectClaudeSubscription(client, { accessToken: TOKEN });
+
+    expect(stub.routes()).toContain(CREDENTIAL_ROTATE);
+    expect(stub.routes()).not.toContain(FOREIGN_ROTATE);
+    expect(result.credentialId).toBe(CREDENTIAL_ID);
   });
 
   test("rotates an existing oauth2 credential in place rather than creating a second row", async () => {
