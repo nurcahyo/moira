@@ -2873,7 +2873,8 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
       "console refused to guess rather than risk creating a duplicate provider row.",
   },
 
-  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up) ------------- */
+  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up; two-phase
+         async job per issue #269) ------------------------------------------ */
   [K.claude_subscription_cli_heading]: {
     key: K.claude_subscription_cli_heading,
     message: "Acquire automatically",
@@ -2882,13 +2883,15 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   [K.claude_subscription_cli_intro]: {
     key: K.claude_subscription_cli_intro,
     message:
-      "Runs the claude CLI on this console's own host and stores the token it prints, " +
-      "without you having to run or paste anything. Only available when an administrator " +
-      "has turned this on for this deployment, and only useful when the CLI on this host is " +
-      "already signed in to a Claude subscription.",
+      "Runs the claude CLI on this console's own host. Signing in is interactive — you may " +
+      "need to open a browser tab and finish a login before this finishes — so this can take " +
+      "a few minutes. Only available when an administrator has turned this on for this " +
+      "deployment, and only useful when the CLI on this host can reach a Claude subscription.",
     description:
-      "Explains Mode A in the panel. Deliberately does not name the opt-in environment " +
-      "variable — that belongs to deployment configuration, not to translatable copy.",
+      "Explains Mode A in the panel, including that it is now a two-phase job the operator " +
+      "may need to interact with, not an instant mint (issue #269). Deliberately does not " +
+      "name the opt-in environment variable — that belongs to deployment configuration, not " +
+      "to translatable copy.",
   },
   [K.claude_subscription_cli_submit]: {
     key: K.claude_subscription_cli_submit,
@@ -2904,8 +2907,22 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   },
   [K.claude_subscription_cli_pending]: {
     key: K.claude_subscription_cli_pending,
-    message: "Running the CLI...",
-    description: "Announced politely while the CLI-mint request is in flight.",
+    message: "Starting the claude CLI...",
+    description: "Announced politely while the acquire/start request is in flight (issue #269).",
+  },
+  [K.claude_subscription_cli_awaiting_login]: {
+    key: K.claude_subscription_cli_awaiting_login,
+    message: "Waiting for the sign-in to finish. This can take a few minutes.",
+    description:
+      "Announced politely while a Mode A job is running and the panel is polling " +
+      "acquire/status (issue #269). Paired with the authorization link when one is known.",
+  },
+  [K.claude_subscription_cli_open_link]: {
+    key: K.claude_subscription_cli_open_link,
+    message: "Open sign-in page",
+    description:
+      "Link text for the authorization URL a Mode A job reports, when one is known. Opens in " +
+      "a new tab; see ConnectClaudeSubscriptionPanel.tsx.",
   },
   [K.claude_subscription_cli_disabled_notice]: {
     key: K.claude_subscription_cli_disabled_notice,
@@ -2919,6 +2936,18 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.claude_subscription_cli_disabled,
     message: "This deployment has not turned on automatic acquisition.",
     description: "403 from the acquire endpoint itself, in case the button was reachable anyway.",
+  },
+  [K.claude_subscription_cli_pty_unavailable]: {
+    key: K.claude_subscription_cli_pty_unavailable,
+    message:
+      "This host cannot run the interactive sign-in: it has no terminal to give the Claude CLI. " +
+      "Run `claude setup-token` in a terminal and paste the token below instead.",
+    description:
+      "409 from acquire/start, refused BEFORE spawning anything. `ptyIsAvailable()` " +
+      "(lib/claude-cli.ts) is an honest capability statement, not a per-host probe: neither a " +
+      "plain pipe nor wrapping the spawn in the system `script(1)` was found to give the CLI a " +
+      "real terminal from inside a server process (both measured; see that module's header), so " +
+      "this is reached on every host today, not only a minimal/distroless one.",
   },
   [K.claude_subscription_cli_binary_missing]: {
     key: K.claude_subscription_cli_binary_missing,
@@ -2934,13 +2963,18 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   },
   [K.claude_subscription_cli_timeout]: {
     key: K.claude_subscription_cli_timeout,
-    message: "The claude CLI did not finish in time.",
-    description: "The process ran past the acquire endpoint's bounded timeout and was killed.",
+    message:
+      "Signing in through the claude CLI exceeded the time this console allows. Run " +
+      "claude setup-token yourself in a terminal, then paste the result in the field below.",
+    description:
+      "issue #269: the job's wall-clock budget (minutes, not the old 20-second exec timeout) " +
+      "expired before the CLI exited. Must name the paste fallback by rule — see this key's " +
+      "own history before softening the wording.",
   },
   [K.claude_subscription_cli_output_too_large]: {
     key: K.claude_subscription_cli_output_too_large,
     message: "The claude CLI printed more output than the console will read.",
-    description: "The process exceeded the acquire endpoint's bounded output size and was killed.",
+    description: "The process exceeded the acquire job's bounded output size and was killed.",
   },
   [K.claude_subscription_cli_failed]: {
     key: K.claude_subscription_cli_failed,
@@ -2952,6 +2986,19 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.claude_subscription_cli_invalid_output,
     message: "The claude CLI did not print anything the console recognizes as a token.",
     description: "The process exited zero but stdout carried no non-empty line to use.",
+  },
+  [K.claude_subscription_cli_job_not_found]: {
+    key: K.claude_subscription_cli_job_not_found,
+    message: "This acquisition attempt is no longer being tracked. Start again.",
+    description:
+      "acquire/status polled a job id the in-process registry has no record of — most likely " +
+      "the console restarted, or the job was already swept after finishing. Never a 500: the " +
+      "registry is in-process by design (issue #269), so this is an expected, keyed outcome.",
+  },
+  [K.claude_subscription_cli_invalid_job]: {
+    key: K.claude_subscription_cli_invalid_job,
+    message: "That request did not name a valid acquisition attempt.",
+    description: "acquire/status called with a missing, empty, or oversized `job` query parameter.",
   },
 
   /* --- Mode B: an official Anthropic Console API key ------------------------ */

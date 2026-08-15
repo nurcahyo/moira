@@ -85,12 +85,20 @@ export const LLM_ENDPOINTS = {
    */
   claudeSubscription: "/api/settings/llm/claude-subscription",
   /**
-   * Mode A — mint the token server-side by running the local `claude` CLI,
-   * then store it through the SAME chain `claudeSubscription` uses. Nested
-   * under the paste endpoint's own path because it is the same credential
-   * shape, obtained a different way — not a sibling feature.
+   * Mode A, phase 1 of 2 (issue #269) — spawn the local `claude` CLI
+   * DETACHED from the request and return a job id immediately; never blocks
+   * on the (minutes-long, human-speed) login. Nested under the paste
+   * endpoint's own path because it stores the same credential shape,
+   * obtained a different way — not a sibling feature.
    */
-  claudeSubscriptionAcquire: "/api/settings/llm/claude-subscription/acquire",
+  claudeSubscriptionAcquireStart: "/api/settings/llm/claude-subscription/acquire/start",
+  /**
+   * Mode A, phase 2 of 2 — poll a job `acquire/start` returned. On success
+   * stores the token through the SAME chain `claudeSubscription` uses. Build
+   * the full URL with `claudeSubscriptionAcquireStatusUrl`, not this base
+   * alone — the job id travels as a query parameter.
+   */
+  claudeSubscriptionAcquireStatus: "/api/settings/llm/claude-subscription/acquire/status",
   /** Mode B — an official `sk-ant-…` API key, stored as `api_key`. */
   claudeApiKey: "/api/settings/llm/claude-api-key",
 } as const;
@@ -98,6 +106,11 @@ export const LLM_ENDPOINTS = {
 /** `/api/llm/providers/{id}` and the collections nested under it. */
 export function providerEndpoint(providerId: string, suffix = ""): string {
   return `${LLM_ENDPOINTS.providers}/${encodeURIComponent(providerId)}${suffix}`;
+}
+
+/** `GET .../acquire/status?job=…` for one Mode A job id. */
+export function claudeSubscriptionAcquireStatusUrl(jobId: string): string {
+  return `${LLM_ENDPOINTS.claudeSubscriptionAcquireStatus}?job=${encodeURIComponent(jobId)}`;
 }
 
 /* -------------------------------------------------------------------------- */

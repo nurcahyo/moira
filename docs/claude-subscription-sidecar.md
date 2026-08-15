@@ -134,18 +134,63 @@ duplicate.
 The panel offers three acquisition modes for the `oauth2` row above, plus a
 separate field for the one credential shape that is fully sanctioned today:
 
-- **Mode A — CLI-assisted (primary).** `POST /api/settings/llm/claude-subscription/acquire`
-  runs the locally installed `claude` CLI on the CONSOLE'S OWN HOST
-  (`lib/claude-cli.ts`) to mint the token itself — `claude setup-token`,
-  captured server-side, never sent to the browser — then stores it through the
-  exact same `connectClaudeSubscription` chain the paste mode below uses. This
-  is command execution on the console host, so it is gated behind an opt-in
-  environment variable, `CONSOLE_ALLOW_LOCAL_CLI_CREDENTIALS` (default `false`,
-  see `lib/env.ts`), and it is single-operator by nature: the CLI's signed-in
-  session on that host belongs to whoever ran `claude login` there. Treat it as
+- **Mode A — CLI-assisted (primary), a two-phase async job (issue #269).**
+  `claude setup-token` is INTERACTIVE — it opens a browser, starts a loopback
+  listener, and waits for a human to finish an OAuth login, which takes
+  minutes. An earlier version of this mode ran it through a single bounded
+  `execFile` call with a 20-second timeout; that reliably killed the CLI
+  mid-login and returned an opaque 409. It is now two console-only routes,
+  both in `lib/claude-cli.ts`'s in-process job registry:
+  - `POST /api/settings/llm/claude-subscription/acquire/start` spawns
+    `claude setup-token` on the CONSOLE'S OWN HOST, DETACHED from the
+    request, and returns `{ job_id, authorization_url }` immediately — it
+    never waits for the child.
+  - `GET /api/settings/llm/claude-subscription/acquire/status?job=…` polls
+    the job. `running` while the child is alive; on `succeeded`, the FIRST
+    poll to observe it stores the token through the exact same
+    `connectClaudeSubscription` chain the paste mode below uses (never
+    sending the raw token to the browser, and never storing it twice); on
+    `failed`, a keyed, actionable message — including, once the job's
+    multi-minute budget is exhausted, one that names the paste fallback
+    (Mode C) by rule.
+
+  **Known limitation, found while building this (not merely theorized):**
+  `claude setup-token`'s interactive UI is built on Ink and renders NOTHING
+  over a plain pipe — verified locally by piping its stdin from `/dev/null`
+  and capturing stdout+stderr for a full 10 seconds with no timeout at all:
+  0 bytes on both streams. The SAME command under a pseudo-terminal (macOS
+  `script -q <file> claude setup-token`) renders a spinner and an
+  authorization URL. So today, with the shipped (plain-pipe) executor,
+  `authorization_url` stays `null` for a real job's whole life and every real
+  job ends in the timeout failure — never `succeeded`. Making the URL
+  actually appear would need a per-spawn pseudo-terminal, which Node's
+  `child_process` cannot allocate on its own; the standard fix is the native
+  `node-pty` package. That is a new native dependency shipped into a
+  distroless, Trivy-gated production image (`console/Dockerfile`) for a mode
+  this document already scopes as local/dev-oriented — a call left to the
+  owner rather than made unilaterally by whoever fixed the timeout. The
+  `ProcessSpawner` seam in `lib/claude-cli.ts` is where a pty-capable
+  executor would plug in; nothing in the job registry or either route would
+  need to change.
+
+  This is command execution on the console host either way, so it stays
+  gated behind an opt-in environment variable,
+  `CONSOLE_ALLOW_LOCAL_CLI_CREDENTIALS` (default `false`, see `lib/env.ts`),
+  and it is single-operator by nature: the CLI's signed-in session on that
+  host belongs to whoever ran `claude login` there. Treat it as
   local/dev-oriented, not a fit for a console host shared across operators.
   There is deliberately **no browser OAuth flow** feeding this mode or any
   other — see "Why not a browser PKCE flow" below.
+
+  **Also investigated and found to not exist:** a documented, non-private way
+  to detect an already-authenticated local CLI session and read its credential
+  directly, which would avoid the browser round trip entirely. `claude auth
+  status` (documented, non-interactive) reports login state — email, org,
+  subscription plan — but never a token, and `claude setup-token --help`
+  lists no non-interactive flag. The only way to read a reusable credential
+  without going through `setup-token` would be the CLI's own local credential
+  store, which is exactly the "reverse-engineered" shape this workstream
+  rules out.
 - **Mode B — an official Anthropic Console API key.** A single field on the
   same panel stores an `sk-ant-…` key as `credential_type: "api_key"`, on a
   SEPARATE dedicated provider row (`display_name: "Anthropic (API key)"`) —
@@ -273,6 +318,7 @@ readiness signal.
   console-side pieces (`lib/claude-subscription.ts`, `lib/claude-cli.ts`,
   `modules/llm/ConnectClaudeSubscriptionPanel.tsx`,
   `app/api/settings/llm/claude-subscription/route.ts`,
-  `app/api/settings/llm/claude-subscription/acquire/route.ts`,
+  `app/api/settings/llm/claude-subscription/acquire/start/route.ts`,
+  `app/api/settings/llm/claude-subscription/acquire/status/route.ts`,
   `app/api/settings/llm/claude-api-key/route.ts`) sit relative to the rest of
   the console.

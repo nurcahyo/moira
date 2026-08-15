@@ -514,20 +514,26 @@ export const CONSOLE_MESSAGE_KEYS = {
   claude_subscription_request_body_invalid: "console.claudeSubscription.request_body_invalid",
   claude_subscription_list_truncated: "console.claudeSubscription.list_truncated",
 
-  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up) ------------ */
+  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up; two-phase
+         async job per issue #269) --------------------------------------- */
   claude_subscription_cli_heading: "console.claudeSubscription.cli_heading",
   claude_subscription_cli_intro: "console.claudeSubscription.cli_intro",
   claude_subscription_cli_submit: "console.claudeSubscription.cli_submit",
   claude_subscription_cli_reacquire: "console.claudeSubscription.cli_reacquire",
   claude_subscription_cli_pending: "console.claudeSubscription.cli_pending",
+  claude_subscription_cli_awaiting_login: "console.claudeSubscription.cli_awaiting_login",
+  claude_subscription_cli_open_link: "console.claudeSubscription.cli_open_link",
   claude_subscription_cli_disabled_notice: "console.claudeSubscription.cli_disabled_notice",
   claude_subscription_cli_disabled: "console.claudeSubscription.cli_disabled",
+  claude_subscription_cli_pty_unavailable: "console.claudeSubscription.cli_pty_unavailable",
   claude_subscription_cli_binary_missing: "console.claudeSubscription.cli_binary_missing",
   claude_subscription_cli_not_signed_in: "console.claudeSubscription.cli_not_signed_in",
   claude_subscription_cli_timeout: "console.claudeSubscription.cli_timeout",
   claude_subscription_cli_output_too_large: "console.claudeSubscription.cli_output_too_large",
   claude_subscription_cli_failed: "console.claudeSubscription.cli_failed",
   claude_subscription_cli_invalid_output: "console.claudeSubscription.cli_invalid_output",
+  claude_subscription_cli_job_not_found: "console.claudeSubscription.cli_job_not_found",
+  claude_subscription_cli_invalid_job: "console.claudeSubscription.cli_invalid_job",
 
   /* --- Mode B: an official Anthropic Console API key ----------------------- */
   claude_api_key_heading: "console.claudeApiKey.heading",
