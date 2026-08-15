@@ -232,6 +232,69 @@ describe("credential-carrying modules are marked and contained", () => {
   });
 });
 
+/**
+ * Matches the `Authorization` HTTP header by name, in the three syntactic
+ * shapes CODE that builds or reads it actually takes:
+ *
+ *   1. an UNQUOTED object key — `{ Authorization: value }`;
+ *   2. a PROPERTY ACCESS — `headers.Authorization`;
+ *   3. a QUOTED word, used exactly alone — `"Authorization"`, `'Authorization'`,
+ *      `` `Authorization` `` — which covers every remaining call shape a header
+ *      is set or read through: `headers["Authorization"]`,
+ *      `headers.set("Authorization", …)`, `headers.get("Authorization")`, a
+ *      quoted object key, and so on, because all of them quote the word with
+ *      nothing else inside the quotes.
+ *
+ * ============================================================================
+ * TWO DIFFERENT FALSE POSITIVES, TWO DIFFERENT REASONS NEITHER SIMPLER PATTERN
+ * WORKS
+ * ============================================================================
+ *
+ * A bare substring check (`.not.toContain("Authorization")`, this guard's
+ * original form) flags any IDENTIFIER that merely contains the word —
+ * `lib/types.ts`'s `ClaudeRunnerAuthorizationCodeRequest` (issue #275/#272
+ * workstream R3, an OAuth authorization-CODE type name, not a header).
+ *
+ * A naive WORD-BOUNDARY check (`/(?<![\w$])Authorization(?![\w$])/`, this
+ * guard's own first attempted fix) repairs that, but breaks a DIFFERENT case
+ * the same wave introduced: `lib/i18n/catalog.en.ts`'s operator-facing copy
+ * "Authorization URL" and "Authorization code" (the labels on the runner
+ * detail page's authorization-URL field and code-paste field) — plain English
+ * prose that happens to start with the same word, which a whole-word check
+ * cannot tell apart from `{ Authorization: token }`.
+ *
+ * What actually distinguishes header-CODE from either false positive: header
+ * code always quotes "Authorization" ALONE (nothing else inside the quotes) or
+ * uses it as a bare property/key, and is never followed by a plain-English
+ * continuation word. "Authorization URL" fails alternative 3 because the
+ * quoted string is `"Authorization URL"`, not `"Authorization"` — there is no
+ * quote character immediately after the word itself, only after "URL". The
+ * three alternatives above are what encode that distinction; a single regex
+ * covering all three could not read shorter without losing one of them.
+ *
+ * Exported as its own named pattern, not inlined into the assertion below, so
+ * the positive- and negative-control tests in the next `describe` block
+ * exercise the REAL pattern rather than a hand-copied stand-in that could
+ * silently drift from it — which is exactly how this guard's PREVIOUS repair
+ * shipped broken and untested.
+ */
+const AUTHORIZATION_HEADER_PATTERN = new RegExp(
+  [
+    // 1. Unquoted object key: `Authorization:` (optional surrounding
+    //    whitespace before the colon), not preceded or followed by another
+    //    identifier character — excludes `ClaudeRunnerAuthorizationCodeRequest`.
+    String.raw`(?<![A-Za-z0-9_$])Authorization(?![A-Za-z0-9_$])\s*:`,
+    // 2. Property access: `headers.Authorization`.
+    String.raw`\.\s*Authorization(?![A-Za-z0-9_$])`,
+    // 3. The word alone, quoted — nothing else between the quotes. Matches
+    //    `"Authorization"` wherever it appears (bracket access, a `.get(...)`/
+    //    `.set(...)` argument, a quoted object key) and NEVER matches
+    //    `"Authorization URL"` or `"Authorization code"`, because the character
+    //    immediately after the word is a space, not the closing quote.
+    String.raw`(["'\`])Authorization\1`,
+  ].join("|"),
+);
+
 describe("the client-safe modules really are client-safe", () => {
   for (const moduleName of CLIENT_SAFE_MODULES) {
     test(`${moduleName} names no credential header and reads no credential`, () => {
@@ -241,21 +304,74 @@ describe("the client-safe modules really are client-safe", () => {
       // mention the header name because that module is server-only.
       const codeOnly = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "");
       expect(codeOnly).not.toContain("X-Moira-System-Key");
-      // The `Authorization` HEADER, matched as its own quoted string token
-      // (`headers["Authorization"]`, `headers['Authorization']`) rather than as
-      // a bare substring. A plain `.not.toContain("Authorization")` also matches
-      // any identifier that happens to contain the word — `lib/types.ts`'s
-      // `ClaudeRunnerAuthorizationCodeRequest` (issue #275/#272 workstream R3,
-      // the OAuth AUTHORIZATION CODE a runner's operator pastes back, which is
-      // not a header and not a credential) is exactly such a false positive.
-      // The regex still catches the real failure mode — a client-safe module
-      // building or reading the `Authorization` header — because that is always
-      // written as the exact quoted string, never as a substring of a longer
-      // identifier.
-      expect(codeOnly).not.toMatch(/(["'`])Authorization\1/);
+      // The `Authorization` HEADER — see `AUTHORIZATION_HEADER_PATTERN`'s own
+      // doc comment above for what it matches, what it deliberately does not,
+      // and the two different false positives (one identifier, one i18n copy)
+      // that ruled out simpler patterns. Pinned by the positive AND negative
+      // controls in the `describe` block below: a guard nobody tests is a
+      // guard that can quietly stop guarding, which is exactly how this one's
+      // first repair shipped.
+      expect(codeOnly).not.toMatch(AUTHORIZATION_HEADER_PATTERN);
       expect(codeOnly).not.toMatch(/process\.env/);
     });
   }
+
+  describe("AUTHORIZATION_HEADER_PATTERN itself", () => {
+    test("POSITIVE CONTROL — an unquoted object key is caught", () => {
+      // The exact defect a prior revision of this guard had: a quoted-string
+      // pattern (`/(["'\`])Authorization\1/`) does not match this at all, so a
+      // client-safe module could have built the header this way and the suite
+      // would have stayed green.
+      expect("fetch(url, { headers: { Authorization: `Bearer ${token}` } })").toMatch(
+        AUTHORIZATION_HEADER_PATTERN,
+      );
+    });
+
+    test("POSITIVE CONTROL — property access is caught", () => {
+      expect("headers.Authorization = token;").toMatch(AUTHORIZATION_HEADER_PATTERN);
+    });
+
+    test("POSITIVE CONTROL — every quoted spelling is still caught", () => {
+      for (const quoted of ['"Authorization"', "'Authorization'", "`Authorization`"]) {
+        expect(quoted).toMatch(AUTHORIZATION_HEADER_PATTERN);
+      }
+    });
+
+    test("POSITIVE CONTROL — bracket access and a Headers-API call are caught", () => {
+      // Both are covered by alternative 3 (the word quoted alone) rather than
+      // needing their own alternative — see the pattern's own doc comment.
+      expect('headers["Authorization"] = value;').toMatch(AUTHORIZATION_HEADER_PATTERN);
+      expect('headers.get("Authorization")').toMatch(AUTHORIZATION_HEADER_PATTERN);
+      expect('headers.set("Authorization", value)').toMatch(AUTHORIZATION_HEADER_PATTERN);
+    });
+
+    test("NEGATIVE CONTROL — an identifier that merely contains the word is not caught", () => {
+      // The false positive this guard exists to fix — issue #275/#272 R3's
+      // `ClaudeRunnerAuthorizationCodeRequest`, an OAuth authorization CODE
+      // type name, not a header.
+      expect("export interface ClaudeRunnerAuthorizationCodeRequest {").not.toMatch(
+        AUTHORIZATION_HEADER_PATTERN,
+      );
+      expect('schema: "ClaudeRunnerAuthorizationCodeRequest",').not.toMatch(
+        AUTHORIZATION_HEADER_PATTERN,
+      );
+    });
+
+    test("NEGATIVE CONTROL — the case-sensitive, unrelated authorization_url field is not caught", () => {
+      expect("authorization_url?: string | null;").not.toMatch(AUTHORIZATION_HEADER_PATTERN);
+    });
+
+    test("NEGATIVE CONTROL — operator-facing i18n copy that starts with the word is not caught", () => {
+      // The SECOND false positive, found only after fixing the first: a naive
+      // whole-word check (this guard's own first attempted repair) flags these
+      // too. `lib/i18n/catalog.en.ts`'s real entries, verbatim — the labels on
+      // the runner detail page's authorization-URL field and code-paste field
+      // (issue #275/#272 workstream R3), plain English prose that happens to
+      // start with the header's name.
+      expect('message: "Authorization URL",').not.toMatch(AUTHORIZATION_HEADER_PATTERN);
+      expect('message: "Authorization code",').not.toMatch(AUTHORIZATION_HEADER_PATTERN);
+    });
+  });
 });
 
 describe("the error boundary is enforced in one place", () => {
@@ -592,9 +708,9 @@ describe("the credential DTOs are contained rather than exempted", () => {
     // A parser that found nothing would make every pin below vacuous.
     const source = readFileSync(join(CONSOLE_ROOT, CREDENTIAL_DTO_MODULE), "utf8");
     const interfaces = extractInterfaces(CREDENTIAL_DTO_MODULE, source, "[A-Za-z0-9_]+");
-    expect(interfaces.filter((declared) => declared.members.length > 0).length).toBeGreaterThanOrEqual(
-      5,
-    );
+    expect(
+      interfaces.filter((declared) => declared.members.length > 0).length,
+    ).toBeGreaterThanOrEqual(5);
   });
 
   test("every secret-shaped interface in the module is pinned", () => {
