@@ -181,7 +181,24 @@ tl_count_skips() {
 # `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
 # with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
 # 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
-TL_TEST_COUNT_MINIMUM=1588
+#
+# Re-measured 2026-08-16 on `feat/runner-service-docker-engine` (issue #273, workstream R1 of
+# #272), rebased on `develop` at 05dbf9c: **1699** passed, source declaring 1693, by
+# `scripts/gates.sh` with Postgres and Redis up and zero skip lines. That branch adds 108 tests
+# — 92 unit tests under `src/runner/**` and 16 in `tests/runner_control_plane.rs` — so 1588 +
+# 108 = 1696, and the remaining 3 are `tests/runner_docker_engine.rs`, which is opt-in against
+# a real Docker daemon and *passes by returning early* when the opt-in is absent. That is worth
+# naming: those three count toward `passed` in every environment, including CI, precisely
+# because they are early-return-and-pass rather than `#[ignore]`d, which would count toward
+# `declared` and never toward `passed`. The +6 doctest offset holds again.
+#
+# Re-measured 2026-08-16 after rebasing that same branch onto `develop` at c19076b, which is
+# R2 (#282, the Moira-side orchestration of these runners): **1738** passed, source declaring
+# 1732, by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. 39 of that is
+# R2's own suite — it added tests without moving this line, which is the drift this file keeps
+# warning about and keeps accumulating — and 1 is the `ATTACH_HOLD` guard this branch added
+# after R2 landed. The +6 doctest offset holds for the sixth consecutive measurement.
+TL_TEST_COUNT_MINIMUM=1738
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

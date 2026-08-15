@@ -35,6 +35,18 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
+# Docker Engine API client, used by the SECOND binary only (`src/bin/moira-runner.rs`).
+# The `moira` binary must never reach the Docker socket — socket access is root-equivalent
+# on the host — so every call into this crate is confined to `src/runner/docker_engine.rs`
+# behind the `ContainerEngine` trait, and a unit test in `src/runner/mod.rs` pins that the
+# `bollard` import appears in exactly one file.
+#
+# Default features are `["http", "pipe"]` and both are load-bearing: `pipe` supplies the
+# unix-socket and named-pipe transports (`/var/run/docker.sock`, the normal case) and
+# `http` supplies the TCP transport that `DOCKER_HOST=tcp://…` selects. `connect_with_defaults`
+# dispatches on `DOCKER_HOST` at runtime, so dropping either feature turns a working
+# operator configuration into a startup failure.
+bollard = "0.21"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 futures-util = "0.3"
@@ -73,6 +85,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", features = ["chrono", "json", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+# Already in the tree transitively (aes-gcm, argon2, jsonwebtoken); made direct because
+# `src/runner/token.rs` compares the runner control token with `ConstantTimeEq` and a
+# transitive version is not a version this crate may rely on. Same reasoning as `zeroize`
+# below. BSD-3-Clause, already on `deny.toml`'s allow-list for exactly this crate.
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

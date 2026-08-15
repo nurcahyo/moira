@@ -14,7 +14,9 @@ src/
   i18n/            response message-key catalog and default English strings
   infra/           Postgres pools, migrations, listeners, SQL row mapping
   orchestration/   runtime and provider-handle caches, execution controls, Rig execution
+  runner/          moira-runner: the containerised Claude runner control plane (second binary)
   security/        JWT/JWKS auth, caller identity, encryption
+  bin/             additional binaries — currently `moira-runner.rs` only
   error.rs         shared app error and HTTP error mapping
 migrations/        append-only SQL migrations
 config/            default process config
@@ -30,6 +32,7 @@ skills/            repo-local agent skills
 - `i18n` is the single registry of `moira.error.*` and `moira.notice.*` keys with their default English strings, mirrored into `docs/i18n-response-catalog.json`. A user-visible string added anywhere else is a bug.
 - `infra` owns external persistence and database decoding, including enum string conversion.
 - `orchestration` owns Moira runtime behavior: the runtime-config and provider-handle caches (`runtime_cache.rs`, `controls.rs`), provider base-URL normalisation (`provider_url.rs`), concurrency, rate limiting and circuit breaking, and the Rig boundary in `runtime_factory.rs`. Credential resolution is not here — it lives in `src/infra/repositories/runtime.rs`.
+- `runner` is a **second process**, not a layer of the first. It is the whole implementation of the `moira-runner` binary (`src/bin/moira-runner.rs`) and repeats the `http` → `service` → engine layering in miniature, scoped to one binary. It is the only place in the crate that may talk to the Docker Engine API, and `bollard` is imported by exactly one file inside it (`runner/docker_engine.rs`) — asserted by a unit test in `runner/mod.rs`, because Docker socket access is root-equivalent on the host. Nothing in the `moira` binary's path refers to it, it uses neither `Settings` nor the database, and its frozen `{"error": {"code", "message"}}` envelope is deliberately *not* `AppError`'s. See `docs/moira-runner.md`.
 - `security` owns trust and secret handling. Plaintext credentials should only exist in short-lived local variables. It holds no `PgPool` with **one deliberate exception, the content keyring**, which is two modules:
   - `security/data_keys.rs` reads it. Its rows *are* sealed key material, and its invariant — unwrapped exactly once, at boot, under a custody backend, or the process refuses to start — is a security rule rather than a storage one. Splitting the loader into `infra` would leave neither layer able to enforce it. It touches exactly one table, `content_data_keys`.
   - `security/keyring_admin.rs` changes it: the `moira keyring` verbs (`docs/decision-encryption-at-rest.md` §9). It lives beside the loader rather than in `infra` because their failure postures are opposites and only make sense together — the loader refuses to start on anything it cannot fully open, and these verbs must keep working on exactly that keyring, since `abandon` is reachable *only* after the loader has already refused. It is the one module in `src/security` that reads the five content tables, and it does so through migration `0027`'s `content_envelope_data_key_id()` — reference counts for the retirement audit, and `reseal`'s compare-and-swap. Its SQL identifiers come from the `AadProfile` registry, never from literals, so a sixth sealed column is counted by construction.
