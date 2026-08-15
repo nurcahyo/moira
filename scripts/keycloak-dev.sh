@@ -34,11 +34,14 @@ KEY_FILE="$CERT_DIR/tls.key"
 REALM_URL="https://127.0.0.1:8443/realms/moira/.well-known/openid-configuration"
 # First boot imports the realm and stands up the HTTPS listener; 2-4 minutes is
 # typical on a laptop. Polled at 1s, so this is a ceiling, not a wait.
-MAX_ATTEMPTS=300
+MAX_ATTEMPTS=600
 
 if [ "${1:-}" = "--down" ]; then
     printf 'compose  stopping the dev-idp profile (cert kept)\n'
-    docker compose --profile dev-idp down
+    # `stop`/`rm` the one service rather than `down`: `down` would also tear down the
+    # postgres and redis this repo's own `make up` started, which is not what stopping
+    # the IdP should mean.
+    docker compose --profile dev-idp rm --stop --force --volumes keycloak
     exit 0
 fi
 
@@ -57,7 +60,12 @@ else
 fi
 
 printf 'compose  starting the dev-idp profile (quay.io/keycloak/keycloak:26.4)\n'
-docker compose --profile dev-idp up -d
+# NAME THE SERVICE. `docker compose --profile dev-idp up -d` with no service argument
+# also starts every default-profile service — postgres and redis — which on the machine
+# this target exists for are already running from `make up`, so the run dies on
+# "Bind for 0.0.0.0:5432 failed: port is already allocated" before Keycloak is reachable.
+# Verified: without the explicit service, `make keycloak` fails on a normal dev machine.
+docker compose --profile dev-idp up -d keycloak
 
 printf 'realm    waiting for %s\n' "$REALM_URL"
 for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1)); do

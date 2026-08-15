@@ -12,7 +12,7 @@
     {
       "clientId": "moira-console",
       "name": "Moira console (local dev)",
-      "description": "LOCAL DEVELOPMENT ONLY — issue #260. The client secret below (moira-local-dev-secret) is a published dev value committed to the repo, not a real credential. Never reuse this realm export outside a laptop.",
+      "description": "LOCAL DEVELOPMENT ONLY \u2014 issue #260. The client secret below (moira-local-dev-secret) is a published dev value committed to the repo, not a real credential. Never reuse this realm export outside a laptop.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
@@ -59,6 +59,10 @@
           "value": "owner",
           "temporary": false
         }
+      ],
+      "requiredActions": [],
+      "realmRoles": [
+        "default-roles-moira"
       ]
     },
     {
@@ -74,6 +78,10 @@
           "value": "operator",
           "temporary": false
         }
+      ],
+      "requiredActions": [],
+      "realmRoles": [
+        "default-roles-moira"
       ]
     }
   ]
