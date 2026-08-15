@@ -25,10 +25,23 @@ existing `provider_models` row for these ids `deprecated` (and registers them de
 tenant never had them), for every configured `deepseek` provider. A `deprecated`
 `provider_models.status` already excludes the row from routing and from
 `GET /api/v1/models` / `GET /api/v1/routes` discovery — every candidate query in
-`src/infra/repositories/public.rs` filters on `pm.status = 'active'` — so no new status value or
-column was needed to retire them. Existing routing policies that still point at a now-deprecated
-`provider_model_id` keep resolving (the row still exists), but new discovery and new routing
-configuration should move to `deepseek-v4-flash` / `deepseek-v4-pro`.
+`src/infra/repositories/runtime.rs` and `src/infra/repositories/public.rs` filters on
+`pm.status = 'active'` — so no new status value or column was needed to retire them.
+
+**A routing policy that still names a deprecated model resolves to nothing.** The row continues
+to exist, but `list_model_candidates` joins `provider_models` on `pm.status = 'active'`, so the
+policy contributes no candidate and, if it was the route's only one, the route stops producing
+candidates at all. `0028` alone would therefore have broken every deployment routing to DeepSeek
+at the moment it migrated. Migration
+`0035_deepseek_legacy_aliases_do_not_strand_routing_policies.sql` closes that: it repoints every
+live policy naming a retired alias onto the current-generation model on the same provider —
+`deepseek-chat` to `deepseek-v4-flash`, `deepseek-reasoner` to `deepseek-v4-pro` — and records
+what it moved off in `routing_policies.metadata -> 'deepseek_v4_repoint'`, so the substitution is
+visible per policy and reversible with a single PATCH. It skips a policy whose scope already has
+a live policy for the successor, to avoid putting the same candidate in one fallback chain twice.
+
+New discovery and new routing configuration should name `deepseek-v4-flash` /
+`deepseek-v4-pro` directly.
 
 ## Capabilities
 

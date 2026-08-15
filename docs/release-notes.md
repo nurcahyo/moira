@@ -8,6 +8,78 @@ changelog.
 
 ## Unreleased
 
+### DeepSeek routing policies are repointed off the retired aliases, and `0030` can stall a busy fleet on the way in
+
+Two migration findings from the plan-12 review: [#256](https://github.com/nurcahyo/moira/issues/256)
+finding 1 and [#250](https://github.com/nurcahyo/moira/issues/250) finding 1. One changes rows on
+upgrade; the other is a cost you may want to avoid paying during traffic.
+
+**Your DeepSeek routing policies move to the v4 ids.** `0028` retired `deepseek-chat` and
+`deepseek-reasoner` to `deprecated`, and `deprecated` removes a model from candidate resolution —
+so a policy still naming one of them resolved to nothing, and a route with no other policy stopped
+answering, at the moment `0028` migrated. `0035` closes that by repointing every live policy onto
+the successor on the same provider: `deepseek-chat` to `deepseek-v4-flash`, `deepseek-reasoner` to
+`deepseek-v4-pro`. **This changes which model serves those routes.** Each repointed row records
+what it was moved off, so the change is auditable and reversible:
+
+```sql
+select id, route_id, provider_model_id, metadata -> 'deepseek_v4_repoint'
+  from routing_policies
+ where metadata ? 'deepseek_v4_repoint';
+```
+
+A policy whose scope already had a live policy for the successor is left alone rather than
+duplicated. Every repointed row's `version` bumps, so a client holding an old `If-Match` for one
+of them gets a `409` and must re-read.
+
+**`0030` takes ACCESS EXCLUSIVE on `execution_attempts` and holds it across a full scan.** That is
+one row per upstream provider attempt — the highest-volume table in the schema — and the lock is
+on the table, so for the length of the scan every execution in the fleet blocks, not just the
+migrating replica. `0034` re-installs the constraint in the non-blocking `NOT VALID` + `VALIDATE`
+shape this repository documents in `0027`, but **it cannot undo `0030`**: nothing appended after a
+migration changes what that migration does, and a shipped migration's bytes are not edited here
+because `sqlx` checksums them and a database that applied the old bytes then refuses to boot.
+
+If your `execution_attempts` is small, or this install is new, ignore this — the scan is instant on
+an empty table. Otherwise check first:
+
+```sql
+select count(*) from execution_attempts;
+```
+
+To skip the scan on a large table, apply `0030`'s effect by hand in the safe order **before**
+deploying, then record it as applied so the migrator does not repeat it:
+
+```sql
+alter table execution_attempts
+    add column if not exists candidate_rank integer,
+    add column if not exists candidate_score double precision,
+    add column if not exists selection_reason varchar(64);
+alter table execution_attempts
+    drop constraint if exists execution_attempts_selection_reason_valid;
+alter table execution_attempts
+    add constraint execution_attempts_selection_reason_valid check (
+        selection_reason is null
+        or selection_reason in ('priority', 'explicit_hint', 'scored', 'fallback_after_failure')
+    ) not valid;
+-- separate statement, after the commit above: SHARE UPDATE EXCLUSIVE, blocks nobody
+alter table execution_attempts
+    validate constraint execution_attempts_selection_reason_valid;
+```
+
+Then insert the ledger row, taking the checksum from a scratch database migrated from the same
+checkout rather than typing one — `select checksum from _sqlx_migrations where version = 30` — and
+using it here:
+
+```sql
+insert into _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
+values (30, 'execution attempt candidate observability', now(), true, '\x…'::bytea, 0);
+```
+
+A wrong checksum is not silent: the next boot fails with `VersionMismatch(30)` and applies nothing.
+`0034` then runs normally on top and is cheap, because it validates a constraint that already
+holds.
+
 ### Breaking: `encrypted_content` now actually encrypts, and rolling back past this release hides those rows
 
 Closes [#139](https://github.com/nurcahyo/moira/issues/139), the release-train step that turns the
