@@ -1,0 +1,66 @@
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.promptPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.status {
+  color: #555;
+  font-size: 0.875rem;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}
+
+.responsePanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 0.375rem;
+  padding: 1rem;
+}
+
+.responseHeading {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.empty {
+  margin: 0;
+  color: #555;
+}
+
+.responseText {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.9375rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .responsePanel {
+    border-color: rgba(255, 255, 255, 0.16);
+  }
+
+  .status,
+  .empty {
+    color: #9ca3af;
+  }
+}

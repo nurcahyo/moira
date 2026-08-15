@@ -169,6 +169,20 @@ const EXEMPT_DTO_FIELDS = [
   // as `maximum_input_tokens`/`maximum_output_tokens` above — matched by the
   // pattern's `token` alternative with no credential meaning under any reading.
   "max_tokens",
+  // Issue #261 (the playground). `max_output_tokens` (`PublicResponseRequest`)
+  // is the same integer token BUDGET as `max_tokens`/`maximum_output_tokens`
+  // above, just spelled differently on this schema. `cached_input_tokens`,
+  // `input_tokens`, `output_tokens`, `reasoning_tokens` and `total_tokens`
+  // (`PublicUsageSummary` and the distinct-but-field-identical `UsageSummary`
+  // — see that interface's own doc comment on why there are two) are all
+  // integer USAGE COUNTS a provider reports back, not credentials — the same
+  // trade as every entry above.
+  "max_output_tokens",
+  "cached_input_tokens",
+  "input_tokens",
+  "output_tokens",
+  "reasoning_tokens",
+  "total_tokens",
 ] as const;
 
 describe("credential-carrying modules are marked and contained", () => {

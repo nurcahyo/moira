@@ -2973,6 +2973,11 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message: "Evals",
     description: "Navigation link to `/evals`, the eval suite/case/run screen (plan 12 §3).",
   },
+  [K.chrome_nav_playground]: {
+    key: K.chrome_nav_playground,
+    message: "Playground",
+    description: "Navigation link to `/playground`, the test-chat screen (issue #261).",
+  },
   [K.chrome_nav_flows]: {
     key: K.chrome_nav_flows,
     message: "Flows",
@@ -3991,6 +3996,371 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     key: K.flows_run_created_label,
     message: "Flow run triggered",
     description: "Label for a flow run row's `created_at` timestamp.",
+  },
+
+  /* --- the /playground screen (issue #261) --------------------------------- */
+  [K.page_playground_title]: {
+    key: K.page_playground_title,
+    message: "Test playground",
+    description:
+      "Page `<h1>` for `/playground`. Deliberately not the same English as the nav link's " +
+      "`console.chrome.nav_playground` — same convention as `console.page.skills_title`.",
+  },
+  [K.playground_page_intro]: {
+    key: K.playground_page_intro,
+    message:
+      "Send a prompt through Moira's real execution path and see how it was routed — which candidate served, retries and failovers, latency and token usage. This is a testing tool, not a chat product: nothing sent here is saved as conversation history.",
+    description: "Intro paragraph under the page title.",
+  },
+  [K.playground_request_body_invalid]: {
+    key: K.playground_request_body_invalid,
+    message: "The console could not read that playground request.",
+    description: "400 when a playground BFF route's JSON body fails to parse at all.",
+  },
+  [K.playground_prompt_required]: {
+    key: K.playground_prompt_required,
+    message: "Enter a prompt before sending.",
+    description: "400 when the prompt field is missing or blank, and the client-side disabled-Send state's reason.",
+  },
+  [K.playground_run_failed]: {
+    key: K.playground_run_failed,
+    message: "The console could not reach the non-streaming execution endpoint.",
+    description:
+      "Fallback text for a transport failure calling `POST /api/playground/run`, before any Moira-supplied message is available.",
+  },
+  [K.playground_stream_failed]: {
+    key: K.playground_stream_failed,
+    message: "The console could not reach the streaming execution endpoint.",
+    description:
+      "Fallback text for a transport failure calling `POST /api/playground/stream`, before any Moira-supplied message is available.",
+  },
+  [K.playground_diagnose_failed]: {
+    key: K.playground_diagnose_failed,
+    message: "The console could not reach the diagnostics endpoint.",
+    description:
+      "Fallback text for a transport failure calling `POST /api/playground/diagnose`, before any Moira-supplied message is available.",
+  },
+  [K.playground_execution_summary_failed]: {
+    key: K.playground_execution_summary_failed,
+    message: "The routing summary for this run could not be loaded.",
+    description:
+      "Shown when the post-run `GET /api/playground/executions/{id}` follow-up fails; the response text itself is still shown.",
+  },
+  [K.playground_models_load_failed]: {
+    key: K.playground_models_load_failed,
+    message: "The model list for this provider could not be loaded.",
+    description: "Shown when `GET /api/playground/providers/{id}/models` fails after choosing a provider.",
+  },
+  [K.playground_pickers_load_failed]: {
+    key: K.playground_pickers_load_failed,
+    message: "Routes, agent profiles or providers could not be loaded. Controls are shown without their pickers.",
+    description:
+      "Non-fatal notice when the page's server-side route/agent-profile/provider reads fail — the page still renders, same posture as `/flows`'s agent-profile read.",
+  },
+
+  [K.playground_controls_heading]: {
+    key: K.playground_controls_heading,
+    message: "Controls",
+    description: "Heading of the collapsed-by-default `<details>` controls panel.",
+  },
+  [K.playground_field_route_label]: {
+    key: K.playground_field_route_label,
+    message: "Route override",
+    description: "Label for the route picker.",
+  },
+  [K.playground_field_route_none]: {
+    key: K.playground_field_route_none,
+    message: "Default routing (no override)",
+    description: "The route picker's empty option.",
+  },
+  [K.playground_field_agent_profile_label]: {
+    key: K.playground_field_agent_profile_label,
+    message: "Agent profile filter",
+    description: "Label for the agent-profile picker — named as a filter, because that is all it does; see the hint below.",
+  },
+  [K.playground_field_agent_profile_hint]: {
+    key: K.playground_field_agent_profile_hint,
+    message:
+      "There is no agent-profile field on the execution request — Moira resolves it from the selected route's own configuration. Choosing a profile here narrows the Route list below to routes wired to it, so the tool loop actually runs.",
+    description:
+      "Explains why this control filters Route rather than being sent on the wire — `agent_profile_hint` is hardcoded to `None` on `POST /api/v1/responses` (`src/application/public.rs`).",
+  },
+  [K.playground_field_agent_profile_none]: {
+    key: K.playground_field_agent_profile_none,
+    message: "Any route",
+    description: "The agent-profile filter's empty option — every route is shown.",
+  },
+  [K.playground_field_provider_label]: {
+    key: K.playground_field_provider_label,
+    message: "Provider override",
+    description: "Label for the provider picker.",
+  },
+  [K.playground_field_provider_none]: {
+    key: K.playground_field_provider_none,
+    message: "No provider override",
+    description: "The provider picker's empty option.",
+  },
+  [K.playground_field_model_label]: {
+    key: K.playground_field_model_label,
+    message: "Model override",
+    description: "Label for the model picker.",
+  },
+  [K.playground_field_model_none]: {
+    key: K.playground_field_model_none,
+    message: "No model override",
+    description: "The model picker's empty option.",
+  },
+  [K.playground_field_model_needs_provider]: {
+    key: K.playground_field_model_needs_provider,
+    message: "Choose a provider to list its models.",
+    description: "Shown in place of the model picker until a provider is selected.",
+  },
+  [K.playground_field_temperature_label]: {
+    key: K.playground_field_temperature_label,
+    message: "Temperature",
+    description: "Label for the temperature number input.",
+  },
+  [K.playground_field_max_tokens_label]: {
+    key: K.playground_field_max_tokens_label,
+    message: "Max output tokens",
+    description: "Label for the max-output-tokens number input.",
+  },
+  [K.playground_field_priority_label]: {
+    key: K.playground_field_priority_label,
+    message: "Priority",
+    description: "Label for the priority number input.",
+  },
+  [K.playground_field_priority_hint]: {
+    key: K.playground_field_priority_hint,
+    message:
+      "Only takes effect with Detailed diagnostics enabled — the streaming and non-streaming chat endpoints have no priority field at all. Scope-gated server-side (`moira:execution:override-priority`); a caller without that scope sees the refusal after sending, not a silently ignored value.",
+    description:
+      "Explains the field's real scope: `ExecutionOptions.priority` is reachable only through `POST /api/v1/admin/runtime/diagnose`.",
+  },
+  [K.playground_field_complexity_hint_label]: {
+    key: K.playground_field_complexity_hint_label,
+    message: "Complexity hint",
+    description: "Label for the complexity-tier picker. Same diagnostics-only scope as priority.",
+  },
+  [K.playground_complexity_none]: {
+    key: K.playground_complexity_none,
+    message: "Unset",
+    description: "The complexity-hint picker's empty option.",
+  },
+  [K.playground_complexity_trivial]: {
+    key: K.playground_complexity_trivial,
+    message: "Trivial",
+    description: "`ComplexityTier.trivial`.",
+  },
+  [K.playground_complexity_standard]: {
+    key: K.playground_complexity_standard,
+    message: "Standard",
+    description: "`ComplexityTier.standard`.",
+  },
+  [K.playground_complexity_heavy]: {
+    key: K.playground_complexity_heavy,
+    message: "Heavy",
+    description: "`ComplexityTier.heavy`.",
+  },
+  [K.playground_field_stream_toggle_label]: {
+    key: K.playground_field_stream_toggle_label,
+    message: "Stream the response",
+    description: "Label for the streaming/non-streaming fallback toggle. On by default.",
+  },
+  [K.playground_field_diagnostics_toggle_label]: {
+    key: K.playground_field_diagnostics_toggle_label,
+    message: "Detailed diagnostics (routing candidates + tool calls)",
+    description: "Label for the toggle that switches Send to `POST /api/playground/diagnose`.",
+  },
+  [K.playground_field_diagnostics_toggle_hint]: {
+    key: K.playground_field_diagnostics_toggle_hint,
+    message:
+      "Runs a separate, non-streaming diagnostic execution instead of the normal chat call — the only way to see per-candidate ranking, retries/failovers and tool invocations, because the streaming and non-streaming chat endpoints never emit them. Disabled on this deployment, or without the `moira:runtime:diagnose` scope, this will fail cleanly after sending rather than silently doing nothing.",
+    description:
+      "The core honesty note for issue #261's biggest gap: tool calls and candidate ranking are dropped from the public SSE stream by `map_runtime_event` and exist only via the diagnose endpoint.",
+  },
+
+  [K.playground_prompt_label]: {
+    key: K.playground_prompt_label,
+    message: "Prompt",
+    description: "Label for the prompt textarea.",
+  },
+  [K.playground_prompt_placeholder]: {
+    key: K.playground_prompt_placeholder,
+    message: "Ask the model something…",
+    description: "Placeholder text for the prompt textarea.",
+  },
+  [K.playground_send]: {
+    key: K.playground_send,
+    message: "Send",
+    description: "The submit button.",
+  },
+  [K.playground_stop]: {
+    key: K.playground_stop,
+    message: "Stop",
+    description: "The cancel button, shown only while a streaming request is in flight.",
+  },
+  [K.playground_status_idle]: {
+    key: K.playground_status_idle,
+    message: "Idle",
+    description: "Status line before the first send.",
+  },
+  [K.playground_status_sending]: {
+    key: K.playground_status_sending,
+    message: "Sending…",
+    description: "Status line for the non-streaming request while it is in flight.",
+  },
+  [K.playground_status_streaming]: {
+    key: K.playground_status_streaming,
+    message: "Streaming…",
+    description: "Status line while SSE frames are arriving.",
+  },
+  [K.playground_status_diagnosing]: {
+    key: K.playground_status_diagnosing,
+    message: "Running detailed diagnostics…",
+    description: "Status line while the non-streaming diagnostic call is in flight.",
+  },
+  [K.playground_status_cancelled]: {
+    key: K.playground_status_cancelled,
+    message: "Cancelled",
+    description: "Status line after the Stop button aborts an in-flight stream.",
+  },
+
+  [K.playground_response_heading]: {
+    key: K.playground_response_heading,
+    message: "Response",
+    description: "Heading of the response panel.",
+  },
+  [K.playground_response_empty]: {
+    key: K.playground_response_empty,
+    message: "Send a prompt to see the response here.",
+    description: "The response panel's empty state.",
+  },
+
+  [K.playground_routing_heading]: {
+    key: K.playground_routing_heading,
+    message: "Routing outcome",
+    description: "Heading of the routing-transparency panel.",
+  },
+  [K.playground_routing_route_label]: {
+    key: K.playground_routing_route_label,
+    message: "Route used",
+    description: "Label for the route that actually served the request.",
+  },
+  [K.playground_routing_model_label]: {
+    key: K.playground_routing_model_label,
+    message: "Model used",
+    description: "Label for the provider/model that actually served the request.",
+  },
+  [K.playground_routing_status_label]: {
+    key: K.playground_routing_status_label,
+    message: "Execution status",
+    description: "Label for the execution's terminal status.",
+  },
+  [K.playground_routing_latency_label]: {
+    key: K.playground_routing_latency_label,
+    message: "Latency",
+    description: "Label for `PublicExecutionSummary.latency_ms`.",
+  },
+  [K.playground_routing_attempt_count_label]: {
+    key: K.playground_routing_attempt_count_label,
+    message: "Attempts",
+    description: "Label for `PublicExecutionSummary.attempt_count` — how many candidates were tried, including retries and failovers.",
+  },
+  [K.playground_routing_usage_label]: {
+    key: K.playground_routing_usage_label,
+    message: "Token usage",
+    description: "Label for the usage summary.",
+  },
+  [K.playground_routing_usage_tokens]: {
+    key: K.playground_routing_usage_tokens,
+    message: "{input} in / {output} out / {total} total",
+    description: "Interpolated token-count line. `input`/`output`/`total` are `messageArgs`.",
+  },
+  [K.playground_routing_fallback_heading]: {
+    key: K.playground_routing_fallback_heading,
+    message: "Failover hops",
+    description: "Heading for the list of `response.fallback.selected` events observed live during a streamed run.",
+  },
+  [K.playground_routing_summary_pending]: {
+    key: K.playground_routing_summary_pending,
+    message: "Loading the routing summary…",
+    description: "Shown while the post-run `GET /api/playground/executions/{id}` follow-up is in flight.",
+  },
+  [K.playground_routing_summary_unavailable]: {
+    key: K.playground_routing_summary_unavailable,
+    message: "No routing summary yet — send a prompt first.",
+    description: "The routing panel's empty state, before any run has completed.",
+  },
+  [K.playground_routing_summary_public_note]: {
+    key: K.playground_routing_summary_public_note,
+    message:
+      "This is the routing detail available without extra permissions. Per-candidate rank/score and the reason each one was tried are only visible with Detailed diagnostics enabled.",
+    description: "Sits under the baseline (non-diagnostic) routing summary to set expectations honestly.",
+  },
+
+  [K.playground_diagnostics_heading]: {
+    key: K.playground_diagnostics_heading,
+    message: "Detailed diagnostics",
+    description: "Heading of the diagnostics-mode result panel.",
+  },
+  [K.playground_diagnostics_candidates_heading]: {
+    key: K.playground_diagnostics_candidates_heading,
+    message: "Candidate ranking",
+    description: "Heading for the `candidate_ranked` event's candidate list.",
+  },
+  [K.playground_diagnostics_candidate_rank_label]: {
+    key: K.playground_diagnostics_candidate_rank_label,
+    message: "Rank",
+    description: "Label for a candidate's `candidate_rank`.",
+  },
+  [K.playground_diagnostics_candidate_score_label]: {
+    key: K.playground_diagnostics_candidate_score_label,
+    message: "Candidate score",
+    description: "Label for a candidate's `candidate_score` — usually unset in this MVP-static routing slice.",
+  },
+  [K.playground_diagnostics_candidate_reason_label]: {
+    key: K.playground_diagnostics_candidate_reason_label,
+    message: "Selection reason",
+    description: "Label for a candidate's `selection_reason` (`AttemptSelectionReason`).",
+  },
+  [K.playground_diagnostics_attempts_heading]: {
+    key: K.playground_diagnostics_attempts_heading,
+    message: "Provider attempts",
+    description: "Heading for `ExecutionOutcome.attempts`.",
+  },
+  [K.playground_diagnostics_failure_heading]: {
+    key: K.playground_diagnostics_failure_heading,
+    message: "Failure",
+    description: "Heading shown when `ExecutionOutcome.failure` is present.",
+  },
+
+  [K.playground_tools_heading]: {
+    key: K.playground_tools_heading,
+    message: "Tool calls",
+    description: "Heading of the tool-call list.",
+  },
+  [K.playground_tools_empty]: {
+    key: K.playground_tools_empty,
+    message: "No tool calls on this run.",
+    description: "Shown in diagnostics mode when the run produced no `tool_call_*`/`tool_result` events.",
+  },
+  [K.playground_tools_unavailable_note]: {
+    key: K.playground_tools_unavailable_note,
+    message:
+      "Tool call activity is not visible on the streaming or non-streaming chat path — Moira's public execution API does not emit it. Enable Detailed diagnostics to see each tool invocation and its result.",
+    description:
+      "Shown in place of the tool-call list outside diagnostics mode. `tool_call_started`/`tool_call_delta`/`tool_call_completed`/`tool_result` are all dropped from the public SSE stream by `map_runtime_event`.",
+  },
+  [K.playground_tool_arguments_label]: {
+    key: K.playground_tool_arguments_label,
+    message: "Arguments",
+    description: "Label for a tool call's model-authored arguments (from `tool_call_started`).",
+  },
+  [K.playground_tool_outcome_label]: {
+    key: K.playground_tool_outcome_label,
+    message: "Outcome",
+    description: "Label for a tool call's outcome (from `tool_result`).",
   },
 };
 

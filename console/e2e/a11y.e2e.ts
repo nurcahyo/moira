@@ -172,6 +172,10 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   "/evals",
   // Plan 12 §6 — multi-agent flow authoring. Same gap shape as `/skills`.
   "/flows",
+  // Issue #261 — the test-chat playground. Same gap shape as `/skills`: gated
+  // like the rest of `(console)`, so the walker asserts the redirect and
+  // audits nothing. No authenticated spec renders this screen yet.
+  "/playground",
 ];
 
 /** The pathname a route's fixture URL resolves to. */

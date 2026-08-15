@@ -171,7 +171,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     expect(stub.requests[0]?.headers["Idempotency-Key"]).toBe("idem-1");
   });
 
-  test("exactly nineteen of the registry's operations declare a key", () => {
+  test("exactly twenty of the registry's operations declare a key", () => {
     // Every entry is read off the spec, not assumed;
     // `tests/contract/openapi-contract.test.ts` re-derives each flag from
     // `docs/openapi.json` on every run.
@@ -201,6 +201,14 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
     // a key, and none of enable/disable/bulk-enable/patch/delete does —
     // `bulkEnableSkills` in particular declares NEITHER this nor `If-Match`,
     // because it is a multi-row operation with no single row version.
+    //
+    // ONE MORE WITH ISSUE #261 (the playground): `createResponse` (`POST
+    // /api/v1/responses`, the non-streaming fallback) declares an OPTIONAL
+    // key, unlike every other entry above — the playground does not supply
+    // one (a replayed prompt should execute again, not silently return the
+    // first answer), which is legal since the header is declared, not
+    // required. `streamResponse` is NOT in this list: the spec explicitly
+    // rejects `Idempotency-Key` on the streaming operation.
     const withKey = (Object.keys(MOIRA_OPERATIONS) as MoiraOperationName[])
       .filter((name) => MOIRA_OPERATIONS[name].declaresIdempotencyKey)
       .sort();
@@ -215,6 +223,7 @@ describe("Idempotency-Key is sent only where the spec declares it", () => {
       "createProvider",
       "createProviderCredential",
       "createProviderModel",
+      "createResponse",
       "createRoutingPolicy",
       "createSkill",
       "createTrustedJwtIssuer",
@@ -765,6 +774,18 @@ const OPERATIONS_OUTSIDE_THE_LLM_AND_AUTH_PROVIDER_SURFACES = [
   "deleteFlow",
   "listFlowRuns",
   "listAgentProfiles",
+  // Issue #261 (the playground). The public execution surface — chat, its
+  // streaming twin, the post-run execution summary, and the admin-only
+  // diagnostic — is EXECUTION, not LLM runtime CONFIGURATION: none of them
+  // names a provider, model, credential or routing knob to CHANGE, which is
+  // the property `LLM_CONFIG_OPERATION_NAMES` is derived over. Their path
+  // segments (`responses`, `executions`, `runtime`) do not match
+  // `LLM_CONFIG_COLLECTIONS` either, so `collectionSegmentOf` would not have
+  // classified them there by accident. Not an auth-provider operation.
+  "createResponse",
+  "streamResponse",
+  "getExecution",
+  "diagnoseRuntime",
 ] as const satisfies readonly MoiraOperationName[];
 
 describe("the LLM configuration surface is administration, never bootstrap", () => {

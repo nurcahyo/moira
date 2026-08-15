@@ -47,6 +47,7 @@
 //   console.invite.*  the public /invite/[token] redemption page
 //   console.llm.*     the /settings/llm screen — providers, models, routing
 //   console.graph.*   the /graph screen — the derived relationship graph (plan 12 §4)
+//   console.playground.* the /playground screen — test-chat with routing/tool-call transparency (issue #261)
 
 /* -------------------------------------------------------------------------- */
 /* The table                                                                  */
@@ -166,6 +167,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   chrome_nav_provider_health: "console.chrome.nav_provider_health",
   chrome_nav_evals: "console.chrome.nav_evals",
   chrome_nav_flows: "console.chrome.nav_flows",
+  chrome_nav_playground: "console.chrome.nav_playground",
   chrome_sign_out: "console.chrome.sign_out",
   chrome_sign_out_pending: "console.chrome.sign_out_pending",
   chrome_sign_out_failed: "console.chrome.sign_out_failed",
@@ -744,6 +746,82 @@ export const CONSOLE_MESSAGE_KEYS = {
   flows_run_status_failed: "console.flows.run_status_failed",
   flows_run_status_cancelled: "console.flows.run_status_cancelled",
   flows_run_created_label: "console.flows.run_created_label",
+
+  /* --- the /playground screen (issue #261) --------------------------------- */
+  page_playground_title: "console.page.playground_title",
+  playground_page_intro: "console.playground.page_intro",
+  playground_request_body_invalid: "console.playground.request_body_invalid",
+  playground_prompt_required: "console.playground.prompt_required",
+  playground_run_failed: "console.playground.run_failed",
+  playground_stream_failed: "console.playground.stream_failed",
+  playground_diagnose_failed: "console.playground.diagnose_failed",
+  playground_execution_summary_failed: "console.playground.execution_summary_failed",
+  playground_models_load_failed: "console.playground.models_load_failed",
+  playground_pickers_load_failed: "console.playground.pickers_load_failed",
+
+  playground_controls_heading: "console.playground.controls_heading",
+  playground_field_route_label: "console.playground.field_route_label",
+  playground_field_route_none: "console.playground.field_route_none",
+  playground_field_agent_profile_label: "console.playground.field_agent_profile_label",
+  playground_field_agent_profile_hint: "console.playground.field_agent_profile_hint",
+  playground_field_agent_profile_none: "console.playground.field_agent_profile_none",
+  playground_field_provider_label: "console.playground.field_provider_label",
+  playground_field_provider_none: "console.playground.field_provider_none",
+  playground_field_model_label: "console.playground.field_model_label",
+  playground_field_model_none: "console.playground.field_model_none",
+  playground_field_model_needs_provider: "console.playground.field_model_needs_provider",
+  playground_field_temperature_label: "console.playground.field_temperature_label",
+  playground_field_max_tokens_label: "console.playground.field_max_tokens_label",
+  playground_field_priority_label: "console.playground.field_priority_label",
+  playground_field_priority_hint: "console.playground.field_priority_hint",
+  playground_field_complexity_hint_label: "console.playground.field_complexity_hint_label",
+  playground_complexity_none: "console.playground.complexity_none",
+  playground_complexity_trivial: "console.playground.complexity_trivial",
+  playground_complexity_standard: "console.playground.complexity_standard",
+  playground_complexity_heavy: "console.playground.complexity_heavy",
+  playground_field_stream_toggle_label: "console.playground.field_stream_toggle_label",
+  playground_field_diagnostics_toggle_label: "console.playground.field_diagnostics_toggle_label",
+  playground_field_diagnostics_toggle_hint: "console.playground.field_diagnostics_toggle_hint",
+
+  playground_prompt_label: "console.playground.prompt_label",
+  playground_prompt_placeholder: "console.playground.prompt_placeholder",
+  playground_send: "console.playground.send",
+  playground_stop: "console.playground.stop",
+  playground_status_idle: "console.playground.status_idle",
+  playground_status_sending: "console.playground.status_sending",
+  playground_status_streaming: "console.playground.status_streaming",
+  playground_status_diagnosing: "console.playground.status_diagnosing",
+  playground_status_cancelled: "console.playground.status_cancelled",
+
+  playground_response_heading: "console.playground.response_heading",
+  playground_response_empty: "console.playground.response_empty",
+
+  playground_routing_heading: "console.playground.routing_heading",
+  playground_routing_route_label: "console.playground.routing_route_label",
+  playground_routing_model_label: "console.playground.routing_model_label",
+  playground_routing_status_label: "console.playground.routing_status_label",
+  playground_routing_latency_label: "console.playground.routing_latency_label",
+  playground_routing_attempt_count_label: "console.playground.routing_attempt_count_label",
+  playground_routing_usage_label: "console.playground.routing_usage_label",
+  playground_routing_usage_tokens: "console.playground.routing_usage_tokens",
+  playground_routing_fallback_heading: "console.playground.routing_fallback_heading",
+  playground_routing_summary_pending: "console.playground.routing_summary_pending",
+  playground_routing_summary_unavailable: "console.playground.routing_summary_unavailable",
+  playground_routing_summary_public_note: "console.playground.routing_summary_public_note",
+
+  playground_diagnostics_heading: "console.playground.diagnostics_heading",
+  playground_diagnostics_candidates_heading: "console.playground.diagnostics_candidates_heading",
+  playground_diagnostics_candidate_rank_label: "console.playground.diagnostics_candidate_rank_label",
+  playground_diagnostics_candidate_score_label: "console.playground.diagnostics_candidate_score_label",
+  playground_diagnostics_candidate_reason_label: "console.playground.diagnostics_candidate_reason_label",
+  playground_diagnostics_attempts_heading: "console.playground.diagnostics_attempts_heading",
+  playground_diagnostics_failure_heading: "console.playground.diagnostics_failure_heading",
+
+  playground_tools_heading: "console.playground.tools_heading",
+  playground_tools_empty: "console.playground.tools_empty",
+  playground_tools_unavailable_note: "console.playground.tools_unavailable_note",
+  playground_tool_arguments_label: "console.playground.tool_arguments_label",
+  playground_tool_outcome_label: "console.playground.tool_outcome_label",
 } as const;
 
 /** Every console-originated key, as a union of string literals. */
