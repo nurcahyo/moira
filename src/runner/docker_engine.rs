@@ -32,69 +32,67 @@
 //! a silently empty transcript, and "the authorization URL never appeared" is a very
 //! expensive way to discover a framing assumption was wrong.
 //!
-//! # THE OPEN DEFECT: submitting an authorization code does not work from this client
+//! # Submitting an authorization code: the sequence is measured, not reasoned about
 //!
-//! Read this before touching [`ContainerEngine::write_stdin`], [`ATTACH_HOLD`] or their
-//! callers. Everything else in this file is verified against a real daemon; this one path is
-//! not, and the boundary is sharp.
+//! Read this before touching [`ContainerEngine::write_stdin`], [`SUBMIT_KEY_GAP`],
+//! [`ATTACH_HOLD`] or their callers. Code submission works end to end against the real image,
+//! and it works because of a specific, unintuitive sequence that nine attempts converged on.
+//! Every plausible simplification of it has already been tried and measured NOT to submit.
 //!
-//! **What works.** The write reaches the container. The CLI echoes the authorization code back
-//! masked, so the attach upgrade, the pty, the container config and the payload are all
-//! correct.
+//! ## What the CLI actually requires
 //!
-//! **What does not.** The trailing `\r` never takes effect. The code sits typed into the
-//! prompt indefinitely and the exchange never runs.
+//! `claude setup-token` does **not** submit on the carriage return glued to the end of the
+//! pasted text. The code appears masked at the prompt and the line just sits there — no error,
+//! no timeout, the runner stays in `awaiting_authorization` until its TTL. It submits on a
+//! **second, bare** carriage return delivered on the same still-open connection a few seconds
+//! later. So the shipped sequence is:
 //!
-//! **What proves the fault is on this side.** A ~40-line Node client performing a raw HTTP 101
-//! upgrade over the same unix socket **submits successfully against a container this service
-//! created** — same image, same config (`OpenStdin=true StdinOnce=false Tty=true
-//! AttachStdin=false`), same payload — producing `OAuth error: Request failed with status code
-//! 400` for a deliberately bogus code. Stronger still: after this client had typed a code into
-//! the prompt, that Node client sending a *bare* `\r` submitted that same already-typed code.
-//! So the text lands and the carriage return does not, and the container is blameless.
+//! 1. attach, and start draining the read half immediately;
+//! 2. wait [`ATTACH_SETTLE`] before the first byte;
+//! 3. write the frozen contract's payload, `code + "\r"`, unchanged, in one write;
+//! 4. wait [`SUBMIT_KEY_GAP`];
+//! 5. write one bare `\r`;
+//! 6. keep the connection open and draining for [`ATTACH_HOLD`].
 //!
-//! ## The one real property this investigation established
+//! Verified twice, independently, against `moira-claude-runner:local` (`claude setup-token`
+//! 2.1.233, Docker Desktop 29.6.2): both runs produced
+//! `OAuth error: Request failed with status code 400` for a deliberately bogus code, and the
+//! runner's own state machine then reported `failed` / `oauth_exchange_failed`.
 //!
-//! **The carriage return is only acted on while the attach connection stays open.** Closing
-//! right after the write discards it. That is why [`ATTACH_HOLD`] exists, why it is 30 s, and
-//! why it carries a compile-time floor.
+//! ## What does NOT work, so nobody "tidies" this into one of them
 //!
-//! ## …and why that is necessary but not sufficient here
-//!
-//! The connection lifetime was tested against both Docker clients, at both magnitudes. All
-//! four cells fail from Rust:
-//!
-//! | | hold ≈ 2 s | hold = 30 s, draining throughout |
-//! |---|---|---|
-//! | `bollard` attach | no submit | no submit |
-//! | hand-rolled HTTP 101 upgrade over the raw socket | no submit | no submit |
-//!
-//! The 30 s runs were instrumented rather than assumed: the drain reported **3 chunks
-//! received** and the hold reported elapsing a full 30 s after the write, so the stream was
-//! genuinely live and the connection genuinely open. A Node client holding ~12 s on the same
-//! image submits.
-//!
-//! **The hand-rolled client was reverted**, twice, and deliberately: it behaved identically to
-//! `bollard` (`HTTP/1.1 101 UPGRADED`, 38 bytes written, `ends_with_cr=true`), so shipping
-//! ~150 lines of bespoke HTTP plus two extra tokio features would have added surface for no
-//! measured benefit. Two independent Rust clients failing identically, where a Node client
-//! succeeds, says the difference is not the choice of Docker library.
-//!
-//! ## Other things tried, so nobody repeats them
-//!
-//! | Attempt | Result |
+//! | Sequence | Result |
 //! |---|---|
-//! | `code + "\r"` in one write (the frozen contract's payload) | text lands, no submit |
-//! | code and `\r` as two writes, 100 ms and 250 ms apart | same |
+//! | `code + "\r"` in one write, connection closed straight after | text lands, no submit |
+//! | `code + "\r"` in one write, connection held open 30 s while draining | text lands, no submit |
+//! | `code` alone, then a bare `\r` after 2 s or after 5 s | text lands, no submit |
+//! | `code` and `\r` as two writes 100 ms / 250 ms apart | text lands, no submit |
 //! | bracketed paste `ESC[200~…ESC[201~` | worse — the terminator is typed literally, so this CLI does not implement it |
-//! | a settle delay before the first byte, matching the reference client | same, and **kept** — it is what the reference does |
-//! | `AttachStdin`/`AttachStdout` false at create, matching `docker run -dit` | same, and **kept** — it is the correct config, pinned by a test |
-//! | gating `awaiting_authorization` on the paste prompt rather than the URL | same, and **kept** — it was a genuine bug: the old state let a caller write before the CLI's reader existed |
 //!
-//! **The payload is settled — do not vary it.** `code + "\r"` is measured working twice from
-//! the reference client. The next diagnostic step is to diff the two clients at the syscall or
-//! socket level (`dtruss`, or a proxy between client and daemon), which is the one thing that
-//! has not been done.
+//! The third row is the one that kills the obvious theory: "deliver the carriage return as its
+//! own read" is **not** sufficient on its own — the payload's own trailing `\r` has to be there
+//! too. The mechanism inside the CLI was not chased further.
+//!
+//! ## How it was isolated, and the two theories that were eliminated on the way
+//!
+//! * **`bollard` is not at fault.** A hand-rolled HTTP 101 upgrade over the raw unix socket
+//!   behaved identically (`HTTP/1.1 101 UPGRADED`, 38 bytes written, ending in `\r`). It was
+//!   reverted rather than shipped, since it added ~150 lines of bespoke HTTP and two tokio
+//!   features for no measured benefit.
+//! * **The write half was never half-closed.** That was the leading theory, and a chunk count
+//!   cannot test it — Docker delivers only *new* output on attach, so a quiet CLI yields zero
+//!   chunks whether or not the writer is alive. What settled it: a diagnostic wrote
+//!   `code + "\r"`, waited 5 s, then wrote a bare `\r` on the *same* writer. The probe write
+//!   returned `Ok`, proving the write half had been alive throughout — and the container
+//!   immediately performed the exchange. That single run eliminated the half-close theory and
+//!   revealed the working sequence at the same time.
+//!
+//! ## The container config also matters, and is pinned by a test
+//!
+//! Containers are created **detached**, exactly as `docker run -dit` does it:
+//! `AttachStdin`/`AttachStdout`/`AttachStderr` false, with `OpenStdin: true` and
+//! `StdinOnce: false`. `Attach*` and `OpenStdin` read like the same thing and are not — the
+//! former say "a client is attached at start time", which is a promise nothing here keeps.
 
 use std::collections::HashMap;
 
@@ -167,6 +165,43 @@ const _: () = assert!(
     "ATTACH_HOLD must stay well above the 2s an earlier revision used: the CLI only acts on \
      the submitting carriage return while the attach connection is open"
 );
+
+/// How long to wait after the pasted line before sending the carriage return that submits it.
+///
+/// # This is the defect that took nine attempts to find, and the shape of it is unintuitive
+///
+/// `claude setup-token` does **not** submit on the carriage return that arrives glued to the
+/// end of the pasted text. The code appears masked at the prompt and the line just sits there
+/// — no error, no timeout, the runner stays in `awaiting_authorization` until its TTL. It
+/// submits on a **second, bare** carriage return delivered on the same connection a few
+/// seconds later.
+///
+/// The frozen contract's payload is therefore written unchanged, and then one extra `\r`
+/// follows it. Both halves matter and both were measured:
+///
+/// | Sequence | Result |
+/// |---|---|
+/// | `code + "\r"` in one write | text lands, **no submit** |
+/// | `code + "\r"`, then a bare `\r` after 5 s | **submits**, exchange runs |
+/// | `code` alone, then `\r` after 2 s or 5 s | text lands, **no submit** |
+/// | `code + "\r"` with the connection merely held open 30 s while draining | text lands, **no submit** |
+///
+/// That third row is the one that kills the obvious theory. "Deliver the carriage return as
+/// its own read" is not sufficient — the payload's own trailing `\r` has to be there too. The
+/// mechanism inside the CLI was not chased further; the sequence is reproduced exactly as
+/// measured rather than reasoned about.
+///
+/// How it was isolated, after connection lifetime had been eliminated: with the attach held
+/// open 30 s and the read half drained throughout, a diagnostic wrote `code + "\r"`, waited
+/// 5 s, then wrote a bare `\r` on the *same* writer. The probe write returned `Ok` — proving
+/// the write half had been alive the whole time, which is what ruled out the half-close
+/// theory — and the container immediately produced
+/// `OAuth error: Request failed with status code 400`.
+///
+/// 5 s is the measured value, and 2 s is measured *not* to work, so this is pinned at the
+/// value that was verified rather than trimmed for latency. It is paid once per code
+/// submission on an interactive flow whose previous step was a browser round trip.
+const SUBMIT_KEY_GAP: std::time::Duration = std::time::Duration::from_millis(5000);
 
 /// A [`ContainerEngine`] backed by the real Docker Engine API.
 pub struct DockerEngine {
@@ -450,13 +485,35 @@ impl ContainerEngine for DockerEngine {
 
             tokio::time::sleep(ATTACH_SETTLE).await;
 
-            // `EngineError` is not `Clone`, so the outcome crosses the channel as a message
-            // and is rebuilt on the far side.
+            // THE SEQUENCE THAT WORKS, reproduced exactly as it was measured. Do not
+            // "simplify" it without re-measuring against the real image — three plausible
+            // simplifications have already been tried and none of them submit.
+            //
+            //   1. write `code + "\r"` — the frozen contract's payload, unchanged, in one
+            //      write. The text appears masked at the prompt. The line is NOT submitted.
+            //   2. wait `SUBMIT_KEY_GAP`.
+            //   3. write a bare `\r` on the same writer. NOW the line submits and the CLI
+            //      performs the exchange.
+            //
+            // Measured alternatives that do NOT submit: the payload alone; the payload with
+            // the trailing `\r` split off and sent separately after 2 s or 5 s; the payload
+            // in one write with the connection merely held open for 30 s while draining.
             let outcome: Result<(), String> = async {
                 input
                     .write_all(&payload)
                     .await
                     .map_err(|error| format!("write to container stdin: {error}"))?;
+                input
+                    .flush()
+                    .await
+                    .map_err(|error| format!("flush container stdin: {error}"))?;
+
+                tokio::time::sleep(SUBMIT_KEY_GAP).await;
+
+                input
+                    .write_all(b"\r")
+                    .await
+                    .map_err(|error| format!("submit the line to container stdin: {error}"))?;
                 input
                     .flush()
                     .await
@@ -556,38 +613,42 @@ mod tests {
         );
     }
 
-    /// The attach connection must outlive the write, and this is the guard for it.
+    /// The three timings that make code submission work, guarded together.
     ///
     /// # What this catches, and what it honestly cannot
     ///
-    /// It catches the regression that cost this workstream eight attempts: someone reading
-    /// `write_stdin`, seeing a 30-second sleep on what looks like a fire-and-forget write, and
-    /// "tidying" it away. The carriage return that submits the pasted line is only acted on
-    /// while the connection is open, so shortening or deleting this silently returns the
-    /// service to a state where it accepts a code and does nothing with it.
+    /// It catches the regression that cost this workstream nine attempts: someone reading
+    /// `write_stdin`, seeing a settle, a five-second gap and a thirty-second hold around what
+    /// looks like a fire-and-forget write, and "tidying" them away. Each one is measured —
+    /// see [`SUBMIT_KEY_GAP`] for the table of sequences that do *not* submit — and removing
+    /// any of them silently returns the service to accepting a code and doing nothing with it,
+    /// with no error anywhere.
     ///
     /// It cannot catch it *behaviourally*, and that is worth stating rather than implying
-    /// otherwise. The property lives in a real CLI's reader on the far side of a real daemon;
-    /// the in-memory engine has no connection to close, and even the opt-in Docker suite could
-    /// not see it — its probe container runs `sh -c 'read line'`, and a POSIX `read` does not
-    /// care whether the writer is still attached. That suite passed throughout the entire
-    /// period this bug was live. So the guard here is the constant plus the `const assert!`
-    /// beside it, and the reason is written down where the next reader will find it.
+    /// otherwise. The property lives in a real CLI's reader on the far side of a real daemon.
+    /// The in-memory engine has no connection to close, and even the opt-in Docker suite could
+    /// not see it — its probe container runs `sh -c 'read line'`, and a POSIX `read` submits on
+    /// the first newline it gets and does not care whether the writer is still attached. That
+    /// suite passed green throughout the entire period this bug was live, which is exactly why
+    /// it is not trusted for this.
     #[test]
-    fn the_attach_hold_stays_long_enough_to_submit() {
-        // Measured NOT to work at 2s; the reference client uses ~12s.
+    fn the_submission_timings_stay_at_their_measured_values() {
+        // Measured NOT to submit at 2s; measured to submit at 5s.
         assert!(
-            ATTACH_HOLD >= std::time::Duration::from_secs(10),
-            "ATTACH_HOLD is {ATTACH_HOLD:?}; an earlier revision used 2s and the CLI never \
-             acted on the submitting carriage return"
+            SUBMIT_KEY_GAP >= std::time::Duration::from_secs(5),
+            "SUBMIT_KEY_GAP is {SUBMIT_KEY_GAP:?}; 2s is measured NOT to submit and 5s is \
+             measured to submit, so this must not be trimmed for latency"
         );
-        // The settle before the first byte is the reference client's other timing property.
+        // The reference client's own delay before its first byte.
         assert!(ATTACH_SETTLE >= std::time::Duration::from_millis(1000));
+        // The connection has to outlive the submitting carriage return by a wide margin, and
+        // that return is itself SUBMIT_KEY_GAP after the payload.
         assert!(
-            ATTACH_HOLD > ATTACH_SETTLE,
-            "holding for less time than we wait before writing would mean closing almost \
-             immediately after the write, which is the failure itself"
+            ATTACH_HOLD > SUBMIT_KEY_GAP,
+            "the hold must outlast the gap, or the connection closes before the carriage \
+             return is even sent"
         );
+        assert!(ATTACH_HOLD >= std::time::Duration::from_secs(10));
     }
 
     /// `Attach*` and `OpenStdin` read like the same thing and are not, so the difference is
