@@ -23,11 +23,11 @@
 //! # Provider coverage
 //!
 //! `Capabilities::Embeddings` is `Capable<_>` for `openai` (both the responses and the
-//! completions extension), `azure`, and `gemini`, and is `Nothing` for `deepseek`. Anthropic
-//! exposes no embedding model at all in 0.40. So embeddings are available for exactly the
-//! OpenAI-compatible family, Azure OpenAI, and Gemini — and a Moira application configured
-//! against Anthropic, DeepSeek or `custom` gets an explicit, honest refusal rather than a
-//! silent skip.
+//! completions extension), `azure`, and `gemini`, and is `Nothing` for `deepseek` and
+//! `chatgpt` (issue #216). Anthropic exposes no embedding model at all in 0.40. So embeddings
+//! are available for exactly the OpenAI-compatible family, Azure OpenAI, and Gemini — and a
+//! Moira application configured against Anthropic, DeepSeek, `chatgpt_oauth`, or `custom` gets
+//! an explicit, honest refusal rather than a silent skip.
 
 use std::time::Duration;
 
@@ -231,9 +231,10 @@ impl EmbeddingFactory for RigEmbeddingFactory {
                     client.embedding_model_with_ndims(model_key, dimension),
                 ))
             }
-            ProviderType::Anthropic | ProviderType::DeepSeek | ProviderType::Custom => {
-                Err(unsupported_provider(provider.provider_type))
-            }
+            ProviderType::Anthropic
+            | ProviderType::DeepSeek
+            | ProviderType::Custom
+            | ProviderType::ChatgptOauth => Err(unsupported_provider(provider.provider_type)),
         }
     }
 }
@@ -259,6 +260,7 @@ fn provider_type_label(provider_type: ProviderType) -> &'static str {
         ProviderType::AzureOpenAi => "azure_openai",
         ProviderType::Local => "local",
         ProviderType::Custom => "custom",
+        ProviderType::ChatgptOauth => "chatgpt_oauth",
     }
 }
 
@@ -509,6 +511,10 @@ mod tests {
             ProviderType::Anthropic,
             ProviderType::DeepSeek,
             ProviderType::Custom,
+            // `chatgpt::ChatGPTExt`'s `Capabilities<H>::Embeddings = Nothing`
+            // (rig-core-0.40.0/src/providers/chatgpt/mod.rs:173) — the ChatGPT subscription
+            // backend exposes completions only, not embeddings.
+            ProviderType::ChatgptOauth,
         ] {
             assert!(
                 !provider_type_supports_embeddings(provider_type),

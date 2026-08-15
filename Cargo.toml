@@ -94,6 +94,17 @@ uuid = { version = "1", features = ["serde", "v4", "v7"] }
 # transitive version is not a version this crate may rely on.
 zeroize = "1"
 
+[dev-dependencies]
+# `test-utils` is a dependency-free rig-core feature (`rig-core-0.40.0/Cargo.toml:75`) that
+# exposes `rig_core::test_utils` — `MockCompletionModel`/`MockTurn` and the scripted HTTP
+# doubles `RecordingHttpClient`/`MockStreamingClient`/`SequencedStreamingHttpClient`/
+# `HttpErrorStreamingClient`. Used to prove Rig's own request encoder/response decoder without a
+# socket (`.agents/skills/moira-rig-errors-testing/SKILL.md`, "L2" testing strategy) — first
+# exercised here for the `chatgpt_oauth` provider (issue #216), which needed a network-free way
+# to prove the `ChatGPTAuth::AccessToken` construction path is real and reachable without ever
+# touching `chatgpt.com`.
+rig-core = { version = "0.40", features = ["test-utils"] }
+
 # Build-time profile tuning. Not about the shipped artifact — `--release` is untouched — but about
 # how long the edit/check/test loop takes and how much disk it costs.
 #

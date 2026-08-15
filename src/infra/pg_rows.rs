@@ -1592,6 +1592,7 @@ pub fn provider_type_from_db(value: String) -> Result<ProviderType, AppError> {
         "azure_openai" => Ok(ProviderType::AzureOpenAi),
         "local" => Ok(ProviderType::Local),
         "custom" => Ok(ProviderType::Custom),
+        "chatgpt_oauth" => Ok(ProviderType::ChatgptOauth),
         _ => Err(AppError::Internal(format!("unknown provider type {value}"))),
     }
 }
@@ -1606,6 +1607,7 @@ pub fn provider_type_to_db(provider_type: &ProviderType) -> &'static str {
         ProviderType::AzureOpenAi => "azure_openai",
         ProviderType::Local => "local",
         ProviderType::Custom => "custom",
+        ProviderType::ChatgptOauth => "chatgpt_oauth",
     }
 }
 
@@ -1832,6 +1834,46 @@ mod tests {
                 "unexpected variant parsed from {db_value:?}"
             );
         }
+    }
+
+    #[test]
+    fn provider_type_round_trips_all_nine_variants() {
+        // These strings must match the DB CHECK constraint on providers.provider_type exactly
+        // (migrations/0003_security_foundation.sql plus the `chatgpt_oauth` widening in
+        // migrations/0033_chatgpt_subscription_provider.sql).
+        let cases = [
+            (ProviderType::OpenAiCompatible, "openai_compatible"),
+            (ProviderType::OpenAi, "openai"),
+            (ProviderType::Anthropic, "anthropic"),
+            (ProviderType::Gemini, "gemini"),
+            (ProviderType::DeepSeek, "deepseek"),
+            (ProviderType::AzureOpenAi, "azure_openai"),
+            (ProviderType::Local, "local"),
+            (ProviderType::Custom, "custom"),
+            (ProviderType::ChatgptOauth, "chatgpt_oauth"),
+        ];
+
+        for (variant, db_value) in cases {
+            assert_eq!(
+                provider_type_to_db(&variant),
+                db_value,
+                "unexpected DB literal for {variant:?}"
+            );
+            assert_eq!(
+                provider_type_from_db(db_value.to_string()).unwrap(),
+                variant,
+                "unexpected variant parsed from {db_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_type_from_db_rejects_unknown_value() {
+        let result = provider_type_from_db("chatgpt-oauth".to_string());
+        assert!(
+            result.is_err(),
+            "an out-of-vocabulary DB string must error, not silently default"
+        );
     }
 
     #[test]

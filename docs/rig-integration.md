@@ -11,7 +11,7 @@ Moira uses official Rig APIs:
 - `rig_core::client::CompletionClient`
 - `rig_core::client::EmbeddingsClient`
 - `rig_core::embeddings::{EmbeddingModel, Embedding, EmbeddingError}`
-- Provider clients from `rig_core::providers::{openai, anthropic, gemini, deepseek, azure}`
+- Provider clients from `rig_core::providers::{openai, anthropic, gemini, deepseek, azure, chatgpt}`
 
 Dispatch strategy: Moira uses a small enum over official Rig completion model types. This keeps static provider typing intact without creating a second generic LLM client abstraction.
 
@@ -24,6 +24,23 @@ Supported in Phase 3:
 - `gemini`: Rig Gemini completion model
 - `deepseek`: Rig DeepSeek completion model
 - `azure_openai`: Rig Azure OpenAI completion model
+- `chatgpt_oauth`: rig-core 0.40's native ChatGPT-subscription provider
+  (`rig_core::providers::chatgpt`, `ResponsesCompletionModel`), reusing the OpenAI Responses API
+  engine against `chatgpt.com/backend-api/codex`. **Refused unless
+  `provider_security.allow_chatgpt_subscription = true`** — off by default in every environment,
+  including production. This is a deliberate ToS risk-acceptance opt-in, not a sanctioned
+  integration path: ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms,
+  with no carve-out for third-party, multi-tenant use (issue #216,
+  `docs/chatgpt-subscription-spike.md`). Credential = `credential_type: oauth2`, the access
+  token read from the `access_token` payload field, mirrored into
+  `chatgpt::ChatGPTAuth::AccessToken` — a thin, fully-expressible construction with no file I/O
+  and no device-code flow. `chatgpt::ChatGPTAuth::OAuth` (rig-core's own local-file/device-code
+  login) is never constructed; it is the wrong shape for a multi-tenant server process. Does
+  **not** emit `output_schema`: `chatgpt::ResponsesCompletionModel::create_request`
+  unconditionally clears `additional_parameters.text` (and `temperature`, `max_output_tokens`,
+  and several `additional_params` keys) on every request, so `structured_output` is never a
+  satisfiable routing capability for this provider (`application/execution.rs`,
+  `provider_emits_output_schema`).
 
 Configured but not executable:
 
@@ -64,6 +81,7 @@ compile.
 - `azure_openai`: **supported** (`Capable`)
 - `gemini`: **supported** (`Capable`)
 - `deepseek`: **not supported** — `type Embeddings = Nothing`
+- `chatgpt` (`chatgpt_oauth`): **not supported** — `type Embeddings = Nothing`
 - `anthropic`: **not supported** — exposes no embedding model at all
 - `custom`: not executable, as for completions
 

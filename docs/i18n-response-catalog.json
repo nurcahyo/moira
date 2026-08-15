@@ -114,6 +114,11 @@
       "description": "Used when a concurrency or rate allowance is already fully consumed. Transient — retry after a short delay, and reduce concurrency if it recurs."
     },
     {
+      "key": "moira.error.chatgpt_subscription_opt_in_required",
+      "default_message": "This provider requires an explicit ToS risk-acceptance opt-in that this deployment has not enabled.",
+      "description": "Used when a chatgpt_oauth provider is created, or would be executed, while provider_security.allow_chatgpt_subscription is false. ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no carve-out for third-party, multi-tenant use. Enabling the flag is a deployment operator's own explicit acceptance of that risk for their own subscription, not a sanctioned integration path (docs/chatgpt-subscription-spike.md, issue #216)."
+    },
+    {
       "key": "moira.error.circuit_open",
       "default_message": "Requests to this provider are paused after repeated failures.",
       "description": "Used when the circuit breaker for the selected provider and model is open, so attempts are refused without being sent. Transient — it closes again on its own; retry after a short delay."
