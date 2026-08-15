@@ -389,9 +389,34 @@ impl<'a> AgentPlatformService<'a> {
     /// The pair is checked **as it will be after this patch**, not as it arrives, because
     /// either half alone is enough to move a secret: binding a credential to an existing
     /// hostile host, and moving an existing credential's host to a hostile one, are the same
-    /// attack from two directions. A patch that touches neither still re-validates, which is
-    /// deliberate — it makes a stored row that predates this rule un-patchable until the
-    /// binding is corrected, rather than letting an unrelated `timeout_ms` edit renew it.
+    /// attack from two directions.
+    ///
+    /// # …but a row that already fails the rule stays editable
+    ///
+    /// Round one of this fix re-validated on *every* patch, including one that touched
+    /// neither half. That made a row stored before the rule existed un-patchable for an
+    /// unrelated `timeout_ms` or `response_schema` edit, which is not a security property —
+    /// it is an operator being told to fix something the same endpoint refuses to let them
+    /// fix. Worse, the un-patchable row keeps running: the execution path refuses to *send*
+    /// its credential (see `application::execution::skill_credential`), so the skill is
+    /// already dead, and the write refusal only prevented cleanup.
+    ///
+    /// So the rule is **do not make it worse**, which is the property that actually keeps
+    /// secrets where they belong:
+    ///
+    /// | pre-patch pair | post-patch pair | outcome |
+    /// |---|---|---|
+    /// | any | entitled | allowed |
+    /// | entitled | not entitled | **refused** — a live binding is being moved somewhere it may not go |
+    /// | not entitled | not entitled, **and identical** to the pre-patch pair | allowed — no secret moves, and the row becomes cleanable |
+    /// | not entitled | not entitled, and *different* | **refused** — a broken row is not a licence to point it somewhere new |
+    ///
+    /// The third row is the recovery path and it is narrow on purpose: the binding must be
+    /// byte-for-byte unchanged. Every other field is free. The genuine remedies for such a
+    /// row are all still available and all audited — give the provider a `base_url` naming
+    /// the executor's host, repoint the executor at an entitled credential, or
+    /// [`delete_executor`](Self::delete_executor). `docs/agent-platform.md` carries the
+    /// inventory query for finding them.
     ///
     /// Reading the current row outside the write transaction is safe under this resource's
     /// existing optimistic-concurrency contract: any concurrent change moves `updated_at`,
@@ -428,7 +453,21 @@ impl<'a> AgentPlatformService<'a> {
         let effective_host = new_allowed_host
             .clone()
             .unwrap_or_else(|| current.allowed_host.clone());
-        if let Some(credential_id) = request.credential_id.or(current.credential_id) {
+        let effective_credential = request.credential_id.or(current.credential_id);
+        // The binding is untouched when neither half differs from what is already stored.
+        // Compared on the *effective* values rather than on "was the field present in the
+        // request", so a console that PATCHes the whole object back — re-sending the identical
+        // credential id and the identical URL — still counts as untouched.
+        let binding_unchanged =
+            effective_credential == current.credential_id && effective_host == current.allowed_host;
+        // A patch that does not move the binding is not a bind: the post-patch pair *is* the
+        // pre-patch pair, so it can expose nothing the stored row does not already expose, and
+        // the existence check is skipped along with the entitlement check — otherwise a row
+        // whose credential was since deleted would 404 on an unrelated edit and stay
+        // uncleanable, which is the same trap in a different colour.
+        if let Some(credential_id) = effective_credential
+            && !binding_unchanged
+        {
             self.require_credential_entitled_to_host(credential_id, &effective_host)
                 .await?;
         }

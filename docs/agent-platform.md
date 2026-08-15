@@ -110,6 +110,62 @@ never drift apart. `credential_id`, when set, must reference a live `provider_cr
 checked at PATCH time — and carries no inline secret (decision 21). There is no `POST` to
 hand-author an executor in this MVP; every row today comes from the import pipeline.
 
+#### A credential may only be bound to its own provider's host
+
+**This rule is a behaviour change. Read it before upgrading if any skill executor carries a
+`credential_id`.**
+
+Issue #253 finding 1: the bound credential is decrypted at call time and sent as
+`Authorization: Bearer <plaintext>`, and an existence-only check on `credential_id` made
+`moira:skills:write` equivalent to reading the plaintext of *every* row in
+`provider_credentials` — bind one to `https://collector.attacker.example`, which passes the
+SSRF guard like any other public host, and read it off the wire. No other admin scope grants
+that; the credentials surface only ever returns masked values.
+
+The rule is entitlement by destination: the credential's owning provider must declare the
+executor's `allowed_host` as its `providers.base_url` host. A provider with **no** `base_url`
+(one left on its vendor default) entitles nothing — there is no host to compare against, and
+inventing the vendor default would tie the rule to a hostname table kept in step with
+`rig-core`. It is enforced at PATCH time and again at execution time, before decryption.
+
+**The failure mode this introduces.** An executor row that was legal before the rule and is not
+legal under it keeps existing, and nothing rejects it at deploy time — but at execution the
+credential is refused, and because `skill_refs` resolution is fail-closed the **whole
+execution** fails with `SkillUnavailable`, not just the one tool call. The refusal is logged
+server-side with the `credential_id` and the `allowed_host`; the caller sees only the class.
+There is no migration, because no automatic repair is safe: silently unbinding the credential
+would make the skill call unauthenticated, and silently widening the provider's `base_url`
+would grant the entitlement the rule exists to withhold.
+
+**Find the affected rows before you deploy:**
+
+```sql
+select e.skill_id, e.allowed_host, c.id as credential_id, p.id as provider_id, p.base_url
+from skill_http_executors e
+join provider_credentials c on c.id = e.credential_id
+join providers p on p.id = c.provider_id
+where e.credential_id is not null
+  and (p.base_url is null
+       or lower(split_part(split_part(regexp_replace(p.base_url, '^[a-zA-Z]+://', ''), '/', 1), ':', 1))
+           is distinct from lower(e.allowed_host));
+```
+
+**Repair each one, in whichever way is actually true of your deployment:**
+
+1. Give the provider a `base_url` naming the executor's host, if that provider really does
+   serve it (`PATCH /api/v1/admin/providers/{id}`, an audited write).
+2. Repoint the executor at a credential whose provider does serve that host
+   (`PATCH /api/v1/admin/skills/{id}/executor` with a new `credential_id`).
+3. `DELETE /api/v1/admin/skills/{id}/executor` and re-import, if the executor was wrong.
+
+**A non-conforming row stays editable.** PATCH refuses only patches that *move* the binding —
+a different `credential_id`, or a `url_template` whose host differs from the stored
+`allowed_host`. A patch that leaves both exactly as they are is allowed, so `timeout_ms`,
+`method`, `header_template` and `response_schema` can still be edited, and the row can still be
+deleted. (The first release of this rule re-validated on every patch, which made such a row
+un-patchable for unrelated edits — a refusal that moved no secret, since execution already
+refuses to send one, and only blocked cleanup.)
+
 ## Evaluations
 
 Issue #214, F2 (plan 12 §3, decision 14). An eval suite is a named, versioned registry of

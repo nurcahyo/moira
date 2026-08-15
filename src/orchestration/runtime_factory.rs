@@ -26,6 +26,7 @@ use crate::{
     },
     error::AppError,
     orchestration::normalize_openai_base_url,
+    security::ProviderEndpointPolicy,
 };
 
 /// Error code returned when a `chatgpt_oauth` provider is configured or executed without this
@@ -89,6 +90,51 @@ pub struct RigRuntimeFactory {
     /// request, the same way every other static provider-security posture in this file is
     /// captured once rather than threaded through per call.
     allow_chatgpt_subscription: bool,
+    /// The address space this deployment permits a provider credential to be sent to,
+    /// captured from `provider_security` for the same reason the flag above is.
+    ///
+    /// See [`guard_endpoint`] and [`crate::security::provider_endpoint`].
+    endpoint_policy: ProviderEndpointPolicy,
+}
+
+/// Refuses to build a client pointed at an address this deployment's `provider_security`
+/// policy does not permit — **the use-time half of issue #251's class**.
+///
+/// Every arm of [`RigRuntimeFactory::build_completion_model`] below hands
+/// `credential.secret` to a Rig client aimed at exactly one address. This is the single place
+/// that address is checked, and it runs on every build rather than only on the admin write,
+/// because two of the three sources feeding it were never checked at write time at all:
+/// `credential.config["endpoint"]` (the Azure override, unread by
+/// `validate_credential_secret` until this change) and anything that reaches the tables
+/// without an admin request — a migration, a restore, a direct `psql` edit.
+///
+/// It is deliberately DNS-free; [`crate::security::provider_endpoint`] states exactly what
+/// that does and does not buy, and why this cannot be
+/// [`crate::security::validate_outbound_url`] instead.
+///
+/// The public message names the subject and nothing else. The server-side WARN carries the
+/// denial class and the value, which can name an internal address.
+pub(crate) fn guard_endpoint(
+    policy: ProviderEndpointPolicy,
+    subject: &'static str,
+    value: &str,
+) -> Result<(), AppError> {
+    match policy.permits(value) {
+        Ok(()) => Ok(()),
+        Err(denial) => {
+            tracing::warn!(
+                subject,
+                reason = denial.as_str(),
+                endpoint = value,
+                "refusing to send a provider credential to an address this deployment's \
+                 provider_security policy does not permit"
+            );
+            Err(AppError::Config(format!(
+                "{subject} is not an address this deployment permits a provider credential to \
+                 be sent to"
+            )))
+        }
+    }
 }
 
 #[async_trait]
@@ -144,9 +190,10 @@ pub struct RuntimeCompletionOutput {
 }
 
 impl RigRuntimeFactory {
-    pub fn new(allow_chatgpt_subscription: bool) -> Self {
+    pub fn new(allow_chatgpt_subscription: bool, endpoint_policy: ProviderEndpointPolicy) -> Self {
         Self {
             allow_chatgpt_subscription,
+            endpoint_policy,
         }
     }
 }
@@ -155,8 +202,9 @@ impl Default for RigRuntimeFactory {
     /// `allow_chatgpt_subscription: false` — the ToS-risk opt-in stays off unless a caller
     /// passes `true` to [`RigRuntimeFactory::new`] explicitly. No production code path uses
     /// this impl; `MoiraExecutionService::new` always calls `new` with the resolved setting.
+    /// The endpoint policy defaults to neither concession granted, for the same reason.
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, ProviderEndpointPolicy::default())
     }
 }
 
@@ -170,6 +218,12 @@ impl RuntimeFactory for RigRuntimeFactory {
         _policy: &ProviderRuntimePolicyRecord,
     ) -> Result<RuntimeModelHandle, AppError> {
         let secret = credential.secret.expose_secret();
+        // Before any arm below: whatever `base_url` the row carries is where this secret is
+        // about to go. Validated at write time too, but a row can also arrive from a
+        // migration or a direct database edit, and this is the check nothing can get behind.
+        if let Some(base_url) = provider.base_url.as_deref() {
+            guard_endpoint(self.endpoint_policy, "provider base_url", base_url)?;
+        }
         match provider.provider_type {
             ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
                 require_credential_type(
@@ -242,6 +296,17 @@ impl RuntimeFactory for RigRuntimeFactory {
                             "azure_openai provider requires a configured endpoint".to_string(),
                         )
                     })?;
+                // The only arm whose destination can come from the *credential payload* rather
+                // than from `providers.base_url`, and therefore the one member of issue #251's
+                // class that no write path checked before this change. Re-guarded here even
+                // when it fell through to `base_url`: which of the two won is a runtime fact,
+                // and a guard that depends on which branch was taken is one edit from being
+                // wrong.
+                guard_endpoint(
+                    self.endpoint_policy,
+                    "azure_openai credential endpoint",
+                    endpoint,
+                )?;
                 let api_version = credential
                     .config
                     .get("api_version")
@@ -905,5 +970,213 @@ mod tests {
             Some("test-account-id"),
             "credential.config's account_id must reach the wire as ChatGPT-Account-Id"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Issue #251's class, second member: the address a decrypted credential is sent to.
+    //
+    // Network-free by construction — every case below is refused *before* a client is built,
+    // which is the property under test.
+    // -----------------------------------------------------------------------------------
+
+    fn test_provider(
+        provider_type: ProviderType,
+        base_url: Option<&str>,
+    ) -> ResolvedProviderConfiguration {
+        ResolvedProviderConfiguration {
+            provider_id: uuid::Uuid::now_v7(),
+            provider_version: 1,
+            provider_type,
+            display_name: "test provider".to_string(),
+            base_url: base_url.map(str::to_string),
+        }
+    }
+
+    fn azure_credential(endpoint: Option<&str>) -> ResolvedCredential {
+        let config = match endpoint {
+            Some(endpoint) => serde_json::json!({ "api_key": "test-key", "endpoint": endpoint }),
+            None => serde_json::json!({ "api_key": "test-key" }),
+        };
+        ResolvedCredential {
+            credential_id: uuid::Uuid::now_v7(),
+            credential_version: 1,
+            credential_type: CredentialType::AzureOpenAi,
+            secret: secrecy::SecretString::new("test-key".to_string()),
+            config,
+        }
+    }
+
+    /// `build_completion_model` ignores its policy argument entirely (`_policy`), so the
+    /// values here are only shape.
+    fn test_runtime_policy() -> ProviderRuntimePolicyRecord {
+        ProviderRuntimePolicyRecord {
+            id: uuid::Uuid::now_v7(),
+            provider_id: uuid::Uuid::now_v7(),
+            connect_timeout_ms: 1_000,
+            request_timeout_ms: 30_000,
+            stream_idle_timeout_ms: 30_000,
+            max_concurrent_requests: 1,
+            max_concurrent_streams: 1,
+            retry_limit: 0,
+            retry_base_delay_ms: 1,
+            retry_max_delay_ms: 1,
+            circuit_failure_threshold: 1,
+            circuit_open_duration_ms: 1,
+            status: crate::domain::RuntimePolicyStatus::Active,
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        }
+    }
+
+    fn api_key_credential() -> ResolvedCredential {
+        ResolvedCredential {
+            credential_id: uuid::Uuid::now_v7(),
+            credential_version: 1,
+            credential_type: CredentialType::ApiKey,
+            secret: secrecy::SecretString::new("test-key".to_string()),
+            config: serde_json::json!({ "api_key": "test-key" }),
+        }
+    }
+
+    /// The open member of the class round one closed only one instance of.
+    ///
+    /// `credential.config["endpoint"]` is read **in preference to** `providers.base_url`, and
+    /// nothing on the credential write path looked at it before this change — so
+    /// `moira:credentials:write`, on its own, could aim the decrypted Azure API key at the
+    /// instance-metadata service. The `base_url` here is a perfectly ordinary public host, so
+    /// the only thing this can be failing on is the credential-supplied override.
+    #[tokio::test]
+    async fn an_azure_credential_endpoint_cannot_send_the_api_key_to_a_denied_address() {
+        let factory = RigRuntimeFactory::default();
+        for hostile in [
+            "http://169.254.169.254/",
+            "http://127.0.0.1:6379/",
+            "https://10.0.0.5/",
+            "https://user:pass@api.example/",
+        ] {
+            let error = factory
+                .build_completion_model(
+                    &test_provider(
+                        ProviderType::AzureOpenAi,
+                        Some("https://real.openai.azure.com"),
+                    ),
+                    "gpt-4o",
+                    &azure_credential(Some(hostile)),
+                    &test_runtime_policy(),
+                )
+                .await
+                .expect_err("a credential-supplied endpoint must not escape the address policy");
+            let message = error.to_string();
+            assert!(
+                message.contains("azure_openai credential endpoint"),
+                "the refusal must name the field an operator has to fix, got: {message}"
+            );
+            assert!(
+                !message.contains(hostile),
+                "the public message must not echo the address back, got: {message}"
+            );
+        }
+    }
+
+    /// The same value is permitted once the deployment has declared it lives there, so the
+    /// guard is this deployment's policy rather than a blanket ban.
+    #[tokio::test]
+    async fn an_azure_credential_endpoint_on_a_permitted_private_address_still_builds() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: true,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::AzureOpenAi, None),
+                "gpt-4o",
+                &azure_credential(Some("http://127.0.0.1:8080/")),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect("a deployment that granted both concessions may use a loopback endpoint");
+    }
+
+    /// Refused even with both concessions granted: there is no development story in which a
+    /// provider credential belongs at `169.254.169.254`.
+    #[tokio::test]
+    async fn the_metadata_address_is_refused_even_for_a_fully_permissive_deployment() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: true,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::AzureOpenAi, None),
+                "gpt-4o",
+                &azure_credential(Some("http://169.254.169.254/")),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect_err("the instance metadata service is never a provider endpoint");
+    }
+
+    /// `providers.base_url` is validated on both admin write paths, so this arm is the
+    /// backstop for a row that reached the table another way — a migration, a restore, a
+    /// direct `psql` edit. Covers the non-Azure arms, where `base_url` is the only address.
+    #[tokio::test]
+    async fn a_base_url_that_never_went_through_the_admin_write_path_is_still_refused() {
+        let factory = RigRuntimeFactory::default();
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+            ProviderType::DeepSeek,
+        ] {
+            let refused = factory
+                .build_completion_model(
+                    &test_provider(provider_type, Some("http://169.254.169.254/v1")),
+                    "some-model",
+                    &api_key_credential(),
+                    &test_runtime_policy(),
+                )
+                .await
+                .is_err();
+            assert!(
+                refused,
+                "{provider_type:?} must refuse a base_url pointing at the metadata service"
+            );
+        }
+    }
+
+    /// The guard must never be *stricter* than the admin write path, or a deployment that
+    /// legitimately runs an in-cluster provider over private `https` would have every
+    /// execution refused against a provider the admin plane already accepted. This is the
+    /// property that rules out reusing `validate_outbound_url`'s all-or-nothing
+    /// `allow_insecure`.
+    #[tokio::test]
+    async fn allow_private_alone_is_enough_for_an_in_cluster_https_provider() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: false,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::OpenAiCompatible, Some("https://10.42.0.7/v1")),
+                "some-model",
+                &api_key_credential(),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect(
+                "allow_private_provider_urls alone must keep an in-cluster https provider \
+                 working",
+            );
     }
 }

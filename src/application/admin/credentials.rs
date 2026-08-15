@@ -58,6 +58,13 @@ impl<'a> CredentialAdminService<'a> {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let cipher = self.state.cipher.clone();
+        // Copied out before the closure so the `'static` future does not borrow `self.state`.
+        // An `azure_openai` payload's `endpoint` is a runtime destination for the very secret
+        // being written, so it is held to this deployment's provider-address policy exactly
+        // as `providers.base_url` is — see `validate_credential_secret`.
+        let endpoint_policy = crate::security::ProviderEndpointPolicy::from_provider_security(
+            &self.state.settings.provider_security,
+        );
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, |transaction| {
                 Box::pin(async move {
@@ -65,7 +72,11 @@ impl<'a> CredentialAdminService<'a> {
                         .await?;
                     validate_credential_scope(&request)?;
                     authorize_credential_scope(&actor, &request.scope)?;
-                    validate_credential_secret(&request.credential_type, &request.secret)?;
+                    validate_credential_secret(
+                        &request.credential_type,
+                        &request.secret,
+                        endpoint_policy,
+                    )?;
                     let id = Uuid::now_v7();
                     let plaintext = serde_json::to_vec(&request.secret).map_err(|err| {
                         AppError::BadRequest(format!("invalid credential secret: {err}"))
@@ -219,12 +230,21 @@ impl<'a> CredentialAdminService<'a> {
         let actor = actor.clone();
         let ctx = ctx.clone();
         let cipher = self.state.cipher.clone();
+        // A rotation rewrites the whole payload, `endpoint` included, so it is the second
+        // write path that can introduce a hostile azure endpoint and is held to the same rule.
+        let endpoint_policy = crate::security::ProviderEndpointPolicy::from_provider_security(
+            &self.state.settings.provider_security,
+        );
         let outcome = AdminCommandRunner::new(self.repo.clone(), command_hasher(self.state))
             .execute(spec, |transaction| {
                 Box::pin(async move {
                     let existing = load_credential_record(transaction, id).await?;
                     authorize_credential_record(&actor, &existing)?;
-                    validate_credential_secret(&existing.credential_type, &request.secret)?;
+                    validate_credential_secret(
+                        &existing.credential_type,
+                        &request.secret,
+                        endpoint_policy,
+                    )?;
                     let plaintext = serde_json::to_vec(&request.secret).map_err(|err| {
                         AppError::BadRequest(format!("invalid credential secret: {err}"))
                     })?;

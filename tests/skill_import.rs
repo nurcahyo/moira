@@ -37,6 +37,11 @@ const RESOLVABLE_TEST_HOST: &str = "8.8.8.8";
 struct Fixture {
     router: Router,
     suffix: String,
+    /// Only the legacy-row test uses this, and only to *create* the pre-rule state — a
+    /// `skill_http_executors` row whose binding no admin route would accept today. That state
+    /// is by definition unreachable through the routes, so writing it any other way would be
+    /// testing a shape the fixture invented rather than the one a real upgrade inherits.
+    pool: sqlx::PgPool,
     _database: TestDatabase,
 }
 
@@ -56,13 +61,14 @@ impl Fixture {
         let database = TestDatabase::create().await?;
         let pool = database.pool.clone();
         let settings = Settings::default();
-        let state = AppState::new(settings, Some(pool))
+        let state = AppState::new(settings, Some(pool.clone()))
             .await
             .expect("test app state");
         let router = moira::build_router(state).expect("test router");
         Some(Self {
             router,
             suffix: Uuid::now_v7().simple().to_string(),
+            pool,
             _database: database,
         })
     }
@@ -162,6 +168,10 @@ fn sample_document(host: &str, suffix: &str) -> Value {
 /// finding 1's `collector.attacker.example`: the whole point is that it passes
 /// `validate_outbound_url`, because a public host always does.
 const OTHER_PUBLIC_TEST_HOST: &str = "1.1.1.1";
+/// A third public IP literal, for the legacy-row test: it needs a host that is neither the
+/// executor's own nor the one the already-bound foreign credential's provider serves, so that
+/// "cannot be repointed" is proved against a genuinely new destination.
+const THIRD_PUBLIC_TEST_HOST: &str = "9.9.9.9";
 
 fn skill_id_of(record: &Value) -> Uuid {
     Uuid::parse_str(record["id"].as_str().expect("skill id")).expect("UUID id")
@@ -435,6 +445,134 @@ async fn a_credential_whose_provider_has_no_base_url_cannot_be_bound_at_all() {
         refused.body["error"]["code"],
         "skill_credential_host_mismatch"
     );
+}
+
+/// The repair to round one's own admitted defect: a `skill_http_executors` row stored **before**
+/// the binding rule existed must stay editable.
+///
+/// Round one re-validated on every patch, so a legacy row was un-patchable even for an
+/// unrelated `timeout_ms` edit. That is not a security property. The row's credential is
+/// already refused at execution time (`resolve_skill_credential` returns `HostNotEntitled`
+/// before it decrypts anything), so the write refusal moved no secret — it only stopped an
+/// operator cleaning up, on the same endpoint that told them to.
+///
+/// The rule is now "do not make it worse": the binding may stay exactly where it is, and
+/// everything else about the row is free. Both refusals below prove the security half is
+/// intact, and the last step proves the documented repair actually lands.
+#[tokio::test]
+async fn a_row_that_predates_the_binding_rule_stays_editable_but_cannot_be_repointed() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (skill_id, _etag) = fixture
+        .imported_executor(RESOLVABLE_TEST_HOST, "legacy")
+        .await;
+    let path = format!("/api/v1/admin/skills/{skill_id}/executor");
+
+    // The pre-rule state: a credential whose provider serves a different host, bound straight
+    // in the table the way a pre-rule admin write, a migration or a restore left it.
+    let foreign = fixture
+        .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, "legacyforeign")
+        .await;
+    sqlx::query("update skill_http_executors set credential_id = $1 where skill_id = $2")
+        .bind(foreign)
+        .bind(skill_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("seed the pre-rule binding");
+
+    let current = fixture.request("GET", &path, None, None).await;
+    assert_eq!(current.status, StatusCode::OK, "body: {}", current.body);
+    assert_eq!(current.body["credential_id"], json!(foreign.to_string()));
+    let etag = current.etag.expect("GET must return an ETag");
+
+    // 1. An unrelated field edit lands. This is the assertion round one fails.
+    let edited = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "timeout_ms": 4_321 })),
+        )
+        .await;
+    assert_eq!(
+        edited.status,
+        StatusCode::OK,
+        "a legacy row must stay editable for fields that are not the binding: {}",
+        edited.body
+    );
+    assert_eq!(edited.body["timeout_ms"], json!(4_321));
+    assert_eq!(
+        edited.body["credential_id"],
+        json!(foreign.to_string()),
+        "the unrelated edit must not have quietly re-bound anything"
+    );
+    let etag = edited.etag.expect("PATCH must return an ETag");
+
+    // 2. The binding itself still cannot move to another non-entitled credential.
+    let other = fixture
+        .credential_on_provider_at(THIRD_PUBLIC_TEST_HOST, "legacyother")
+        .await;
+    let repointed = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "credential_id": other })),
+        )
+        .await;
+    assert_eq!(
+        repointed.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a broken row is not a licence to point it somewhere new: {}",
+        repointed.body
+    );
+    assert_eq!(
+        repointed.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
+
+    // 3. …and neither can the host move under it.
+    let moved = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({
+                "url_template": format!("https://{THIRD_PUBLIC_TEST_HOST}/v1/orders")
+            })),
+        )
+        .await;
+    assert_eq!(
+        moved.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        moved.body
+    );
+    assert_eq!(
+        moved.body["error"]["code"],
+        "skill_credential_host_mismatch"
+    );
+
+    // 4. The documented repair — bind a credential the executor's host is entitled to — works.
+    let own = fixture
+        .credential_on_provider_at(RESOLVABLE_TEST_HOST, "legacyrepair")
+        .await;
+    let repaired = fixture
+        .request(
+            "PATCH",
+            &path,
+            Some(&etag),
+            Some(json!({ "credential_id": own })),
+        )
+        .await;
+    assert_eq!(
+        repaired.status,
+        StatusCode::OK,
+        "the repair path must land: {}",
+        repaired.body
+    );
+    assert_eq!(repaired.body["credential_id"], json!(own.to_string()));
 }
 
 #[tokio::test]

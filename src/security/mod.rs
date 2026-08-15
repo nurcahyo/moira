@@ -9,6 +9,7 @@ mod idempotency;
 mod key_custody;
 mod keyring_admin;
 mod masking;
+mod provider_endpoint;
 mod ssrf;
 
 pub use api_keys::{
@@ -57,6 +58,10 @@ pub use keyring_admin::{
     Promotion, ResealOptions, ResealReport, Retirement, RewrapReport, envelope_data_key_id,
 };
 pub use masking::{mask_plain_secret, mask_secret_value, request_hash, secret_fingerprint};
+pub use provider_endpoint::{
+    ProviderEndpointDenial, ProviderEndpointPolicy, is_cloud_metadata_host, is_forbidden_ip,
+    is_private_host, provider_endpoint_shape_denial,
+};
 pub use ssrf::{
     HostResolver, JwksDenialReason, JwksFetchError, OutboundDenialReason, OutboundUrlDenial,
     OutboundUrlPolicy, SystemResolver, fetch_jwks_hardened, is_denied_ip, validate_jwks_url,

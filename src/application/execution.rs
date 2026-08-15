@@ -70,12 +70,17 @@ impl MoiraExecutionService {
         let pool = state.pool()?.clone();
         let allow_chatgpt_subscription =
             state.settings.provider_security.allow_chatgpt_subscription;
+        // Resolved before `state` moves into `Self`, and captured once for the same reason
+        // `allow_chatgpt_subscription` is: it is a deployment posture, not a per-request one.
+        let endpoint_policy = crate::security::ProviderEndpointPolicy::from_provider_security(
+            &state.settings.provider_security,
+        );
         Ok(Self {
             state,
             runtime_repo: PgRuntimeRepository::new(pool.clone()),
             admin_repo: PgAdminRepository::new(pool.clone()),
             agent_platform_repo: PgAgentPlatformRepository::new(pool),
-            factory: RigRuntimeFactory::new(allow_chatgpt_subscription),
+            factory: RigRuntimeFactory::new(allow_chatgpt_subscription, endpoint_policy),
         })
     }
 

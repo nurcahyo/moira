@@ -33,7 +33,12 @@ use serde_json::json;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::support::{TestDatabase, mock_control_plane::MockControlPlane};
+use axum::http::StatusCode;
+
+use crate::support::{
+    TestDatabase,
+    mock_control_plane::{MockControlPlane, TokenScript},
+};
 
 fn metrics() -> MetricsRegistry {
     MetricsRegistry::new("moira-test", None)
@@ -636,6 +641,140 @@ async fn oauth_token_refresh_never_posts_a_refresh_token_to_an_ssrf_blocked_endp
 
     control_plane.shutdown().await;
 }
+
+/// The **fourth** mechanism this fix deliberately added, and the one round one shipped with no
+/// test at all: `OAuthTokenRefreshHandler::new` builds its own client with
+/// `redirect::Policy::none()` instead of taking `AppState::http`, which keeps reqwest's
+/// default `redirect::Policy::limited(10)`.
+///
+/// The other three that change behaviour are covered: the SSRF guard on the configured
+/// endpoint (`oauth_token_refresh_never_posts_a_refresh_token_to_an_ssrf_blocked_endpoint`)
+/// and the two halves of the skill-credential entitlement rule (`tests/skill_import.rs`).
+/// This one had nothing, and an untested security mechanism is a claim rather than a control
+/// — the case it exists for is one none of the other three can reach: a token endpoint that
+/// **passes** validation and then answers `307 Location: <somewhere else>`. Validation is a
+/// statement about the request Moira issues, never about wherever the response points next.
+///
+/// Two further constructions in that handler stay untested and are *not* claimed as covered:
+/// the `Url`-typed `exchange_refresh_token` signature, which is a compile-time obligation
+/// with no runtime behaviour to observe, and the no-fallback `http: Option<Client>`, whose
+/// `None` arm is only reachable if reqwest cannot initialise a TLS backend at all — a
+/// condition no test can force without a test-only constructor.
+///
+/// Both planes are on loopback, so the fixture is the permissive `test_state`: the whole
+/// point is that the *first* address is allowed. The assertion is on the second plane —
+/// `token_call_count() == 0` and, stronger, that the refresh token's plaintext never appeared
+/// in any body it received.
+#[tokio::test]
+async fn oauth_token_refresh_never_follows_a_redirect_away_from_the_validated_endpoint() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let state = test_state(&pool).await;
+    // `entry` is the configured, validated endpoint; `exfiltration` is where its redirect
+    // points. Two separate servers rather than two routes on one, so "did the token reach the
+    // redirect target" is answered by a counter that the first hop cannot touch.
+    let entry = MockControlPlane::start().await;
+    let exfiltration = MockControlPlane::start().await;
+    entry
+        .set_token_script(TokenScript::Redirect {
+            status: StatusCode::TEMPORARY_REDIRECT,
+            location: exfiltration.token_endpoint(),
+        })
+        .await;
+    let actor = admin_actor();
+    let admin = AdminService::new(&state).expect("admin service");
+
+    let provider = admin
+        .create_provider(
+            &actor,
+            &request_context(),
+            ProviderCreateRequest {
+                provider_type: ProviderType::Anthropic,
+                display_name: "Redirecting IdP".to_string(),
+                base_url: None,
+                metadata: json!({ "oauth_token_endpoint": entry.token_endpoint() }),
+            },
+        )
+        .await
+        .expect("create provider");
+
+    let expires_soon = Utc::now() + chrono::Duration::seconds(60);
+    let credential = admin
+        .create_credential(
+            &actor,
+            &request_context(),
+            CredentialCreateRequest {
+                provider_id: provider.id,
+                credential_type: CredentialType::Oauth2,
+                scope: CredentialScope::Global,
+                secret: CredentialSecret::OAuth2 {
+                    access_token: "old-access-token".to_string(),
+                    refresh_token: Some(REDIRECT_TEST_REFRESH_TOKEN.to_string()),
+                    token_type: Some("Bearer".to_string()),
+                    expires_at: Some(expires_soon),
+                },
+                display_name: Some("Redirect test credential".to_string()),
+                priority: 100,
+                expires_at: Some(expires_soon),
+                metadata: json!({}),
+            },
+        )
+        .await
+        .expect("create oauth2 credential");
+
+    let settings = WorkerSettings::default();
+    queue(&pool, settings.clone())
+        .enqueue("oauth-token-refresh", json!({}), None, &metrics())
+        .await
+        .expect("enqueue oauth-token-refresh");
+    let outcome = dispatch_one(&state, settings).await;
+
+    assert_eq!(
+        entry.token_call_count(),
+        1,
+        "the validated endpoint is allowed and must be called exactly once — otherwise this \
+         test would pass for the wrong reason"
+    );
+    assert!(
+        entry.observed_secret(REDIRECT_TEST_REFRESH_TOKEN).await,
+        "sanity: the refresh token really is in the body of the request that was allowed, so \
+         a followed redirect would carry it"
+    );
+    assert_eq!(
+        exfiltration.token_call_count(),
+        0,
+        "a 307 from a validated token endpoint must not re-issue the exchange against the \
+         Location target"
+    );
+    assert!(
+        !exfiltration
+            .observed_secret(REDIRECT_TEST_REFRESH_TOKEN)
+            .await,
+        "the decrypted refresh token must never reach the redirect target"
+    );
+    assert_eq!(
+        outcome.completed, 1,
+        "the job itself still completes; only this credential's refresh fails"
+    );
+
+    let admin_repo = PgAdminRepository::new(pool.clone());
+    let unchanged = admin_repo
+        .get_credential(credential.id)
+        .await
+        .expect("load the credential");
+    assert_eq!(
+        unchanged.version, credential.version,
+        "a refresh that ended at a 3xx must not rewrite the credential"
+    );
+
+    entry.shutdown().await;
+    exfiltration.shutdown().await;
+}
+
+/// A distinctive plaintext so `observed_secret` cannot match on something incidental.
+const REDIRECT_TEST_REFRESH_TOKEN: &str = "redirect-probe-refresh-token-8f2a1c";
 
 async fn status_of(pool: &PgPool, id: Uuid) -> String {
     sqlx::query_scalar("select status from worker_jobs where id = $1")
