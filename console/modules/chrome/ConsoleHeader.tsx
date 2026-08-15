@@ -69,6 +69,7 @@ const NAV_ITEMS: readonly NavItem[] = [
   { href: "/providers/health", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_provider_health },
   { href: "/evals", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_evals },
   { href: "/flows", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_flows },
+  { href: "/playground", labelKey: CONSOLE_MESSAGE_KEYS.chrome_nav_playground },
 ];
 
 export interface ConsoleHeaderProps {

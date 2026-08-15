@@ -2446,6 +2446,731 @@ assertKeyContract<
   >
 >();
 
+/* -------------------------------------------------------------------------- */
+/* The playground (issue #261) — public execution DTOs                        */
+/* -------------------------------------------------------------------------- */
+//
+// Everything below models `POST /api/v1/responses`, `POST /api/v1/responses/stream`,
+// `GET /api/v1/executions/{execution_id}` and `POST /api/v1/admin/runtime/diagnose` —
+// the real execution path the playground drives, plus the admin-only diagnostic
+// surface it falls back to for routing transparency and tool-call visibility.
+// See `modules/playground/` and `app/api/playground/**` for the callers.
+//
+// A `oneOf` schema (a discriminated union with no top-level `properties`/`required`
+// of its own — `PublicContentPart`, `PublicOutputItem`, `PublicOutputContentPart`)
+// gets a plain TypeScript union and deliberately NO `*_CONTRACT`: the contract
+// test reads `schema.properties`/`schema.required` directly, and a `oneOf` schema
+// has neither at its own top level, so welding `ExactKeys` to one would either
+// fail to compile or silently assert an empty required/optional set. The same
+// applies to every bare string enum (`PublicMessageRole`, `RuntimeEventType`,
+// …) — enums are not run through this machinery anywhere else in this file
+// either (see `ProviderType`, `ResourceStatus`).
+
+/** `#/components/schemas/PublicMessageRole`. */
+export type PublicMessageRole = "system" | "developer" | "user" | "assistant" | "tool";
+
+/**
+ * `#/components/schemas/PublicContentPart` — a `oneOf`, not a flat object. The
+ * playground only ever constructs the `input_text` arm; `input_image` is
+ * modelled for completeness of the read side, not because this console sends one.
+ */
+export type PublicContentPart =
+  | { readonly type: "input_text"; readonly text: string }
+  | { readonly type: "input_image"; readonly image_url: string };
+
+/** `#/components/schemas/PublicInputMessage`. `additionalProperties: false`. */
+export interface PublicInputMessage {
+  role: PublicMessageRole;
+  content: PublicContentPart[];
+}
+
+export const PUBLIC_INPUT_MESSAGE_CONTRACT = {
+  schema: "PublicInputMessage",
+  required: ["role", "content"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicInputMessage,
+    (typeof PUBLIC_INPUT_MESSAGE_CONTRACT)["required"][number],
+    (typeof PUBLIC_INPUT_MESSAGE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicResponseRequest`. `additionalProperties: false` —
+ * a field this console does not use must still be declared here so the
+ * contract test's key-set comparison passes; `response_format`, `tools`,
+ * `tool_choice` and `conversation` are typed loosely (`unknown`) because the
+ * playground never constructs one (see `modules/playground/PlaygroundScreen.tsx`
+ * — non-goals: prompt libraries, conversation persistence, client-declared
+ * tools). `credential_id` and `seed` are likewise declared but unused.
+ */
+export interface PublicResponseRequest {
+  input: PublicInputMessage[];
+  conversation?: unknown;
+  credential_id?: string | null;
+  max_output_tokens?: number | null;
+  metadata?: JsonValue;
+  model?: string | null;
+  /** A provider UUID, despite the field's name — not a string hint. */
+  provider?: string | null;
+  response_format?: unknown;
+  route?: string | null;
+  seed?: number | null;
+  temperature?: number | null;
+  timeout_ms?: number | null;
+  tool_choice?: unknown;
+  tools?: unknown[];
+  top_p?: number | null;
+}
+
+export const PUBLIC_RESPONSE_REQUEST_CONTRACT = {
+  schema: "PublicResponseRequest",
+  required: ["input"],
+  optional: [
+    "conversation",
+    "credential_id",
+    "max_output_tokens",
+    "metadata",
+    "model",
+    "provider",
+    "response_format",
+    "route",
+    "seed",
+    "temperature",
+    "timeout_ms",
+    "tool_choice",
+    "tools",
+    "top_p",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicResponseRequest,
+    (typeof PUBLIC_RESPONSE_REQUEST_CONTRACT)["required"][number],
+    (typeof PUBLIC_RESPONSE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicOutputContentPart` — a `oneOf`. See the section header. */
+export type PublicOutputContentPart =
+  | { readonly type: "output_text"; readonly text: string }
+  | { readonly type: "output_unavailable"; readonly reason: string };
+
+/**
+ * `#/components/schemas/PublicOutputItem` — a single-arm `oneOf`. Still gets no
+ * `*_CONTRACT`, for the reason stated at the top of this section: the schema
+ * itself carries no top-level `properties`/`required`, only its one arm does.
+ */
+export interface PublicOutputItem {
+  readonly type: "message";
+  readonly role: string;
+  readonly content: PublicOutputContentPart[];
+}
+
+/** `#/components/schemas/PublicCitation`. */
+export interface PublicCitation {
+  id: string;
+  type: string;
+  document_id?: string | null;
+  memory_id?: string | null;
+  section?: string | null;
+  title?: string | null;
+}
+
+export const PUBLIC_CITATION_CONTRACT = {
+  schema: "PublicCitation",
+  required: ["id", "type"],
+  optional: ["document_id", "memory_id", "section", "title"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicCitation,
+    (typeof PUBLIC_CITATION_CONTRACT)["required"][number],
+    (typeof PUBLIC_CITATION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicConversationRef`. */
+export interface PublicConversationRef {
+  id: string;
+}
+
+export const PUBLIC_CONVERSATION_REF_CONTRACT = {
+  schema: "PublicConversationRef",
+  required: ["id"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicConversationRef,
+    (typeof PUBLIC_CONVERSATION_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_CONVERSATION_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicRouteRef` — which route actually served. */
+export interface PublicRouteRef {
+  id: string;
+  key: string;
+}
+
+export const PUBLIC_ROUTE_REF_CONTRACT = {
+  schema: "PublicRouteRef",
+  required: ["id", "key"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicRouteRef,
+    (typeof PUBLIC_ROUTE_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_ROUTE_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicModelRef` — which provider/model actually served. */
+export interface PublicModelRef {
+  id: string;
+  provider: ProviderType;
+  key: string;
+}
+
+export const PUBLIC_MODEL_REF_CONTRACT = {
+  schema: "PublicModelRef",
+  required: ["id", "provider", "key"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicModelRef,
+    (typeof PUBLIC_MODEL_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_MODEL_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicUsageSummary`. Every field nullable — a provider may report none of them. */
+export interface PublicUsageSummary {
+  cached_input_tokens?: number | null;
+  currency?: string | null;
+  estimated_cost?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export const PUBLIC_USAGE_SUMMARY_CONTRACT = {
+  schema: "PublicUsageSummary",
+  required: [],
+  optional: [
+    "cached_input_tokens",
+    "currency",
+    "estimated_cost",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicUsageSummary,
+    (typeof PUBLIC_USAGE_SUMMARY_CONTRACT)["required"][number],
+    (typeof PUBLIC_USAGE_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicResponseStatus`. */
+export type PublicResponseStatus = "queued" | "in_progress" | "completed" | "failed" | "cancelled";
+
+/** `#/components/schemas/PublicResponse` — the non-streaming (and post-stream `GET`) shape. */
+export interface PublicResponse {
+  id: string;
+  object: string;
+  created_at: string;
+  status: PublicResponseStatus;
+  execution_id: string;
+  request_id: string;
+  output: PublicOutputItem[];
+  citations: PublicCitation[];
+  usage: PublicUsageSummary;
+  metadata: JsonValue;
+  output_persisted: boolean;
+  conversation?: PublicConversationRef | null;
+  model?: PublicModelRef | null;
+  route?: PublicRouteRef | null;
+}
+
+export const PUBLIC_RESPONSE_CONTRACT = {
+  schema: "PublicResponse",
+  required: [
+    "id",
+    "object",
+    "created_at",
+    "status",
+    "execution_id",
+    "request_id",
+    "output",
+    "citations",
+    "usage",
+    "metadata",
+    "output_persisted",
+  ],
+  optional: ["conversation", "model", "route"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicResponse,
+    (typeof PUBLIC_RESPONSE_CONTRACT)["required"][number],
+    (typeof PUBLIC_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicSseEnvelope` — one frame of `POST
+ * /api/v1/responses/stream`. `type` names the event (`response.created`,
+ * mapped runtime events like `response.routing.completed`, and exactly one
+ * terminal event per stream); `payload` is that event's own shape, which this
+ * console reads defensively field-by-field rather than typing exhaustively —
+ * see `lib/sse.ts` and `modules/playground/PlaygroundScreen.tsx`.
+ */
+export interface PublicSseEnvelope {
+  response_id: string;
+  execution_id: string;
+  request_id: string;
+  sequence: number;
+  timestamp: string;
+  type: string;
+  payload: JsonValue;
+}
+
+export const PUBLIC_SSE_ENVELOPE_CONTRACT = {
+  schema: "PublicSseEnvelope",
+  required: ["response_id", "execution_id", "request_id", "sequence", "timestamp", "type", "payload"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicSseEnvelope,
+    (typeof PUBLIC_SSE_ENVELOPE_CONTRACT)["required"][number],
+    (typeof PUBLIC_SSE_ENVELOPE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicExecutionSummary` — `GET
+ * /api/v1/executions/{execution_id}`. The baseline routing-transparency source
+ * reachable with NO extra scope beyond the execution itself: `attempt_count`
+ * and `latency_ms` are real, but there is no per-attempt array here and no
+ * `candidate_rank`/`candidate_score`/`selection_reason` — those exist only in
+ * `RuntimeEventEnvelope` payloads behind `POST /api/v1/admin/runtime/diagnose`.
+ * See that endpoint's doc comment on `DiagnosticExecutionResponse` below.
+ */
+export interface PublicExecutionSummary {
+  execution_id: string;
+  response_id: string;
+  request_id: string;
+  status: PublicResponseStatus;
+  attempt_count: number;
+  usage: PublicUsageSummary;
+  completed_at?: string | null;
+  failure_class?: string | null;
+  latency_ms?: number | null;
+  model?: PublicModelRef | null;
+  route?: PublicRouteRef | null;
+  started_at?: string | null;
+}
+
+export const PUBLIC_EXECUTION_SUMMARY_CONTRACT = {
+  schema: "PublicExecutionSummary",
+  required: ["execution_id", "response_id", "request_id", "status", "attempt_count", "usage"],
+  optional: ["completed_at", "failure_class", "latency_ms", "model", "route", "started_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicExecutionSummary,
+    (typeof PUBLIC_EXECUTION_SUMMARY_CONTRACT)["required"][number],
+    (typeof PUBLIC_EXECUTION_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* The runtime diagnostic surface — `POST /api/v1/admin/runtime/diagnose`     */
+/* -------------------------------------------------------------------------- */
+//
+// Disabled by default (`runtime.diagnostic_endpoint_enabled = false`, a 404
+// when off) and gated on `moira:runtime:diagnose` — see
+// `app/api/playground/diagnose/route.ts`. It is the ONLY committed HTTP
+// surface that returns `candidate_ranked`/`fallback_selected` with
+// rank/score/selection-reason, and the only one that returns
+// `tool_call_started`/`tool_call_delta`/`tool_result` at all:
+// `map_runtime_event` (`src/application/public.rs`) deliberately drops all
+// four tool-call event types and `candidate_ranked` from the public SSE
+// stream, so the playground's tool-call and per-candidate views exist only
+// behind this endpoint. See the PR description for the shape of that gap.
+
+/** `#/components/schemas/ComplexityTier`. Inert in this MVP-static slice — see `ExecutionOptions.complexity_hint`. */
+export type ComplexityTier = "trivial" | "standard" | "heavy";
+
+/**
+ * `#/components/schemas/ExecutionOptions`. Every field optional on the wire.
+ * `priority`/`complexity_hint` are reachable ONLY through
+ * `DiagnosticExecutionRequest.options` — `POST /api/v1/responses` hardcodes
+ * both to `None` regardless of what the caller sends (`src/application/public.rs`),
+ * which is why the playground's priority/complexity controls are wired to the
+ * diagnose call, not the chat call.
+ */
+export interface ExecutionOptions {
+  allow_fallback?: boolean;
+  complexity_hint?: ComplexityTier | null;
+  max_fallbacks?: number | null;
+  max_retries?: number | null;
+  max_tokens?: number | null;
+  output_schema?: JsonValue;
+  priority?: number | null;
+  required_capabilities?: string[];
+  stream?: boolean;
+  temperature?: number | null;
+  timeout_ms?: number | null;
+}
+
+export const EXECUTION_OPTIONS_CONTRACT = {
+  schema: "ExecutionOptions",
+  required: [],
+  optional: [
+    "allow_fallback",
+    "complexity_hint",
+    "max_fallbacks",
+    "max_retries",
+    "max_tokens",
+    "output_schema",
+    "priority",
+    "required_capabilities",
+    "stream",
+    "temperature",
+    "timeout_ms",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionOptions,
+    (typeof EXECUTION_OPTIONS_CONTRACT)["required"][number],
+    (typeof EXECUTION_OPTIONS_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/DiagnosticExecutionRequest`. `additionalProperties: false`. */
+export interface DiagnosticExecutionRequest {
+  prompt: string;
+  application_id?: string | null;
+  credential_id?: string | null;
+  external_tenant_id?: string | null;
+  external_user_id?: string | null;
+  metadata?: JsonValue;
+  options?: ExecutionOptions;
+  provider_id?: string | null;
+  provider_model_id?: string | null;
+  route?: string | null;
+  stream?: boolean;
+}
+
+export const DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT = {
+  schema: "DiagnosticExecutionRequest",
+  required: ["prompt"],
+  optional: [
+    "application_id",
+    "credential_id",
+    "external_tenant_id",
+    "external_user_id",
+    "metadata",
+    "options",
+    "provider_id",
+    "provider_model_id",
+    "route",
+    "stream",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    DiagnosticExecutionRequest,
+    (typeof DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT)["required"][number],
+    (typeof DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RuntimeEventType`. `snake_case` on the wire, matching `event_type` below verbatim. */
+export type RuntimeEventType =
+  | "execution_started"
+  | "routing_started"
+  | "route_selected"
+  | "agent_profile_unavailable"
+  | "model_selected"
+  | "candidate_ranked"
+  | "provider_attempt_started"
+  | "output_text_delta"
+  | "tool_call_started"
+  | "tool_call_delta"
+  | "tool_call_completed"
+  | "tool_result"
+  | "usage_updated"
+  | "provider_attempt_failed"
+  | "fallback_selected"
+  | "execution_completed"
+  | "execution_failed";
+
+/**
+ * `#/components/schemas/RuntimeEventEnvelope` — one entry of
+ * `DiagnosticExecutionResponse.events`, returned VERBATIM and unfiltered
+ * (unlike the public SSE stream's `map_runtime_event`). `payload`'s shape
+ * depends on `event_type`; see `modules/playground/PlaygroundToolCalls.tsx`
+ * and `PlaygroundRoutingSummary.tsx` for the field names each event carries,
+ * transcribed from `src/application/execution.rs`.
+ */
+export interface RuntimeEventEnvelope {
+  request_id: string;
+  execution_id: string;
+  sequence: number;
+  timestamp: string;
+  event_type: RuntimeEventType;
+  payload: JsonValue;
+}
+
+export const RUNTIME_EVENT_ENVELOPE_CONTRACT = {
+  schema: "RuntimeEventEnvelope",
+  required: ["request_id", "execution_id", "sequence", "timestamp", "event_type", "payload"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RuntimeEventEnvelope,
+    (typeof RUNTIME_EVENT_ENVELOPE_CONTRACT)["required"][number],
+    (typeof RUNTIME_EVENT_ENVELOPE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AttemptStatus`. */
+export type AttemptStatus = "started" | "succeeded" | "failed" | "cancelled";
+
+/**
+ * `#/components/schemas/UsageSummary` — a schema DISTINCT from
+ * `PublicUsageSummary` above (no `currency`/`estimated_cost`), even though the
+ * two are field-for-field identical apart from that. Two separate schema names
+ * in `docs/openapi.json`, so two separate contracts here — see "the descriptor
+ * arrays do not overlap" in the contract test.
+ */
+export interface UsageSummary {
+  cached_input_tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export const USAGE_SUMMARY_CONTRACT = {
+  schema: "UsageSummary",
+  required: [],
+  optional: ["cached_input_tokens", "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    UsageSummary,
+    (typeof USAGE_SUMMARY_CONTRACT)["required"][number],
+    (typeof USAGE_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ProviderAttemptSummary` — one row of `ExecutionOutcome.attempts`. */
+export interface ProviderAttemptSummary {
+  attempt_id: string;
+  attempt_number: number;
+  provider_id: string;
+  provider_model_id: string;
+  credential_id: string;
+  status: AttemptStatus;
+  usage: UsageSummary;
+  failure_class?: string | null;
+  latency_ms?: number | null;
+}
+
+export const PROVIDER_ATTEMPT_SUMMARY_CONTRACT = {
+  schema: "ProviderAttemptSummary",
+  required: [
+    "attempt_id",
+    "attempt_number",
+    "provider_id",
+    "provider_model_id",
+    "credential_id",
+    "status",
+    "usage",
+  ],
+  optional: ["failure_class", "latency_ms"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderAttemptSummary,
+    (typeof PROVIDER_ATTEMPT_SUMMARY_CONTRACT)["required"][number],
+    (typeof PROVIDER_ATTEMPT_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ModelSelectionReason` — why the FINAL model won, on `ExecutionOutcome.model`. */
+export type ModelSelectionReason = "explicit_hint" | "priority" | "weighted";
+
+/** `#/components/schemas/RouteSelectionReason`. */
+export type RouteSelectionReason =
+  | "explicit_hint"
+  | "rule_match"
+  | "application_default"
+  | "global_default";
+
+/**
+ * `#/components/schemas/AttemptSelectionReason` — why THIS candidate was tried,
+ * on the `candidate_ranked` event payload. Distinct from `ModelSelectionReason`
+ * — see that type's Rust doc comment, transcribed on `RuntimeEventType.candidate_ranked` above.
+ */
+export type AttemptSelectionReason = "priority" | "explicit_hint" | "scored" | "fallback_after_failure";
+
+/** `#/components/schemas/ModelDecision` — `ExecutionOutcome.model`. */
+export interface ModelDecision {
+  policy_id: string;
+  provider_id: string;
+  provider_model_id: string;
+  model_key: string;
+  provider_type: ProviderType;
+  reason: ModelSelectionReason;
+}
+
+export const MODEL_DECISION_CONTRACT = {
+  schema: "ModelDecision",
+  required: ["policy_id", "provider_id", "provider_model_id", "model_key", "provider_type", "reason"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ModelDecision,
+    (typeof MODEL_DECISION_CONTRACT)["required"][number],
+    (typeof MODEL_DECISION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RouteDecision` — `ExecutionOutcome.route`. */
+export interface RouteDecision {
+  route_id: string;
+  route_key: string;
+  reason: RouteSelectionReason;
+  agent_profile_id?: string | null;
+}
+
+export const ROUTE_DECISION_CONTRACT = {
+  schema: "RouteDecision",
+  required: ["route_id", "route_key", "reason"],
+  optional: ["agent_profile_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RouteDecision,
+    (typeof ROUTE_DECISION_CONTRACT)["required"][number],
+    (typeof ROUTE_DECISION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ExecutionFailure`. `class` is typed loosely (`string`) rather than as the 34-variant `ExecutionFailureClass` enum — this console only displays it. */
+export interface ExecutionFailure {
+  class: string;
+  message: string;
+  retryable: boolean;
+  fallback_eligible: boolean;
+}
+
+export const EXECUTION_FAILURE_CONTRACT = {
+  schema: "ExecutionFailure",
+  required: ["class", "message", "retryable", "fallback_eligible"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionFailure,
+    (typeof EXECUTION_FAILURE_CONTRACT)["required"][number],
+    (typeof EXECUTION_FAILURE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ExecutionStatus`. */
+export type ExecutionStatus = "succeeded" | "failed" | "cancelled";
+
+/** `#/components/schemas/ExecutionOutcome` — the typed half of `DiagnosticExecutionResponse`. */
+export interface ExecutionOutcome {
+  request_id: string;
+  execution_id: string;
+  status: ExecutionStatus;
+  usage: UsageSummary;
+  attempts: ProviderAttemptSummary[];
+  failure?: ExecutionFailure | null;
+  model?: ModelDecision | null;
+  output_text?: string | null;
+  route?: RouteDecision | null;
+  structured_output?: JsonValue;
+}
+
+export const EXECUTION_OUTCOME_CONTRACT = {
+  schema: "ExecutionOutcome",
+  required: ["request_id", "execution_id", "status", "usage", "attempts"],
+  optional: ["failure", "model", "output_text", "route", "structured_output"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionOutcome,
+    (typeof EXECUTION_OUTCOME_CONTRACT)["required"][number],
+    (typeof EXECUTION_OUTCOME_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/DiagnosticExecutionResponse` — `outcome` is the typed,
+ * structured result; `events` is EVERY `RuntimeEventEnvelope` this execution
+ * emitted, unfiltered. `candidate_ranked`'s `candidates[]` (rank/score/reason)
+ * and every `tool_call_*`/`tool_result` event exist ONLY in `events` — neither
+ * appears in `outcome`.
+ */
+export interface DiagnosticExecutionResponse {
+  outcome: ExecutionOutcome;
+  events: RuntimeEventEnvelope[];
+}
+
+export const DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT = {
+  schema: "DiagnosticExecutionResponse",
+  required: ["outcome", "events"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    DiagnosticExecutionResponse,
+    (typeof DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT)["required"][number],
+    (typeof DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
 /**
  * Every schema descriptor, for the contract test to iterate.
  *
@@ -2525,4 +3250,25 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   GRAPH_RESPONSE_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
+  // --- the playground (issue #261) ---------------------------------------
+  PUBLIC_INPUT_MESSAGE_CONTRACT,
+  PUBLIC_RESPONSE_REQUEST_CONTRACT,
+  PUBLIC_CITATION_CONTRACT,
+  PUBLIC_CONVERSATION_REF_CONTRACT,
+  PUBLIC_ROUTE_REF_CONTRACT,
+  PUBLIC_MODEL_REF_CONTRACT,
+  PUBLIC_USAGE_SUMMARY_CONTRACT,
+  PUBLIC_RESPONSE_CONTRACT,
+  PUBLIC_SSE_ENVELOPE_CONTRACT,
+  PUBLIC_EXECUTION_SUMMARY_CONTRACT,
+  EXECUTION_OPTIONS_CONTRACT,
+  DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT,
+  RUNTIME_EVENT_ENVELOPE_CONTRACT,
+  USAGE_SUMMARY_CONTRACT,
+  PROVIDER_ATTEMPT_SUMMARY_CONTRACT,
+  MODEL_DECISION_CONTRACT,
+  ROUTE_DECISION_CONTRACT,
+  EXECUTION_FAILURE_CONTRACT,
+  EXECUTION_OUTCOME_CONTRACT,
+  DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT,
 ];

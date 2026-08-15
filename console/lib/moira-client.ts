@@ -81,6 +81,8 @@ import type {
   ConsoleClaimAdminIdentityRequest,
   ConsoleTrustedJwtIssuerCreateRequest,
   ConsoleProviderModelCreateRequest,
+  DiagnosticExecutionRequest,
+  DiagnosticExecutionResponse,
   EvalCaseCreateRequest,
   EvalCaseRecord,
   EvalRunRecord,
@@ -94,6 +96,9 @@ import type {
   ProviderModelRecord,
   ProviderPatchRequest,
   ProviderRecord,
+  PublicExecutionSummary,
+  PublicResponse,
+  PublicResponseRequest,
   RouteDefinitionRecord,
   RoutingPolicyCreateRequest,
   RoutingPolicyPatchRequest,
@@ -1035,6 +1040,70 @@ export const MOIRA_OPERATIONS = {
     id: "list_agent_profiles",
     method: "GET",
     path: "/api/v1/admin/agent-profiles",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+
+  /* ---------------------------------------------------------------------- */
+  /* The playground (issue #261) — the real execution path                  */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * `POST /api/v1/responses` — the non-streaming fallback. Declares an
+   * OPTIONAL `Idempotency-Key`; the playground does not send one (a replay of
+   * an identical prompt should run again, not silently return the first
+   * answer), which is legal — the header is declared, not required.
+   */
+  createResponse: op({
+    id: "create_response",
+    method: "POST",
+    path: "/api/v1/responses",
+    credential: "admin",
+    declaresIdempotencyKey: true,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `POST /api/v1/responses/stream` — `text/event-stream`. Registered so
+   * `#buildUrl`/`#buildHeaders` stay the single source of truth for the
+   * playground's outbound request too, but it is called through
+   * `streamResponse()` below rather than through `#request<T>`: that helper
+   * always does `await response.json()`, which would consume the stream body
+   * before a single byte reached the browser. Declares NO `Idempotency-Key`
+   * (the spec explicitly rejects one on this operation).
+   */
+  streamResponse: op({
+    id: "stream_response",
+    method: "POST",
+    path: "/api/v1/responses/stream",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `GET /api/v1/executions/{execution_id}` — the baseline routing-transparency
+   * read after a run: `attempt_count`, `latency_ms`, the route/model that
+   * served, usage. No extra scope beyond the execution itself.
+   */
+  getExecution: op({
+    id: "get_execution",
+    method: "GET",
+    path: "/api/v1/executions/{execution_id}",
+    credential: "admin",
+    declaresIdempotencyKey: false,
+    requiresIfMatch: false,
+  }),
+  /**
+   * `POST /api/v1/admin/runtime/diagnose` — disabled by default
+   * (`runtime.diagnostic_endpoint_enabled = false`, a 404 when off) and gated
+   * on `moira:runtime:diagnose` beyond that. The only committed endpoint that
+   * returns per-candidate rank/score/selection-reason and raw tool-call
+   * events — see `DiagnosticExecutionResponse` in `lib/types.ts`.
+   */
+  diagnoseRuntime: op({
+    id: "diagnose_runtime",
+    method: "POST",
+    path: "/api/v1/admin/runtime/diagnose",
     credential: "admin",
     declaresIdempotencyKey: false,
     requiresIfMatch: false,
@@ -2573,6 +2642,79 @@ export class MoiraClient {
     return this.#request<ListResponse<AgentProfileRecord>>("listAgentProfiles", {
       query: { limit: options.limit, cursor: options.cursor, status: options.status },
     });
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* The playground (issue #261) — the real execution path                  */
+  /* ---------------------------------------------------------------------- */
+
+  /** `POST /api/v1/responses` — the non-streaming fallback toggle. */
+  async createResponse(body: PublicResponseRequest): Promise<PublicResponse> {
+    return this.#request<PublicResponse>("createResponse", { body });
+  }
+
+  /**
+   * `POST /api/v1/responses/stream` — returns the RAW upstream `Response`
+   * rather than a parsed value. `#request<T>` always calls `response.json()`,
+   * which would read the stream to completion before a single SSE frame
+   * reached the browser; this method builds the url/headers through the same
+   * private helpers every other operation uses and calls `#fetch` directly
+   * instead.
+   *
+   * The caller owns the returned `Response`: a non-`ok` one carries a JSON
+   * error body exactly like every other operation (`toMoiraError` still
+   * applies — see `app/api/playground/stream/route.ts`), and an `ok` one has
+   * `.body` as the live `text/event-stream` to pipe straight through to the
+   * browser.
+   *
+   * `options.signal` is forwarded to the outbound fetch so the BFF route
+   * handler can cancel the upstream Moira execution the instant the browser
+   * aborts its own request to the console — see the stop button in
+   * `modules/playground/PlaygroundScreen.tsx`.
+   */
+  async streamResponse(
+    body: PublicResponseRequest,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<Response> {
+    const operation = MOIRA_OPERATIONS.streamResponse;
+    const url = this.#buildUrl(operation, {});
+    const headers = await this.#buildHeaders(operation, { body });
+    headers["Accept"] = "text/event-stream";
+    try {
+      return await this.#fetch(url, {
+        method: operation.method,
+        headers,
+        body: JSON.stringify(body),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+    } catch (cause) {
+      throw new MoiraRequestError(toTransportError(cause));
+    }
+  }
+
+  /**
+   * `GET /api/v1/executions/{execution_id}` — the baseline routing-transparency
+   * follow-up after a run, reachable with no scope beyond the execution
+   * itself. `executionId` is `PublicResponse.execution_id`/`PublicSseEnvelope.execution_id`
+   * verbatim, including its `exec_` prefix.
+   */
+  async getExecution(executionId: string): Promise<PublicExecutionSummary> {
+    return this.#request<PublicExecutionSummary>("getExecution", {
+      pathParams: { execution_id: executionId },
+    });
+  }
+
+  /**
+   * `POST /api/v1/admin/runtime/diagnose` — a 404
+   * (`runtime.diagnostic_endpoint_enabled` off on this deployment) or a 403
+   * (missing `moira:runtime:diagnose`, or, when `body.options.priority` /
+   * `.complexity_hint` is set, missing `moira:execution:override-priority` /
+   * `-complexity-hint`) both surface through the usual `MoiraRequestError`
+   * path, so `app/api/playground/diagnose/route.ts` renders either the same
+   * way as any other Moira refusal — the keyed envelope, not a special case.
+   */
+  async diagnoseRuntime(body: DiagnosticExecutionRequest): Promise<DiagnosticExecutionResponse> {
+    return this.#request<DiagnosticExecutionResponse>("diagnoseRuntime", { body });
   }
 
   /* ---------------------------------------------------------------------- */
