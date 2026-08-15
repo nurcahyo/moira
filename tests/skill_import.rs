@@ -664,6 +664,42 @@ impl Fixture {
             .expect("overwrite the provider base_url");
     }
 
+    /// Writes an `allowed_host` no import could produce, because the SSRF guard resolves the
+    /// destination and `.example` does not resolve. The certifier that disproved this
+    /// section's old "cannot miss a row" claim used `api.vendor.example`, and the shapes at
+    /// issue are only fully reproducible on a host whose first character is a letter: a
+    /// digit cannot begin a URL scheme, so `1.1.1.1:8443/v1` fails to parse for a different
+    /// reason than `api.vendor.example:8443/v1`, which parses into a scheme with no host.
+    async fn force_allowed_host(&self, skill_id: Uuid, allowed_host: &str) {
+        sqlx::query("update skill_http_executors set allowed_host = $1 where skill_id = $2")
+            .bind(allowed_host)
+            .bind(skill_id)
+            .execute(&self.pool)
+            .await
+            .expect("overwrite the executor allowed_host");
+    }
+
+    /// Seeds one executor that was entitled when it was bound and is not any more, by
+    /// rewriting both sides of the rule to a state only a migration, a restore or a direct
+    /// `psql` edit can reach. Returns `(skill_id, credential_id)` so the caller can ask the
+    /// documented query and `resolve_skill_credential` about the very same row.
+    async fn executor_forced_to(
+        &self,
+        label: &str,
+        base_url: &str,
+        allowed_host: &str,
+    ) -> (Uuid, Uuid) {
+        let (skill_id, etag) = self.imported_executor(OTHER_PUBLIC_TEST_HOST, label).await;
+        let credential_id = self
+            .credential_on_provider_at(OTHER_PUBLIC_TEST_HOST, label)
+            .await;
+        self.bind_credential(skill_id, &etag, credential_id).await;
+        self.force_provider_base_url(self.provider_of(credential_id).await, base_url)
+            .await;
+        self.force_allowed_host(skill_id, allowed_host).await;
+        (skill_id, credential_id)
+    }
+
     /// Binds a credential to a skill's executor through the admin route, which enforces the
     /// entitlement rule — so anything bound this way was entitled at bind time.
     async fn bind_credential(&self, skill_id: Uuid, etag: &str, credential_id: Uuid) {
@@ -700,9 +736,17 @@ impl Fixture {
 /// host extraction meet the one form a `split_part(…, ':', 1)` cannot survive.
 const PUBLIC_IPV6_TEST_HOST: &str = "[2001:4860:4860::8888]";
 
+/// The host the certifier's disproof used, kept verbatim. Nothing here reaches the network:
+/// every row carrying it is written straight to the database, because none of these shapes
+/// can be written through the admin API and `.example` resolves nowhere. It has to begin with
+/// a letter — a scheme cannot start with a digit, so an IP literal could not demonstrate the
+/// `host:port/path` shape parsing into a *scheme* with no host.
+const UNPARSEABLE_TEST_HOST: &str = "api.vendor.example";
+
 /// The pre-deploy inventory query is the **only** tool an operator has for finding the rows
-/// this rule breaks, so it is executed here rather than trusted, against the four shapes it
-/// has to classify. Two of them are the round-two defects:
+/// this rule breaks, so it is executed here rather than trusted, against every shape it has
+/// to classify. Each seeded row is put to the query *and* to `resolve_skill_credential`, so
+/// the two are compared against each other rather than against a second reading of the SQL.
 ///
 /// 1. **A soft-deleted provider (`reason = 'provider_deleted'`).** The execution-time lookup
 ///    requires the owning `providers` row to be live, so the credential is refused — a
@@ -716,9 +760,16 @@ const PUBLIC_IPV6_TEST_HOST: &str = "[2001:4860:4860::8888]";
 ///    `Url::host_str()` and permits them. A false positive is the safe direction for *finding*
 ///    rows, but it is not free here: repair 1 in the same document moves a live completion
 ///    endpoint, so sending an operator to a row that was never broken has a cost.
+/// 3. **Four rows the code refuses and a string extraction happily reports as fine
+///    (`reason = 'base_url_unparseable'`).** These are the false negatives, and they are the
+///    reason the document no longer claims the query "cannot miss a row the code refuses":
+///    each `base_url` spells the executor's `allowed_host` clearly enough for the SQL to
+///    return it, while `Url::parse` produces no such host — no scheme at all, a scheme that
+///    is really the host, a non-numeric port, a port out of range. An operator running the
+///    query saw nothing, deployed, and the skill broke. This direction has no safe side.
 ///
-/// The fourth is the ordinary host mismatch the query already found, kept so a fix to the
-/// other three cannot quietly cost the original coverage.
+/// The last is the ordinary host mismatch the query already found, kept so a fix to the
+/// others cannot quietly cost the original coverage.
 #[tokio::test]
 async fn the_documented_inventory_query_finds_every_row_the_binding_rule_refuses() {
     let Some(fixture) = Fixture::new().await else {
@@ -772,7 +823,36 @@ async fn the_documented_inventory_query_finds_every_row_the_binding_rule_refuses
         )
         .await;
 
-    // 4. The plain host mismatch — bound the way an upgrade inherits it, since no admin route
+    // 4. The false negatives: `base_url` values that spell UNPARSEABLE_TEST_HOST plainly and
+    //    that `Url::parse` nevertheless yields no host for. Both schemeless shapes are the
+    //    certifier's own rows, reproduced verbatim.
+    let unparseable: Vec<(&str, Uuid, Uuid)> = {
+        let mut seeded = Vec::new();
+        for (label, base_url) in [
+            // No scheme, so not an absolute URL at all.
+            ("invnoscheme", format!("{UNPARSEABLE_TEST_HOST}/v1")),
+            // Parses — as a scheme named api.vendor.example with an opaque path and no host.
+            ("invschemeport", format!("{UNPARSEABLE_TEST_HOST}:8443/v1")),
+            // Has a scheme, but the port is not a port.
+            (
+                "invbadport",
+                format!("https://{UNPARSEABLE_TEST_HOST}:nope/v1"),
+            ),
+            // Has a scheme and a numeric port, and 99999 is not a port either.
+            (
+                "invbigport",
+                format!("https://{UNPARSEABLE_TEST_HOST}:99999/v1"),
+            ),
+        ] {
+            let (skill, credential) = fixture
+                .executor_forced_to(label, &base_url, UNPARSEABLE_TEST_HOST)
+                .await;
+            seeded.push((label, skill, credential));
+        }
+        seeded
+    };
+
+    // 5. The plain host mismatch — bound the way an upgrade inherits it, since no admin route
     //    accepts this binding today.
     let (mismatch_skill, _) = fixture
         .imported_executor(THIRD_PUBLIC_TEST_HOST, "invmismatch")
@@ -827,6 +907,18 @@ async fn the_documented_inventory_query_finds_every_row_the_binding_rule_refuses
         ),
         "the plain mismatch must still be refused"
     );
+    for (label, _, credential) in &unparseable {
+        assert!(
+            matches!(
+                fixture
+                    .resolve_skill_credential(*credential, UNPARSEABLE_TEST_HOST)
+                    .await,
+                SkillCredentialOutcome::HostNotEntitled
+            ),
+            "{label}: Url::parse yields no host for this base_url, so the execution path \
+             refuses it — that is the premise the query below has to match"
+        );
+    }
 
     let rows = sqlx::query(&documented_inventory_query())
         .fetch_all(&fixture.pool)
@@ -864,6 +956,17 @@ async fn the_documented_inventory_query_finds_every_row_the_binding_rule_refuses
         "splitting a bracketed IPv6 authority on ':' yields '[' and reports every IPv6 \
          provider as broken. Reported: {reported:?}"
     );
+    for (label, skill, _) in &unparseable {
+        assert_eq!(
+            reported.get(skill).map(String::as_str),
+            Some("base_url_unparseable"),
+            "{label}: the execution path refuses this row, so the only discovery tool an \
+             operator has must name it. Silence here is what made the document's earlier \
+             'it cannot miss a row the code refuses' false — and false in the unsafe \
+             direction, because the operator reads it as clearance to deploy. \
+             Reported: {reported:?}"
+        );
+    }
 }
 
 #[tokio::test]

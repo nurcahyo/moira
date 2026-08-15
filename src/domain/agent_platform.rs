@@ -781,12 +781,22 @@ mod credential_binding_tests {
 
     /// Hostnames are case-insensitive, and `allowed_host` is stored as the `url` crate
     /// produced it rather than as the operator typed it.
+    ///
+    /// The empty and boundary ports are the counterpart to
+    /// [`an_unparseable_or_hostless_base_url_entitles_nothing`]: `Url::parse` accepts both,
+    /// so the port check the documented inventory query grew must not report them either.
     #[test]
     fn the_host_comparison_folds_case_and_ignores_path_port_and_whitespace() {
-        assert!(credential_binding_permits_host(
-            Some("  https://API.Vendor.Example:8443/v1/chat  "),
-            "api.vendor.example"
-        ));
+        for base in [
+            "  https://API.Vendor.Example:8443/v1/chat  ",
+            "https://api.vendor.example:/v1",
+            "https://api.vendor.example:65535/v1",
+        ] {
+            assert!(
+                credential_binding_permits_host(Some(base), "api.vendor.example"),
+                "{base} names api.vendor.example and must stay entitled"
+            );
+        }
     }
 
     /// The whole point of the rule: issue #253 finding 1's exfiltration destination.
@@ -835,9 +845,27 @@ mod credential_binding_tests {
         assert!(!credential_binding_permits_host(None, "api.openai.com"));
     }
 
+    /// The shapes here are also the ones the documented inventory query in
+    /// `docs/agent-platform.md` used to miss, so this list and that query's `has_authority`
+    /// and port checks describe the same set. Each spells `api.vendor.example` plainly
+    /// enough for a string extraction to return it, and each is refused:
+    ///
+    /// * `api.vendor.example/v1` has no scheme, so it is not an absolute URL at all.
+    /// * `api.vendor.example:8443/v1` *does* parse — as a scheme named `api.vendor.example`
+    ///   carrying the opaque path `8443/v1`, with no host for `host_str()` to return.
+    /// * `:nope` and `:99999` are not ports `Url::parse` accepts, so neither value parses,
+    ///   and the host the operator can read in the string is never produced.
     #[test]
     fn an_unparseable_or_hostless_base_url_entitles_nothing() {
-        for base in ["not-a-url", "/relative/path", "mailto:ops@vendor.example"] {
+        for base in [
+            "not-a-url",
+            "/relative/path",
+            "mailto:ops@vendor.example",
+            "api.vendor.example/v1",
+            "api.vendor.example:8443/v1",
+            "https://api.vendor.example:nope/v1",
+            "https://api.vendor.example:99999/v1",
+        ] {
             assert!(
                 !credential_binding_permits_host(Some(base), "api.vendor.example"),
                 "{base} must entitle nothing"

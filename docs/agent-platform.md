@@ -165,20 +165,19 @@ with binding as (
              regexp_replace(
                regexp_replace(btrim(p.base_url), '^[A-Za-z][A-Za-z0-9+.-]*://', ''),
                '^[^/?#]*@', ''),
-             '[/?#].*$', '') as authority
+             '[/?#].*$', '') as authority,
+           -- Whether the value is shaped like something Url::parse can turn into a host at
+           -- all. Without a 'scheme://' there is no host to extract, whatever the characters
+           -- spell: 'api.vendor.example/v1' is not a URL, and 'api.vendor.example:8443/v1'
+           -- parses as a *scheme* named api.vendor.example carrying an opaque path. The code
+           -- refuses both, while the string extraction above happily returns
+           -- 'api.vendor.example' for both -- so the shape is tested, not assumed.
+           btrim(p.base_url) ~ '^[A-Za-z][A-Za-z0-9+.-]*://' as has_authority
     from skill_http_executors e
     join provider_credentials c on c.id = e.credential_id
     join providers p            on p.id = c.provider_id
     where e.credential_id is not null
-)
-select skill_id,
-       allowed_host,
-       credential_id,
-       provider_id,
-       base_url,
-       case when provider_deleted_at is not null then 'provider_deleted'
-            else 'host_mismatch' end as reason
-from (
+), split as (
     select b.*,
            -- An IPv6 literal keeps its brackets, because Url::host_str() returns them and
            -- allowed_host is stored as that function produced it. Splitting on ':' here
@@ -186,11 +185,38 @@ from (
            case when b.authority like '[%'
                 then lower(left(b.authority, position(']' in b.authority)))
                 else lower(split_part(b.authority, ':', 1))
-           end as base_url_host
+           end as base_url_host,
+           -- Whatever the ':' split dropped, kept so it can be checked rather than ignored.
+           case when b.authority like '[%'
+                then substr(b.authority, position(']' in b.authority) + 1)
+                else substr(b.authority, length(split_part(b.authority, ':', 1)) + 1)
+           end as port_suffix
     from binding b
-) resolved
+), resolved as (
+    select s.*,
+           -- What follows the host must be nothing, or a port Url::parse would accept.
+           -- ':nope' and ':99999' both fail it outright, and a bare ':' split would throw
+           -- them away and compare a host the code never produced.
+           s.has_authority
+             and s.port_suffix ~ '^(:[0-9]{0,5})?$'
+             and case when s.port_suffix ~ '^:[0-9]{1,5}$'
+                      then substr(s.port_suffix, 2)::int <= 65535
+                      else true
+                 end as base_url_parses
+    from split s
+)
+select skill_id,
+       allowed_host,
+       credential_id,
+       provider_id,
+       base_url,
+       case when provider_deleted_at is not null              then 'provider_deleted'
+            when base_url is not null and not base_url_parses then 'base_url_unparseable'
+            else 'host_mismatch' end as reason
+from resolved
 where provider_deleted_at is not null
    or base_url is null
+   or not base_url_parses
    or base_url_host is distinct from lower(allowed_host)
 order by reason, skill_id;
 ```
@@ -201,10 +227,30 @@ uses `Url::host_str()`. The extraction handles the forms that actually diverge i
 scheme, userinfo (`https://api.vendor.example@evil.example/`), port, path/query/fragment,
 surrounding whitespace, bracketed IPv6 literals — but it does not normalise an IPv6 address
 (`[0:0:0:0:0:0:0:1]` against `[::1]`), apply IDNA/punycode, or percent-decode. Those forms
-compare unequal in SQL and equal in the code, so the query can name a row the code accepts; it
-cannot miss a row the code refuses. That direction is the safe one for *finding* rows, but
-"the query returned N rows" is not the set that is broken — confirm each one before repairing
+compare unequal in SQL and equal in the code, so the query can name a row the code accepts.
+"The query returned N rows" is not the set that is broken — confirm each one before repairing
 it, especially before repair 1.
+
+**An empty result means "nothing found", not "nothing broken".** Silence in the other
+direction — a row the code refuses that the query never names — is the one that sends an
+operator into a deploy, so be exact about what is established here and what is not. This
+section used to claim the query "cannot miss a row the code refuses". It could: with
+`allowed_host = 'api.vendor.example'`, a `base_url` of `api.vendor.example/v1` went unreported,
+because a string extraction returns the host a value appears to spell while `Url::parse`
+rejects a value with no scheme at all. `api.vendor.example:8443/v1` was missed the same way,
+and that one does parse — as a *scheme* named `api.vendor.example` with no host. The
+`has_authority` and port checks above exist to close exactly those, and `:nope` and `:99999`
+with them. None of those shapes can be written through `PATCH /api/v1/admin/providers/{id}`,
+which rejects them; they arrive by migration, restore or direct SQL, which is precisely the
+population this query exists to survey.
+
+What is established is bounded by a test rather than by argument:
+`tests/skill_import.rs::the_documented_inventory_query_finds_every_row_the_binding_rule_refuses`
+executes *this block*, unmodified, against a real database and compares its verdict on each
+seeded row against what `resolve_skill_credential` returns for that same row. The shapes it
+seeds are the shapes the query and the code are known to agree on. A shape outside that set has
+been proved in neither direction — if you meet one, seed it there rather than reasoning about
+it here.
 
 **Repair each one, in whichever way is actually true of your deployment:**
 
