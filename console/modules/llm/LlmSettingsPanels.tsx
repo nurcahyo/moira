@@ -28,7 +28,7 @@
 
 import { useRouter } from "next/navigation";
 
-import type { LlmProviderView } from "@/lib/llm-view";
+import type { ClaudeCredentialStatusView, LlmProviderView } from "@/lib/llm-view";
 
 import { ConnectClaudeSubscriptionPanel } from "./ConnectClaudeSubscriptionPanel";
 import { ConnectVllmPanel } from "./ConnectVllmPanel";
@@ -38,16 +38,32 @@ import { ProviderList } from "./ProviderList";
 export interface LlmSettingsPanelsProps {
   readonly defaultBaseUrl: string;
   readonly providers: readonly LlmProviderView[];
+  /** Server-resolved: is Mode A (CLI-assisted Claude acquisition) turned on? */
+  readonly cliAcquisitionEnabled: boolean;
+  /** Status of the Claude subscription (oauth2) and API-key (api_key) rows. */
+  readonly claudeSubscriptionStatus: ClaudeCredentialStatusView;
+  readonly claudeKeyStatus: ClaudeCredentialStatusView;
 }
 
-export function LlmSettingsPanels({ defaultBaseUrl, providers }: LlmSettingsPanelsProps) {
+export function LlmSettingsPanels({
+  defaultBaseUrl,
+  providers,
+  cliAcquisitionEnabled,
+  claudeSubscriptionStatus,
+  claudeKeyStatus,
+}: LlmSettingsPanelsProps) {
   const router = useRouter();
   const reload = (): void => router.refresh();
 
   return (
     <>
       <ConnectVllmPanel defaultBaseUrl={defaultBaseUrl} onConnected={reload} />
-      <ConnectClaudeSubscriptionPanel onConnected={reload} />
+      <ConnectClaudeSubscriptionPanel
+        cliAcquisitionEnabled={cliAcquisitionEnabled}
+        subscriptionStatus={claudeSubscriptionStatus}
+        keyStatus={claudeKeyStatus}
+        onConnected={reload}
+      />
       <ProviderForm onCreated={reload} />
       <ProviderList providers={providers} onChanged={reload} />
     </>

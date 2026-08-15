@@ -84,6 +84,15 @@ export const LLM_ENDPOINTS = {
    * own dedicated provider row. See `lib/claude-subscription.ts`.
    */
   claudeSubscription: "/api/settings/llm/claude-subscription",
+  /**
+   * Mode A — mint the token server-side by running the local `claude` CLI,
+   * then store it through the SAME chain `claudeSubscription` uses. Nested
+   * under the paste endpoint's own path because it is the same credential
+   * shape, obtained a different way — not a sibling feature.
+   */
+  claudeSubscriptionAcquire: "/api/settings/llm/claude-subscription/acquire",
+  /** Mode B — an official `sk-ant-…` API key, stored as `api_key`. */
+  claudeApiKey: "/api/settings/llm/claude-api-key",
 } as const;
 
 /** `/api/llm/providers/{id}` and the collections nested under it. */
@@ -149,6 +158,42 @@ export interface LlmSettingsView {
   readonly providers: readonly LlmProviderView[];
   /** `null` when migration `0005`'s `general` route is absent. */
   readonly generalRouteId: string | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The Claude connect panel's status — deliberately NOT `LlmKeyRowView`       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `not_connected`  — no matching provider/credential row exists yet.
+ * `connected`      — a row exists; `status`/`expiresAt` describe it.
+ * `unknown`        — a list this lookup read was truncated before a match
+ *                     could be confirmed absent, so "not connected" would be
+ *                     a guess. Distinct from both of the above for the same
+ *                     reason `lib/llm-settings.ts`'s `findOnPage` treats
+ *                     "not on this page" as its own case (issue #117).
+ */
+export type ClaudeCredentialStatusKind = "not_connected" | "connected" | "unknown";
+
+/**
+ * What the "Connect a Claude credential" panel shows about ONE of its two
+ * dedicated provider rows (the oauth2 subscription row, or the api_key row).
+ *
+ * Deliberately NOT `LlmKeyRowView`: this type carries `expiresAt`, which the
+ * generic credential-row projection withholds along with `masked_secret` and
+ * `secret_fingerprint`. `expiresAt` is not secret-shaped — it says WHEN a
+ * credential needs attention, not WHAT it is — so it is exposed here; the
+ * masked value and the fingerprint are not, on the same rule
+ * `lib/moira-credential-types.ts`'s `CredentialRecord` states: neither is the
+ * raw secret, but `secret_fingerprint` is a stable identifier for one, and a
+ * browser has no reason to hold either.
+ */
+export interface ClaudeCredentialStatusView {
+  readonly kind: ClaudeCredentialStatusKind;
+  /** `CredentialStatus` from Moira, as a plain string. `null` unless `kind === "connected"`. */
+  readonly status: string | null;
+  /** ISO 8601, or `null` when `kind !== "connected"` or Moira reports none. */
+  readonly expiresAt: string | null;
 }
 
 /* -------------------------------------------------------------------------- */
