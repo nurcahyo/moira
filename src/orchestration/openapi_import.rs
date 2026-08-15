@@ -35,8 +35,35 @@
 //! first pass only enumerates `(path, method)` pairs, which is cheap even for a
 //! pathologically large document, so a spec far over the cap fails fast rather than after
 //! building 10,000 `params_schema` values it is about to discard.
+//!
+//! # The byte budget, and why the operation cap was not enough
+//!
+//! An operation count bounds *how many* schemas are derived, not *how big* they are, and the
+//! two are independent here because `$ref` resolution **deep-clones** the referenced schema
+//! once per operation. A document at the 2 MiB admin body limit
+//! (`ADMIN_BODY_LIMIT_BYTES`, `src/http/mod.rs`) can hold one ~2 MiB component schema and 300
+//! ~80-byte path entries that each `$ref` it — comfortably inside both the body limit and the
+//! operation cap — and the derivation below turns that into ~585 MiB of JSON text held at
+//! once, several times that as live [`serde_json::Value`] nodes, then 300 jsonb binds in one
+//! transaction, a response body of the same size, and (with an `Idempotency-Key`) one more
+//! copy serialised into a single jsonb column. `{"$ref": "#/paths"}` reaches the same
+//! amplification with no large component at all. One request, process-wide OOM, every tenant.
+//!
+//! Three caps close it, and the middle one is the load-bearing one:
+//!
+//! - [`MAX_DOCUMENT_BYTES`] on the input, checked before anything is derived.
+//! - [`MAX_TOTAL_SCHEMA_BYTES`] on the derived schemas **in aggregate** — this is what bounds
+//!   the peak allocation, the transaction and the response, because it is charged across
+//!   operations rather than within one.
+//! - [`MAX_OPERATION_SCHEMA_BYTES`] on any single operation, so one absurd `params_schema`
+//!   cannot be stored even when it fits the aggregate.
+//!
+//! Every charge is measured on the **referenced** value and refused *before* the clone that
+//! would materialise it — measuring after the clone would be measuring the damage. Sizes are
+//! serialised byte lengths counted through a discarding writer, so nothing is allocated to
+//! find out that it is too big.
 
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet, fmt, io};
 
 use serde_json::{Map, Value, json};
 
@@ -46,6 +73,23 @@ use crate::domain::HttpMethod;
 /// is rejected outright — never silently truncated — so the operator learns the true
 /// operation count and can split the import rather than discover a partial one later.
 pub const MAX_IMPORT_OPERATIONS: usize = 300;
+
+/// Largest serialised input document a single import accepts, a quarter of the 2 MiB admin
+/// body limit the HTTP layer already applies. Deliberately below that limit rather than equal
+/// to it: this module is pure and callable without going through Axum, so it must carry its
+/// own input bound, and the tighter the input the smaller the worst case the two caps below
+/// have to absorb.
+pub const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
+
+/// Largest derived `params_schema` for any one operation. A schema this size is already far
+/// past what a model can usefully be shown; the cap exists so one operation cannot store a
+/// row that no reader can afford to load.
+pub const MAX_OPERATION_SCHEMA_BYTES: usize = 64 * 1024;
+
+/// Largest derived `params_schema` total across every operation in one import — the cap that
+/// actually bounds the `$ref` amplification, since the whole failure mode is one big schema
+/// cloned three hundred times, each clone individually modest.
+pub const MAX_TOTAL_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
 
 /// The only HTTP methods `skill_http_executors.method` can store, in the fixed order
 /// operations are enumerated — this is what makes skill-key deduplication deterministic
@@ -81,6 +125,21 @@ pub enum OpenApiImportError {
     NoOperations,
     /// More `(path, method)` pairs than [`MAX_IMPORT_OPERATIONS`] allows.
     TooManyOperations { found: usize, cap: usize },
+    /// The serialised document is larger than [`MAX_DOCUMENT_BYTES`].
+    DocumentTooLarge { bytes: usize, cap: usize },
+    /// One operation's derived `params_schema` exceeds [`MAX_OPERATION_SCHEMA_BYTES`].
+    /// Carries the `skill_key` so the operator can find the offending operation in a
+    /// three-hundred-operation document.
+    OperationSchemaTooLarge {
+        skill_key: String,
+        bytes: usize,
+        cap: usize,
+    },
+    /// The derived `params_schema` values total more than [`MAX_TOTAL_SCHEMA_BYTES`]. Reported
+    /// with the total charged at the moment the budget ran out, which is a lower bound on what
+    /// the full import would have cost — the derivation stops there rather than continuing to
+    /// find out.
+    TotalSchemaTooLarge { bytes: usize, cap: usize },
 }
 
 impl fmt::Display for OpenApiImportError {
@@ -97,6 +156,24 @@ impl fmt::Display for OpenApiImportError {
                 f,
                 "the document defines {found} operations, which exceeds the {cap}-operation \
                  import cap"
+            ),
+            Self::DocumentTooLarge { bytes, cap } => write!(
+                f,
+                "the document is {bytes} bytes, which exceeds the {cap}-byte import limit"
+            ),
+            Self::OperationSchemaTooLarge {
+                skill_key,
+                bytes,
+                cap,
+            } => write!(
+                f,
+                "operation '{skill_key}' derives a {bytes}-byte parameter schema, which \
+                 exceeds the {cap}-byte per-operation limit"
+            ),
+            Self::TotalSchemaTooLarge { bytes, cap } => write!(
+                f,
+                "the document's operations derive at least {bytes} bytes of parameter \
+                 schemas, which exceeds the {cap}-byte total limit"
             ),
         }
     }
@@ -131,11 +208,23 @@ pub struct ParsedImport {
 }
 
 /// Parses and derives every importable operation from `document`. Enforces
-/// [`MAX_IMPORT_OPERATIONS`] but performs no SSRF check and no I/O — see the module docs.
+/// [`MAX_IMPORT_OPERATIONS`], [`MAX_DOCUMENT_BYTES`], [`MAX_OPERATION_SCHEMA_BYTES`] and
+/// [`MAX_TOTAL_SCHEMA_BYTES`], but performs no SSRF check and no I/O — see the module docs.
 pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiImportError> {
     let root = document
         .as_object()
         .ok_or(OpenApiImportError::NotAnObject)?;
+
+    // Before anything is read out of the document, let alone derived from it. `serialized_len`
+    // allocates nothing, so refusing an over-large document costs one pass over a value the
+    // caller already holds.
+    let document_bytes = serialized_len(document);
+    if document_bytes > MAX_DOCUMENT_BYTES {
+        return Err(OpenApiImportError::DocumentTooLarge {
+            bytes: document_bytes,
+            cap: MAX_DOCUMENT_BYTES,
+        });
+    }
 
     let version_ok = root
         .get("openapi")
@@ -192,6 +281,7 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
     }
 
     let mut used_keys: HashSet<String> = HashSet::new();
+    let mut budget = SchemaBudget::default();
     let operations = raw_operations
         .into_iter()
         .map(|(path, method_name, operation, method)| {
@@ -202,14 +292,84 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
                 operation,
                 method,
                 &mut used_keys,
+                &mut budget,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ParsedImport {
         base_url,
         operations,
     })
+}
+
+/// The running byte charge for one import's derived `params_schema` values.
+///
+/// It is threaded through the whole import rather than reset per operation because the attack
+/// it exists to stop is *per-operation-modest, aggregate-enormous*: three hundred clones of a
+/// 1.9 MiB schema pass any per-operation cap that a legitimate large schema also passes. The
+/// per-operation figure is kept alongside so a single absurd operation is still nameable.
+#[derive(Debug, Default)]
+struct SchemaBudget {
+    operation_bytes: usize,
+    total_bytes: usize,
+}
+
+impl SchemaBudget {
+    fn begin_operation(&mut self) {
+        self.operation_bytes = 0;
+    }
+
+    /// Charges `bytes` against both caps. Call this with the size of the value **about to be
+    /// cloned**, never with the size of the clone: the allocation is the harm, so a check that
+    /// runs after it has already happened is a report, not a guard.
+    fn charge(&mut self, bytes: usize, skill_key: &str) -> Result<(), OpenApiImportError> {
+        self.operation_bytes = self.operation_bytes.saturating_add(bytes);
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        if self.operation_bytes > MAX_OPERATION_SCHEMA_BYTES {
+            return Err(OpenApiImportError::OperationSchemaTooLarge {
+                skill_key: skill_key.to_string(),
+                bytes: self.operation_bytes,
+                cap: MAX_OPERATION_SCHEMA_BYTES,
+            });
+        }
+        if self.total_bytes > MAX_TOTAL_SCHEMA_BYTES {
+            return Err(OpenApiImportError::TotalSchemaTooLarge {
+                bytes: self.total_bytes,
+                cap: MAX_TOTAL_SCHEMA_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The serialised byte length of `value`, counted **without materialising the string** — the
+/// entire point is to avoid allocating a copy of something that is about to be refused, so
+/// `to_string().len()` would defeat the guard on exactly the input it is meant to stop.
+///
+/// `serde_json::to_writer` over a `Value` can only fail on an I/O error from the writer, and
+/// this writer never errors, so the `Result` is genuinely unreachable rather than merely
+/// unlikely; treating it as zero bytes would under-charge, so it saturates the counter instead.
+fn serialized_len(value: &Value) -> usize {
+    #[derive(Default)]
+    struct ByteCounter(usize);
+
+    impl io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 fn build_operation(
@@ -219,7 +379,8 @@ fn build_operation(
     operation: &Value,
     method: HttpMethod,
     used_keys: &mut HashSet<String>,
-) -> ParsedOperation {
+    budget: &mut SchemaBudget,
+) -> Result<ParsedOperation, OpenApiImportError> {
     let operation_id = operation
         .get("operationId")
         .and_then(Value::as_str)
@@ -257,9 +418,9 @@ fn build_operation(
         })
         .unwrap_or_default();
 
-    let params_schema = build_params_schema(root, operation);
+    let params_schema = build_params_schema(root, operation, &skill_key, budget)?;
 
-    ParsedOperation {
+    Ok(ParsedOperation {
         skill_key,
         display_name,
         description,
@@ -267,14 +428,24 @@ fn build_operation(
         params_schema,
         method,
         path: path.to_string(),
-    }
+    })
 }
 
 /// Flattens `parameters` and `requestBody` into one JSON-Schema object — see the module
 /// docs for exactly what is and is not merged.
-fn build_params_schema(root: &Value, operation: &Value) -> Value {
+///
+/// Every value this copies into `properties` is charged against `budget` *before* the copy,
+/// because the copies are the whole amplification: a resolved `$ref` is a deep clone of a
+/// subtree the document holds once and this function may hold three hundred times.
+fn build_params_schema(
+    root: &Value,
+    operation: &Value,
+    skill_key: &str,
+    budget: &mut SchemaBudget,
+) -> Result<Value, OpenApiImportError> {
     let mut properties = Map::new();
     let mut required: Vec<String> = Vec::new();
+    budget.begin_operation();
 
     if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
         for parameter in parameters {
@@ -282,8 +453,12 @@ fn build_params_schema(root: &Value, operation: &Value) -> Value {
             let Some(name) = parameter.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let schema = parameter
-                .get("schema")
+            // A parameter that declares no schema gets the fixed 17-byte `{"type":"string"}`
+            // substitute below, which cannot amplify — three hundred of them is under 6 KiB —
+            // so only a declared (and possibly `$ref`-resolved) schema is charged.
+            let declared = parameter.get("schema");
+            budget.charge(declared.map_or(0, serialized_len), skill_key)?;
+            let schema = declared
                 .cloned()
                 .unwrap_or_else(|| json!({"type": "string"}));
             if parameter
@@ -306,6 +481,7 @@ fn build_params_schema(root: &Value, operation: &Value) -> Value {
             .and_then(|media_type| media_type.get("schema"))
         {
             let schema = resolve_maybe_ref(root, schema);
+            budget.charge(serialized_len(schema), skill_key)?;
             properties.insert("body".to_string(), schema.clone());
             if request_body
                 .get("required")
@@ -323,7 +499,7 @@ fn build_params_schema(root: &Value, operation: &Value) -> Value {
     if !required.is_empty() {
         schema.insert("required".to_string(), json!(required));
     }
-    Value::Object(schema)
+    Ok(Value::Object(schema))
 }
 
 /// Resolves a `{"$ref": "#/..."}` object exactly one level against `root`. Anything that is
@@ -682,6 +858,200 @@ mod tests {
 
         let parsed = parse_openapi_document(&document).expect("must parse at the cap");
         assert_eq!(parsed.operations.len(), MAX_IMPORT_OPERATIONS);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The byte budget
+    // -----------------------------------------------------------------------------------
+
+    /// The amplification the operation cap could not see: one big component schema, three
+    /// hundred tiny operations that each `$ref` it. Every dimension the old guard measured is
+    /// inside its limit — 300 operations exactly at the cap, a document well under the admin
+    /// body limit — and the derived total is what explodes.
+    ///
+    /// Deliberately built at the shape of the real attack rather than with one absurd schema,
+    /// because a per-operation cap alone passes this and the aggregate cap is the fix.
+    ///
+    /// Sized by property *count* rather than by a target byte size, so the fixture cannot
+    /// silently drift away from what it claims; every test that uses it measures the result
+    /// with `serialized_len` and asserts which side of which cap it landed on.
+    fn ref_amplification_document(operations: usize, component_properties: usize) -> Value {
+        let mut properties = Map::new();
+        for index in 0..component_properties {
+            properties.insert(
+                format!("field_{index:06}"),
+                json!({"type": "string", "description": "x"}),
+            );
+        }
+        let mut paths = Map::new();
+        for index in 0..operations {
+            paths.insert(
+                format!("/op{index}"),
+                json!({
+                    "post": {
+                        "operationId": format!("op{index}"),
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Big"}
+                                }
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+        json!({
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": Value::Object(paths),
+            "components": {"schemas": {"Big": {"type": "object", "properties": properties}}},
+        })
+    }
+
+    /// The serialised size of the `Big` component `ref_amplification_document` builds — the
+    /// exact number each operation's `params_schema` would carry a copy of.
+    fn referenced_component_bytes(document: &Value) -> usize {
+        serialized_len(&document["components"]["schemas"]["Big"])
+    }
+
+    #[test]
+    fn rejects_ref_amplification_that_the_operation_cap_cannot_see() {
+        let document = ref_amplification_document(MAX_IMPORT_OPERATIONS, 800);
+
+        // The fixture must be inside every guard that existed before this change, or it
+        // proves the wrong thing: at the operation cap, under the document byte cap, and with
+        // a per-operation schema that the per-operation cap would happily accept.
+        assert!(
+            serialized_len(&document) <= MAX_DOCUMENT_BYTES,
+            "the fixture must pass the document cap"
+        );
+        let per_operation = referenced_component_bytes(&document);
+        assert!(
+            per_operation < MAX_OPERATION_SCHEMA_BYTES,
+            "each operation's schema must be individually acceptable ({per_operation} bytes)"
+        );
+        assert!(
+            per_operation * MAX_IMPORT_OPERATIONS > MAX_TOTAL_SCHEMA_BYTES,
+            "the fixture must amplify past the aggregate cap, or it proves nothing"
+        );
+
+        let error = parse_openapi_document(&document).unwrap_err();
+        let OpenApiImportError::TotalSchemaTooLarge { bytes, cap } = error else {
+            panic!("expected the aggregate schema budget to refuse this, got {error:?}");
+        };
+        assert_eq!(cap, MAX_TOTAL_SCHEMA_BYTES);
+        // The refusal must come from the running total, not from one operation: proof the
+        // budget is charged across operations rather than reset for each.
+        assert!(bytes > MAX_OPERATION_SCHEMA_BYTES);
+    }
+
+    /// The aggregate cap must not be reachable only by many operations — one operation whose
+    /// own resolved schema is absurd is refused on its own, and named.
+    #[test]
+    fn rejects_one_operation_whose_resolved_schema_is_over_the_per_operation_cap() {
+        let document = ref_amplification_document(1, 2_000);
+        assert!(referenced_component_bytes(&document) > MAX_OPERATION_SCHEMA_BYTES);
+        assert!(serialized_len(&document) <= MAX_DOCUMENT_BYTES);
+
+        let error = parse_openapi_document(&document).unwrap_err();
+        let OpenApiImportError::OperationSchemaTooLarge {
+            skill_key,
+            bytes,
+            cap,
+        } = error
+        else {
+            panic!("expected the per-operation schema cap to refuse this, got {error:?}");
+        };
+        assert_eq!(skill_key, "op0", "the refusal must name the operation");
+        assert_eq!(cap, MAX_OPERATION_SCHEMA_BYTES);
+        assert!(bytes > MAX_OPERATION_SCHEMA_BYTES);
+    }
+
+    /// `{"$ref": "#/paths"}` reaches the same amplification with no oversized component at
+    /// all — the self-reference resolves to the whole `paths` object, once per operation.
+    #[test]
+    fn rejects_a_self_referential_ref_that_resolves_to_the_whole_paths_object() {
+        let mut paths = Map::new();
+        for index in 0..MAX_IMPORT_OPERATIONS {
+            paths.insert(
+                format!("/op{index}"),
+                json!({
+                    "post": {
+                        "operationId": format!("op{index}"),
+                        "description": "y".repeat(300),
+                        "requestBody": {
+                            "content": {"application/json": {"schema": {"$ref": "#/paths"}}}
+                        }
+                    }
+                }),
+            );
+        }
+        let document = json!({
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": Value::Object(paths),
+        });
+        assert!(serialized_len(&document) <= MAX_DOCUMENT_BYTES);
+
+        let error = parse_openapi_document(&document).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OpenApiImportError::OperationSchemaTooLarge { .. }
+                    | OpenApiImportError::TotalSchemaTooLarge { .. }
+            ),
+            "a self-referential $ref must hit the byte budget, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_document_larger_than_the_byte_cap_before_deriving_anything() {
+        let mut paths = Map::new();
+        for index in 0..10 {
+            paths.insert(
+                format!("/op{index}"),
+                json!({"get": {
+                    "operationId": format!("op{index}"),
+                    "description": "z".repeat(MAX_DOCUMENT_BYTES / 8),
+                }}),
+            );
+        }
+        let document = minimal_document(Value::Object(paths));
+
+        let error = parse_openapi_document(&document).unwrap_err();
+        let OpenApiImportError::DocumentTooLarge { bytes, cap } = error else {
+            panic!("expected the document byte cap to refuse this, got {error:?}");
+        };
+        assert_eq!(cap, MAX_DOCUMENT_BYTES);
+        assert!(bytes > MAX_DOCUMENT_BYTES);
+    }
+
+    /// The guard must be invisible to an ordinary spec: a document that is merely detailed
+    /// still imports, and its schemas are still inlined.
+    #[test]
+    fn an_ordinary_document_is_unaffected_by_the_byte_budget() {
+        let document = ref_amplification_document(50, 50);
+        let parsed = parse_openapi_document(&document).expect("an ordinary document must parse");
+        assert_eq!(parsed.operations.len(), 50);
+        assert!(
+            parsed.operations[0].params_schema["properties"]["body"]["properties"]["field_000000"]
+                .is_object(),
+            "the referenced schema must still be resolved and inlined"
+        );
+    }
+
+    /// `serialized_len` is the measurement the whole budget rests on; if it disagreed with
+    /// `to_string().len()` the caps would be enforced against a number nobody can reproduce.
+    #[test]
+    fn serialized_len_matches_the_string_encoding_it_stands_in_for() {
+        for value in [
+            json!(null),
+            json!({"a": [1, 2, 3], "b": {"c": "déjà vu"}}),
+            json!("a string with \"quotes\" and \\ escapes"),
+        ] {
+            assert_eq!(serialized_len(&value), value.to_string().len());
+        }
     }
 
     #[test]
