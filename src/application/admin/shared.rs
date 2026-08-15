@@ -512,7 +512,19 @@ pub(crate) fn validate_credential_scope(request: &CredentialCreateRequest) -> Re
             "credential priority must be non-negative".to_string(),
         ));
     }
-    match &request.scope {
+    validate_credential_scope_shape(&request.scope)
+}
+
+/// The scope half of [`validate_credential_scope`], reachable without a whole
+/// [`CredentialCreateRequest`].
+///
+/// Split out for issue #275: a Claude runner fixes its credential scope at **provisioning** time,
+/// long before a `CredentialCreateRequest` exists, and the scope has to be validated there — the
+/// finalize path has already spent a one-shot token by the time the credential chain would see it.
+/// Extracted rather than copied so the runner surface and the credential surface cannot drift into
+/// two different ideas of a well-formed scope.
+pub(crate) fn validate_credential_scope_shape(scope: &CredentialScope) -> Result<(), AppError> {
+    match scope {
         CredentialScope::Global => {}
         CredentialScope::Tenant { external_tenant_id } => {
             ExternalTenantId::parse(external_tenant_id.clone())?;

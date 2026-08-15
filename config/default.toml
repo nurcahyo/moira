@@ -202,3 +202,24 @@ dns_timeout_ms = 5000
 # Dev only. Production start-up refuses to come up while this is true. Import never
 # honours it — only the execution-time SSRF re-check.
 allow_insecure_dev_urls = false
+
+# The moira-runner control endpoint (issue #275, workstream R2 of #272).
+#
+# moira-runner is the ONLY component that talks to the Docker Engine API, which is
+# root-equivalent on its host. Moira never holds Docker access; it calls this endpoint
+# server-to-server instead. Deployment topology, not runtime configuration — which is why it
+# lives here rather than in a table the admin API can rewrite.
+[claude_runner]
+# Off by default: a deployment with no runner service is the normal case. While false the whole
+# /api/v1/admin/runners surface answers 503 runner_service_disabled before any network call.
+enabled = false
+# Scheme, host and port only; the client appends /v1/runners…. The contract's default bind is
+# loopback, and production start-up refuses a non-loopback http:// address.
+base_url = "http://127.0.0.1:8090"
+# Bearer token presented on every runner call. Never logged, never returned, never in an error.
+# Empty here and supplied by MOIRA_CLAUDE_RUNNER__AUTH_TOKEN; token material never lives in a
+# committed file. Start-up refuses an enabled runner with no token.
+auth_token = ""
+# Total budget for one runner call — applied as both request and connect timeout on the
+# purpose-built client, so a call site that forgets its own timeout still cannot hang.
+request_timeout_ms = 10000

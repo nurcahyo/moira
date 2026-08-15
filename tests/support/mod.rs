@@ -2,6 +2,9 @@
 
 pub mod mock_control_plane;
 pub mod mock_openai;
+// Issue #275 (workstream R2 of #272). A real axum router on a real ephemeral port standing in for
+// `moira-runner` — no `wiremock`, and no Docker anywhere in the test process.
+pub mod mock_runner_service;
 
 use std::{
     env,
