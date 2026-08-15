@@ -212,30 +212,33 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
     ).toBeDefined();
   });
 
-  test("clicking posts an empty body to the acquire endpoint — nothing user-supplied travels with it", async () => {
+  test("clicking posts an empty body to the START endpoint — nothing user-supplied travels with it", async () => {
     const send = scriptedFetch([
-      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+      { status: 200, body: { job_id: "job-1", authorization_url: null } },
+      { status: 200, body: { status: "succeeded", provider_id: "p1", credential_id: "c1", outcome: "created" } },
     ]);
     render(
       <ConnectClaudeSubscriptionPanel
         fetchImpl={send}
         cliAcquisitionEnabled
         subscriptionStatus={NOT_CONNECTED}
+        cliPollIntervalMs={1}
       />,
     );
     await userEvent.click(
       screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
     );
 
-    await waitFor(() => expect(send.calls.length).toBe(1));
-    expect(send.calls[0]?.url).toBe("/api/settings/llm/claude-subscription/acquire");
+    await waitFor(() => expect(send.calls.length).toBeGreaterThanOrEqual(1));
+    expect(send.calls[0]?.url).toBe("/api/settings/llm/claude-subscription/acquire/start");
     expect(send.calls[0]?.method).toBe("POST");
     expect(send.calls[0]?.body).toEqual({});
   });
 
-  test("a successful acquisition announces 'created' and fires onConnected", async () => {
+  test("a successful acquisition — start, then a poll that reports success — announces 'created' and fires onConnected", async () => {
     const send = scriptedFetch([
-      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+      { status: 200, body: { job_id: "job-1", authorization_url: null } },
+      { status: 200, body: { status: "succeeded", provider_id: "p1", credential_id: "c1", outcome: "created" } },
     ]);
     const connected: string[] = [];
     render(
@@ -244,6 +247,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
         cliAcquisitionEnabled
         subscriptionStatus={NOT_CONNECTED}
         onConnected={() => connected.push("yes")}
+        cliPollIntervalMs={1}
       />,
     );
     await userEvent.click(
@@ -251,10 +255,55 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
     );
     expect(await screen.findByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_created))).toBeDefined();
     await waitFor(() => expect(connected).toEqual(["yes"]));
+    // Exactly one start call, one status poll — the loop stops once terminal.
+    await waitFor(() => expect(send.calls.length).toBe(2));
+    expect(send.calls[1]?.url).toBe("/api/settings/llm/claude-subscription/acquire/status?job=job-1");
+    expect(send.calls[1]?.method).toBe("GET");
   });
 
-  test("a keyed CLI refusal (e.g. not signed in) is rendered as its own alert", async () => {
+  test("while awaiting login, shows a link to the authorization URL a status poll reports, and opens it once", async () => {
+    const originalOpen = window.open;
+    const opened: string[] = [];
+    window.open = ((url?: string | URL) => {
+      opened.push(String(url));
+      return null;
+    }) as typeof window.open;
+
+    try {
+      const send = scriptedFetch([
+        { status: 200, body: { job_id: "job-1", authorization_url: null } },
+        { status: 200, body: { status: "running", authorization_url: "https://example.com/authorize?x=1" } },
+        { status: 200, body: { status: "running", authorization_url: "https://example.com/authorize?x=1" } },
+        { status: 200, body: { status: "succeeded", provider_id: "p1", credential_id: "c1", outcome: "created" } },
+      ]);
+      render(
+        <ConnectClaudeSubscriptionPanel
+          fetchImpl={send}
+          cliAcquisitionEnabled
+          subscriptionStatus={NOT_CONNECTED}
+          cliPollIntervalMs={1}
+        />,
+      );
+      await userEvent.click(
+        screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+      );
+
+      const link = await screen.findByRole("link", {
+        name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_open_link),
+      });
+      expect(link.getAttribute("href")).toBe("https://example.com/authorize?x=1");
+
+      await screen.findByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_created));
+      // Reported the SAME URL on two consecutive polls; opened exactly once.
+      expect(opened).toEqual(["https://example.com/authorize?x=1"]);
+    } finally {
+      window.open = originalOpen;
+    }
+  });
+
+  test("a keyed CLI refusal (e.g. not signed in), discovered via a status poll, is rendered as its own alert", async () => {
     const send = scriptedFetch([
+      { status: 200, body: { job_id: "job-1", authorization_url: null } },
       {
         status: 409,
         body: {
@@ -270,6 +319,7 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
         fetchImpl={send}
         cliAcquisitionEnabled
         subscriptionStatus={NOT_CONNECTED}
+        cliPollIntervalMs={1}
       />,
     );
     await userEvent.click(
@@ -278,6 +328,35 @@ describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
     expect((await screen.findByRole("alert")).textContent).toBe(
       copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_not_signed_in),
     );
+  });
+
+  test("a failure at start time (e.g. the deployment turned this off mid-flow) never polls status", async () => {
+    const send = scriptedFetch([
+      {
+        status: 403,
+        body: {
+          error: {
+            code: "claude_cli_acquisition_disabled",
+            message_key: CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled,
+          },
+        },
+      },
+    ]);
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={send}
+        cliAcquisitionEnabled
+        subscriptionStatus={NOT_CONNECTED}
+        cliPollIntervalMs={1}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled),
+    );
+    expect(send.calls.length).toBe(1);
   });
 });
 

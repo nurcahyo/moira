@@ -48,16 +48,31 @@
 // creating a second one. This component only changes the BUTTON LABEL
 // between "connect" and "re-acquire/rotate" phrasing, and only the label.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/atoms/Badge";
 import { Button } from "@/components/atoms/Button";
 import { FormField } from "@/components/molecules/FormField";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
-import { LLM_ENDPOINTS, type ClaudeCredentialStatusView } from "@/lib/llm-view";
+import {
+  claudeSubscriptionAcquireStatusUrl,
+  LLM_ENDPOINTS,
+  type ClaudeCredentialStatusView,
+} from "@/lib/llm-view";
 
-import { postJson, type LlmFailure } from "./request";
+import { postJson, sendGet, type LlmFailure } from "./request";
 import styles from "./ConnectClaudeSubscriptionPanel.module.css";
+
+/**
+ * How often the panel polls `acquire/status` while a Mode A job is running.
+ * Well under the job's own multi-minute budget (`lib/claude-cli.ts`) — this
+ * only controls UI responsiveness, not the server-side deadline.
+ */
+const CLI_POLL_INTERVAL_MS = 2_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** The neutral default this panel renders with until the page passes a real read. */
 const UNKNOWN_STATUS: ClaudeCredentialStatusView = { kind: "unknown", status: null, expiresAt: null };
@@ -79,6 +94,11 @@ export interface ConnectClaudeSubscriptionPanelProps {
   readonly subscriptionStatus?: ClaudeCredentialStatusView;
   /** Status of the Mode B (api_key) row. */
   readonly keyStatus?: ClaudeCredentialStatusView;
+  /**
+   * Test seam only: how often Mode A polls `acquire/status`. Shipped call
+   * sites never pass this — they get `CLI_POLL_INTERVAL_MS`.
+   */
+  readonly cliPollIntervalMs?: number;
 }
 
 type ConnectOutcome = "created" | "rotated";
@@ -89,9 +109,30 @@ interface ConnectResponse {
   readonly outcome: ConnectOutcome;
 }
 
+interface AcquireStartResponse {
+  readonly job_id: string;
+  readonly authorization_url: string | null;
+}
+
+type AcquireStatusResponse =
+  | { readonly status: "running"; readonly authorization_url: string | null }
+  | ({ readonly status: "succeeded" } & ConnectResponse);
+
 type Phase =
   | { readonly kind: "idle" }
   | { readonly kind: "pending" }
+  | { readonly kind: "saved"; readonly outcome: ConnectOutcome }
+  | { readonly kind: "failed"; readonly failure: LlmFailure };
+
+/**
+ * Mode A's own phase union — a superset of `Phase` because, unlike Modes B/C,
+ * a job that started successfully is not yet done: the panel must show it is
+ * WAITING on a human to finish signing in, and where to do that (issue #269).
+ */
+type CliPhase =
+  | { readonly kind: "idle" }
+  | { readonly kind: "starting" }
+  | { readonly kind: "awaiting_login"; readonly jobId: string; readonly authorizationUrl: string | null }
   | { readonly kind: "saved"; readonly outcome: ConnectOutcome }
   | { readonly kind: "failed"; readonly failure: LlmFailure };
 
@@ -145,25 +186,80 @@ export function ConnectClaudeSubscriptionPanel({
   cliAcquisitionEnabled = false,
   subscriptionStatus = UNKNOWN_STATUS,
   keyStatus = UNKNOWN_STATUS,
+  cliPollIntervalMs = CLI_POLL_INTERVAL_MS,
 }: ConnectClaudeSubscriptionPanelProps) {
-  /* --- Mode A: CLI-assisted ------------------------------------------------ */
-  const [cliPhase, setCliPhase] = useState<Phase>({ kind: "idle" });
-  const cliPending = cliPhase.kind === "pending";
+  /* --- Mode A: CLI-assisted, two-phase (issue #269) ------------------------ */
+  const [cliPhase, setCliPhase] = useState<CliPhase>({ kind: "idle" });
+  const cliPending = cliPhase.kind === "starting" || cliPhase.kind === "awaiting_login";
   const cliAlreadyConnected = subscriptionStatus.kind === "connected";
+  // Guards against `setState` after unmount (the poll loop is a `while`, not
+  // an effect) and against opening a second tab on a later poll that still
+  // reports the same URL.
+  const cliMountedRef = useRef(true);
+  const cliOpenedUrlRef = useRef<string | null>(null);
+  useEffect(
+    () => () => {
+      cliMountedRef.current = false;
+    },
+    [],
+  );
+
+  async function pollCli(jobId: string): Promise<void> {
+    for (;;) {
+      await sleep(cliPollIntervalMs);
+      if (!cliMountedRef.current) return;
+
+      const polled = await sendGet<AcquireStatusResponse>(
+        claudeSubscriptionAcquireStatusUrl(jobId),
+        fetchImpl,
+      );
+      if (!cliMountedRef.current) return;
+
+      if (!polled.ok) {
+        setCliPhase({ kind: "failed", failure: polled.failure });
+        return;
+      }
+      if (polled.data.status === "succeeded") {
+        setCliPhase({ kind: "saved", outcome: polled.data.outcome });
+        onConnected?.();
+        return;
+      }
+
+      const authorizationUrl = polled.data.authorization_url;
+      setCliPhase({ kind: "awaiting_login", jobId, authorizationUrl });
+      // Best-effort: open the sign-in tab the first time a URL is known. The
+      // link rendered below is the affordance of record — a popup blocker
+      // silently swallowing this is not a failure, just a no-op.
+      if (authorizationUrl !== null && cliOpenedUrlRef.current !== authorizationUrl) {
+        cliOpenedUrlRef.current = authorizationUrl;
+        try {
+          window.open(authorizationUrl, "_blank", "noopener,noreferrer");
+        } catch {
+          // Ignored — the rendered link still works.
+        }
+      }
+    }
+  }
 
   async function submitCli(): Promise<void> {
-    setCliPhase({ kind: "pending" });
-    const result = await postJson<ConnectResponse>(
-      LLM_ENDPOINTS.claudeSubscriptionAcquire,
+    setCliPhase({ kind: "starting" });
+    cliOpenedUrlRef.current = null;
+    const started = await postJson<AcquireStartResponse>(
+      LLM_ENDPOINTS.claudeSubscriptionAcquireStart,
       {},
       fetchImpl,
     );
-    if (!result.ok) {
-      setCliPhase({ kind: "failed", failure: result.failure });
+    if (!cliMountedRef.current) return;
+    if (!started.ok) {
+      setCliPhase({ kind: "failed", failure: started.failure });
       return;
     }
-    setCliPhase({ kind: "saved", outcome: result.data.outcome });
-    onConnected?.();
+    setCliPhase({
+      kind: "awaiting_login",
+      jobId: started.data.job_id,
+      authorizationUrl: started.data.authorization_url,
+    });
+    await pollCli(started.data.job_id);
   }
 
   /* --- Mode B: an official Anthropic API key ------------------------------- */
@@ -243,7 +339,20 @@ export function ConnectClaudeSubscriptionPanel({
               )}
             </Button>
             <p className={styles.activity} role="status" aria-live="polite">
-              {cliPending && t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_pending)}
+              {cliPhase.kind === "starting" && t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_pending)}
+              {cliPhase.kind === "awaiting_login" && (
+                <>
+                  {t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_awaiting_login)}
+                  {cliPhase.authorizationUrl !== null && (
+                    <>
+                      {" "}
+                      <a href={cliPhase.authorizationUrl} target="_blank" rel="noopener noreferrer">
+                        {t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_open_link)}
+                      </a>
+                    </>
+                  )}
+                </>
+              )}
               {cliPhase.kind === "saved" && t(savedMessageKey(cliPhase.outcome))}
             </p>
             {cliPhase.kind === "failed" && (
