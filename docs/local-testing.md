@@ -487,10 +487,172 @@ resolution. Two enabled rows produce that message even if neither of them would
 have resolved anyway — so it can mask a second, real configuration problem. Fix
 the count first, then read the message again.
 
+## Keycloak: a one-command local IdP
+
+**Why.** [Walking the wizard yourself](#walking-the-wizard-yourself) above uses
+`console/tests/support/mock-idp.ts` plus `mkcert`, which is the right tool when
+you are exercising the harness. It is not the right tool when you just want to
+click through `/setup` in a browser: it is process-lifetime (nothing to point a
+browser at after the test run exits) and it needs `mkcert` installed. Keycloak
+26.4 in Docker, imported from a checked-in realm, is a **standing** IdP you can
+leave running across a whole afternoon of manual walks, with two seeded users
+and no Google or GitHub account. This was proven end to end manually on
+2026-08-15 (issue #260) — no Moira or console code change was needed, because
+`generic_oidc` already covers Keycloak.
+
+It is **not** started by `make up` / `make setup`. It lives behind the
+`dev-idp` compose profile precisely so the default path — the one every other
+section of this document assumes — stays exactly as fast as it is today.
+
+### Start it
+
+```bash
+make keycloak
+```
+
+This is `scripts/keycloak-dev.sh`: it generates a self-signed cert into
+`deploy/keycloak/` if one is not already there (`openssl req -x509 ...
+-subj "/CN=localhost/O=Moira local dev" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`,
+never committed — see `.gitignore`), starts the profile, and polls
+`https://127.0.0.1:8443/realms/moira/.well-known/openid-configuration` until it
+answers 200. **First boot takes 2-4 minutes** — Keycloak has to import the realm
+and stand up its HTTPS listener — so the script polls rather than sleeping a
+fixed amount and prints a heartbeat every 15 seconds so it does not look hung.
+
+`make keycloak-down` stops the container and keeps the generated cert, so the
+next `make keycloak` skips straight to "starting the dev-idp profile".
+
+### TLS is not optional, for either side
+
+`validate_https_url` (`src/application/auth_settings.rs`) refuses any
+non-`https` auth-provider URL with `400 auth_provider_url_not_allowed` —
+**including the redirect URI** — and it is a syntactic check only (scheme and
+host), never a fetch, so there is no way to satisfy it with plain `http` even
+on a deployment that trusts its own network. There is currently no escape
+hatch; issue #76 is the (optional, not yet built) proposal to add a dev-only
+one, and if it ever lands this whole TLS dance collapses to plain `http` and
+this section shrinks by half.
+
+Concretely that means **two** processes need a working HTTPS listener, not one:
+
+- **Keycloak** — the compose service terminates TLS itself, at 8443, with the
+  cert `make keycloak` generated (`KC_HTTPS_CERTIFICATE_FILE` /
+  `KC_HTTPS_CERTIFICATE_KEY_FILE` in `docker-compose.yml`). Port 8081 (plain
+  HTTP, mapped from the container's 8080) is left open too, but nothing in this
+  recipe uses it — Moira's syntactic check would refuse it as a discovery,
+  authorization, token, userinfo, jwks, or redirect URL.
+- **The console** — run it with Next's own HTTPS dev server:
+
+  ```bash
+  cd console
+  NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  CONSOLE_PUBLIC_ORIGIN=https://localhost:3000 \
+  bun run dev --port 3000 --experimental-https
+  ```
+
+  `CONSOLE_PUBLIC_ORIGIN` has to be `https`: `console/lib/env.ts` runs the same
+  `checkAbsoluteUrl` gate Moira does, and refuses `http` unless
+  `CONSOLE_ALLOW_INSECURE_URLS=true` (a fixture-only knob, refused in
+  production — do not reach for it here).
+
+  `NODE_TLS_REJECT_UNAUTHORIZED=0` is the blanket, **dev-only** escape hatch:
+  it turns off certificate verification for the whole Node process, which is
+  what lets the console's server-side token exchange trust Keycloak's
+  self-signed cert without installing anything. Say this plainly because it is
+  easy to miss: this is a strictly weaker trust model than the `mkcert` +
+  `NODE_EXTRA_CA_CERTS` recipe used [above](#walking-the-wizard-yourself) — that
+  one adds a specific CA to the trust store, this one disables checking
+  altogether. Set it only in the shell you run this dev server from, never in
+  a committed env file, and never on anything that is not a laptop.
+
+### Provision Keycloak as the sign-in provider
+
+The wizard's UI does this, but the exact call it makes is worth having spelled
+out — it is the same `POST /api/setup` the browser calls, with `action:
+"provision"` and Keycloak's realm endpoints under
+`https://127.0.0.1:8443/realms/moira`:
+
+```bash
+curl -sk -X POST https://localhost:3000/api/setup \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "action": "provision",
+        "method": "generic_oidc",
+        "display_name": "Keycloak (local dev)",
+        "client_id": "moira-console",
+        "client_secret": "moira-local-dev-secret",
+        "issuer": "https://127.0.0.1:8443/realms/moira",
+        "discovery_url": "https://127.0.0.1:8443/realms/moira/.well-known/openid-configuration",
+        "authorization_url": "https://127.0.0.1:8443/realms/moira/protocol/openid-connect/auth",
+        "token_url": "https://127.0.0.1:8443/realms/moira/protocol/openid-connect/token",
+        "userinfo_url": "https://127.0.0.1:8443/realms/moira/protocol/openid-connect/userinfo",
+        "jwks_url": "https://127.0.0.1:8443/realms/moira/protocol/openid-connect/certs",
+        "allowed_email_domains": ["moira.local"],
+        "requested_scopes": ["openid", "profile", "email"]
+      }'
+```
+
+`-k` is curl trusting the console's own self-signed `--experimental-https`
+cert for this one request — the same trust decision `NODE_TLS_REJECT_UNAUTHORIZED=0`
+makes for the console process itself. `client_id` and `client_secret` are the
+published dev values from `deploy/keycloak/realm-moira.json`; `moira.local` is
+the domain both seeded users' addresses end in. A 201 response means the
+trusted JWT issuer, the auth-provider row, the sealed console secret, and the
+enable step all landed — `/login` now offers "Continue with Keycloak (local
+dev)".
+
+### Sign in and claim
+
+The `claim` step needs a real Better Auth session cookie, which means a real
+browser round trip through Keycloak — not something worth scripting around
+`curl`. Open `https://localhost:3000/login` (or resume `/setup`) and sign in as
+either seeded user:
+
+| username | password | email |
+| --- | --- | --- |
+| `owner` | `owner` | `owner@moira.local` |
+| `operator` | `operator` | `operator@moira.local` |
+
+Expect **two** self-signed-certificate warnings, both expected and both safe to
+click through on a laptop you control:
+
+1. **The console itself**, the moment the browser loads
+   `https://localhost:3000` — Next's `--experimental-https` mints its own
+   self-signed cert with no CA behind it.
+2. **Keycloak**, the moment the console redirects the browser to
+   `https://127.0.0.1:8443/realms/moira/protocol/openid-connect/auth` — the
+   cert `make keycloak` generated, for the same reason.
+
+Whichever user signs in first and completes the wizard's `claim` step becomes
+the first admin (deny-by-default: only `@moira.local` addresses are on the
+allow-list this recipe provisions). The other stays a valid Keycloak login with
+no Moira grant, useful for exercising "signed in, not an admin" paths.
+
+### Reset
+
+Nothing here is stateful in a way that survives a container: Keycloak's `26.4`
+image runs `start-dev`, which keeps its own database in memory inside the
+container. Removing the container removes every seeded user's session and
+Moira grant history that a fresh claim would otherwise collide with:
+
+```bash
+make keycloak-down
+docker compose rm -f keycloak   # drops the stopped container
+make keycloak                   # re-imports the realm from scratch
+```
+
+The realm import itself is idempotent — the same two users and the same client
+come back every time — but Moira's own `auth_provider_settings` and
+`trusted_jwt_issuers` rows are not reset by this, only Keycloak's. To provision
+again from a clean slate, reset Moira's database too (`make reset`, or a fresh
+`MOIRA_DATABASE__URL`) before re-running the provisioning call above.
+
 ## Reference
 
 | command | |
 | --- | --- |
+| `make keycloak` | start the local Keycloak dev IdP and wait for it to be ready (issue #260) |
+| `make keycloak-down` | stop it, keeping the generated TLS cert |
 | `make doctor` | toolchain, containers, listening ports |
 | `make health` | `/health/live` and `/health/ready` |
 | `make openapi` | the OpenAPI 3.1 document |

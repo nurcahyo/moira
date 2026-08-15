@@ -21,6 +21,11 @@
 # so a `git add .` from the repo root would have committed it.
 .DS_Store
 
+# `scripts/keycloak-dev.sh` generates a self-signed TLS cert for the local
+# Keycloak dev IdP (issue #260) into this directory. Key material, never committed.
+/deploy/keycloak/tls.crt
+/deploy/keycloak/tls.key
+
 # cargo-mutants scratch tree and outcome report (scripts/mutants.sh)
 /mutants.out
 /mutants.out.old
