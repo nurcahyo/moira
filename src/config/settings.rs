@@ -48,6 +48,8 @@ pub struct Settings {
     pub telemetry: TelemetrySettings,
     #[serde(default)]
     pub rag: RagSettings,
+    #[serde(default)]
+    pub skill_execution: SkillExecutionSettings,
 }
 
 /// Bounds on RAG document ingestion (plan 11, Sub-Phase A).
@@ -492,6 +494,58 @@ pub struct RuntimeSettings {
     pub internal_stream_queue_capacity: usize,
 }
 
+/// How an agent profile's enabled `skill_refs` are executed as rig tools (issue #84,
+/// plan 12 §5).
+///
+/// A section of its own rather than more fields on [`RuntimeSettings`]: every knob here
+/// bounds a call Moira makes to a **third-party HTTP endpoint an operator imported**, which
+/// is a different trust surface from the provider calls `runtime` bounds. Grouping them
+/// keeps the one dev-only escape hatch (`allow_insecure_dev_urls`) next to the limits it
+/// relaxes rather than buried among unrelated timeouts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SkillExecutionSettings {
+    /// Total **model calls** one tool-bearing execution may make, matching Rig's own
+    /// turn-budget semantics (`.agents/skills/moira-rig-tools/SKILL.md`). One tool call
+    /// plus a final answer needs at least 2, so a budget of 1 with tools attached is a
+    /// guaranteed failure — which is exactly why this is an explicit setting rather than
+    /// an implicit default buried in the loop.
+    pub maximum_tool_turns: usize,
+    /// Ceiling on how many skill tools one request may advertise. The sibling of
+    /// `public_api.maximum_tool_count`, which caps *caller-declared* tools; this one caps
+    /// what an agent profile's `skill_refs` can put on the wire.
+    pub maximum_advertised_tools: usize,
+    /// Ceiling on the response body a skill tool feeds back to the model. A skill target
+    /// is a third-party endpoint: without a bound, one reply can consume the whole context
+    /// budget (`docs/context-budgeting.md`) or the execution's remaining deadline.
+    pub maximum_response_bytes: usize,
+    /// Budget for resolving a skill target hostname during the execution-time SSRF check.
+    pub dns_timeout_ms: u64,
+    /// Dev-only escape hatch permitting `http://` and private/loopback skill target URLs.
+    /// MUST stay `false` outside development; `Settings::validate` hard-fails production
+    /// when it is `true`, exactly as it does for
+    /// `public_api.image_urls.allow_insecure_dev_urls`.
+    ///
+    /// **Import never honours this** (`AgentPlatformService::validate_skill_url` hardcodes
+    /// `allow_insecure: false`): a spec pointing at private space is refused at write time
+    /// in every environment. This flag only relaxes the *execution-time* re-check, so the
+    /// single way to reach a loopback skill target is to write the row past the admin
+    /// plane — which is what the end-to-end tests do deliberately.
+    pub allow_insecure_dev_urls: bool,
+}
+
+impl Default for SkillExecutionSettings {
+    fn default() -> Self {
+        Self {
+            maximum_tool_turns: 4,
+            maximum_advertised_tools: 32,
+            maximum_response_bytes: 64 * 1024,
+            dns_timeout_ms: 5_000,
+            allow_insecure_dev_urls: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublicApiSettings {
     pub openai_responses_compat_enabled: bool,
@@ -894,6 +948,9 @@ impl Settings {
         if self.public_api.image_urls.allow_insecure_dev_urls {
             features.push("insecure_image_urls");
         }
+        if self.skill_execution.allow_insecure_dev_urls {
+            features.push("insecure_skill_urls");
+        }
         if self.provider_security.allow_http_provider_urls {
             features.push("http_provider_urls");
         }
@@ -1215,6 +1272,11 @@ impl Settings {
             violations.push(
                 "public_api.image_urls.allow_insecure_dev_urls must be false in production"
                     .to_string(),
+            );
+        }
+        if self.skill_execution.allow_insecure_dev_urls {
+            violations.push(
+                "skill_execution.allow_insecure_dev_urls must be false in production".to_string(),
             );
         }
         if self.workers.enabled {

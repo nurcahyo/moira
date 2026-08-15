@@ -3233,6 +3233,7 @@
           "route_forbidden",
           "agent_profile_not_found",
           "agent_profile_disabled",
+          "skill_unavailable",
           "model_not_found",
           "model_forbidden",
           "model_capability_mismatch",

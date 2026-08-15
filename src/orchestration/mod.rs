@@ -7,6 +7,7 @@ mod provider_url;
 mod retrieval;
 mod runtime_cache;
 mod runtime_factory;
+mod skill_tool;
 
 pub use chunking::{ChunkCandidate, ChunkStrategy, ChunkingError, ChunkingLimits, chunk};
 pub use controls::{
@@ -42,4 +43,9 @@ pub use runtime_factory::{
     RuntimeFactory, RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem,
     classify_completion_error, require_chatgpt_subscription_opt_in, rig_chat_history,
     usage_from_rig,
+};
+pub use skill_tool::{
+    HttpSkillTool, SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolBuildError,
+    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopOutcome, build_skill_tool_set,
+    run_tool_loop,
 };

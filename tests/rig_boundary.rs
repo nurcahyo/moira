@@ -31,6 +31,14 @@ use std::path::{Path, PathBuf};
 ///   `chunking.rs`, `ingestion.rs`, the repository and the application service — names no Rig
 ///   type, which is what keeps `Vec<f32>` rather than `rig_core::embeddings::Embedding` the
 ///   currency of the ingestion pipeline.
+/// - `src/orchestration/skill_tool.rs` — the tool twin of `runtime_factory.rs`, added by issue
+///   #84. It implements `rig_core::tool::Tool` for a `skills` row, assembles the `ToolSet`, and
+///   drives the multi-turn loop. Widening the seam here rather than opening a second one is what
+///   `.agents/skills/moira-rig-tools/SKILL.md` requires — "implement `rig_core::tool::Tool`
+///   directly, do not wrap it in a Moira `Tool`-like trait" — and it is what keeps the tool
+///   vocabulary that *does* leave this module Moira's own: `ToolCallRecord`, `SkillGuard`,
+///   `GuardVerdict`. `src/domain/agent_platform.rs` classifies skills and evaluates guards
+///   without naming a Rig type, which is the same shape `chunking.rs` has above `embedding.rs`.
 ///
 /// Adding an entry here is the deliberate act of widening the boundary. It should be rare and it
 /// should be argued for in review, which is the entire point of making it a diff.
@@ -38,6 +46,7 @@ const RIG_BOUNDARY_FILES: &[&str] = &[
     "src/application/execution.rs",
     "src/orchestration/embedding.rs",
     "src/orchestration/runtime_factory.rs",
+    "src/orchestration/skill_tool.rs",
 ];
 
 /// Every `.rs` file under `src/`, as repo-relative slash-separated paths.
