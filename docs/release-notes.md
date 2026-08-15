@@ -38,22 +38,80 @@ one row per upstream provider attempt — the highest-volume table in the schema
 on the table, so for the length of the scan every execution in the fleet blocks, not just the
 migrating replica.
 
-**If you migrate with `moira migrate`, there is nothing for you to do.** Every Moira process that
-migrates — `moira migrate`, `moira serve` with `database.migrate_on_startup`,
-`bootstrap-system-key`, `execute-test` — now runs a preflight before handing control to `sqlx`. If
-`0030` is still pending and `execution_attempts` already exists, the preflight applies `0030`'s own
-three statements in the non-blocking order (`ADD COLUMN`, then `ADD CONSTRAINT … NOT VALID`, then a
-commit, then `VALIDATE CONSTRAINT` under SHARE UPDATE EXCLUSIVE, which blocks neither readers nor
-writers) and records `0030` as applied, so the migrator skips it. The scan still happens; nothing
-waits behind it. The ledger says which path was taken:
+**If you migrate with `moira migrate`, there is one paragraph you should read before deploying at
+peak, and otherwise nothing to do.** Every Moira process that migrates — `moira migrate`,
+`moira serve` with `database.migrate_on_startup`, `bootstrap-system-key`, `execute-test` — now runs
+a preflight before handing control to `sqlx`. If `0030` is still pending and `execution_attempts`
+already exists, the preflight applies `0030`'s own three statements split across two transactions
+— `ADD COLUMN` and `ADD CONSTRAINT … NOT VALID`, a commit, then `VALIDATE CONSTRAINT` — and records
+`0030` as applied, so the migrator skips it.
+
+**What that removes is the scan from under ACCESS EXCLUSIVE, not the ACCESS EXCLUSIVE.** Every
+`ALTER TABLE` takes ACCESS EXCLUSIVE, and the first of the two transactions is no exception — but
+it holds it for three catalog writes instead of for a full scan. Lock modes read from `pg_locks`
+inside the transaction, PostgreSQL 16.14, measured at 200,000, 1,000,000 and 4,000,000 rows:
+
+| statement | lock | time once granted |
+|---|---|---|
+| `add column if not exists` ×3 | ACCESS EXCLUSIVE | 0.3–1.5 ms, flat across all three sizes |
+| `drop constraint if exists` | ACCESS EXCLUSIVE | 0.5–2.7 ms, flat across all three sizes |
+| `add constraint … not valid` | ACCESS EXCLUSIVE | 0.5–2.4 ms, flat across all three sizes |
+| `validate constraint` | SHARE UPDATE EXCLUSIVE | 77 ms at 1M rows, 346 ms at 4M |
+
+The first three are catalog writes and stay in single-digit milliseconds however big the table is.
+The last one is the scan, it grows with the table, and it is the one that runs under SHARE UPDATE
+EXCLUSIVE, which blocks neither readers nor writers. So your fleet stops for milliseconds instead
+of for the length of a scan — not for zero. (Those `validate` figures are one machine, on a table
+already in PostgreSQL's cache, and the 4M one is the median of three. Read them as "proportional to
+the table", not as a forecast for yours; a table too big for cache pays disk on top.)
+
+**A three-millisecond lock is not a three-millisecond wait.** ACCESS EXCLUSIVE conflicts with every
+other mode, so the preflight cannot start until every transaction already touching
+`execution_attempts` has finished — and while it waits in the lock queue, every *later* request for
+the table queues behind it too, including plain `SELECT`s that conflict with nothing already
+running. Measured on the same server: a 12-second read transaction on `execution_attempts` starting
+at t=0, the DDL arriving at t=1s and queueing, and an ordinary `select count(*)` arriving at t=3s —
+the `select` blocked for **9.4 seconds**, behind a statement that runs in 3 ms. One of the samples
+above shows the same thing by accident: an `add column if not exists` that took 0.3 ms in two
+samples took 1,003 ms in a third, because something else had the table at that moment.
+
+**So the ACCESS EXCLUSIVE half gives up rather than queueing.** It runs under
+`lock_timeout = '3s'`. If the lock is not granted in that window the statement is cancelled, the
+transaction rolls back, nothing is written to `_sqlx_migrations`, and **the process fails to start
+with an error naming the table** rather than stalling the fleet. Re-running it is the retry: the
+preflight is idempotent and the next boot resumes from the top. Same scenario with the timeout in
+place — the DDL gave up after 3.2 s and the `select` behind it blocked 1.4 s instead of 9.4 s.
+
+`3s` is a judgement, not a measured optimum. The statements need milliseconds once granted, so a
+wait past a few seconds means a long-lived transaction is sitting on the table and waiting it out
+is the expensive choice; a value in the low hundreds of milliseconds would lose against ordinary
+commit traffic and turn the upgrade into a retry loop. If the migration keeps failing this way,
+find the transaction holding the table:
+
+```sql
+select pid, state, wait_event_type, xact_start, left(query, 120) as query
+  from pg_stat_activity
+ where pid in (select pid from pg_locks where relation = 'execution_attempts'::regclass)
+ order by xact_start;
+```
+
+The ledger says which path was taken:
 
 ```sql
 select version, description from _sqlx_migrations where version = 30;
 -- 30 | execution attempt candidate observability (pre-applied NOT VALID + VALIDATE, issue #250)
 ```
 
-That stock description without the suffix means `0030` ran as written on this database — which is
-correct and costs nothing if the table was empty at the time.
+Three descriptions are possible for version 30 and they mean different things:
+
+| description | what happened |
+|---|---|
+| `… (pre-applied NOT VALID + VALIDATE, issue #250)` | the preflight ran; the scan was taken under SHARE UPDATE EXCLUSIVE |
+| `… (pre-applied by hand NOT VALID + VALIDATE, issue #250)` | somebody ran the manual pre-step below |
+| `execution attempt candidate observability` | `sqlx` ran `0030` as written — free on an empty table, the blocking scan on a populated one |
+
+`tests/migration_constraint_safety.rs` keeps the first of those in step with the constant the code
+writes, and keeps the second from colliding with the third.
 
 **Why the repair is in the process and not in a migration.** `0030` shipped, and migrations are
 append-only here: `sqlx` checksums every file, so a database that applied the old bytes would
@@ -66,10 +124,16 @@ not and cannot make `0030` cheap.
 **`0034` costs one extra scan of `execution_attempts`, and that scan is not free.** It drops the
 constraint and re-adds it `NOT VALID` before validating it, which clears PostgreSQL's
 `convalidated` flag — so its `VALIDATE CONSTRAINT` performs a full scan even though every row
-already satisfies the check. It takes SHARE UPDATE EXCLUSIVE, so it blocks nothing, but on a large
-table it is minutes of I/O rather than a no-op. (An earlier draft of this entry said `0034` would
-be "cheap, because it validates a constraint that already holds". That was wrong: PostgreSQL skips
-validation only for a constraint already *marked* valid, and `0034` is the thing that un-marks it.)
+already satisfies the check. That scan takes SHARE UPDATE EXCLUSIVE and blocks neither readers nor
+writers, but it is real work proportional to the table — see the figures above — not a no-op. The
+drop-and-re-add ahead of it takes ACCESS EXCLUSIVE for a few milliseconds, with the same queueing
+caveat and the same `lock_timeout = '3s'` as the preflight above; if it times out the migration
+fails, records nothing, and is re-run from the top on the next boot. (An earlier draft said `0034`
+would be "cheap, because it validates a constraint that already holds". That was wrong: PostgreSQL
+skips validation only for a constraint already *marked* valid, and `0034` is the thing that un-marks
+it.
+A later draft called `0034` "non-blocking", which was wrong in the other direction: the scan is,
+the migration as a whole is not.)
 
 **If you migrate with `sqlx-cli`, or anything else that is not a Moira process, the preflight never
 runs and `0030` executes as written.** If your `execution_attempts` is small, or this install is
@@ -82,9 +146,17 @@ select count(*) from execution_attempts;
 To skip the blocking scan on a large table, apply `0030`'s effect by hand in the safe order
 **before** deploying, then record it as applied so the migrator does not repeat it. Run these as
 four separate statements, not inside one transaction — the point of the split is the commit
-between the `ADD` and the `VALIDATE`, and locks are held to commit:
+between the `ADD` and the `VALIDATE`, and locks are held to commit. **Run it while no Moira process
+is migrating this database**: the advisory lock that serialises Moira's own preflight against its
+migrator does not reach a `psql` session, so a `moira migrate` starting in the middle of this will
+do the whole thing again — its preflight drops the constraint you just added, re-adds it `NOT
+VALID` and re-scans — and your ledger `INSERT` below then fails on the primary key.
 
 ```sql
+-- The first three take ACCESS EXCLUSIVE. Bound the wait: while one of them sits in the lock
+-- queue, every later reader of execution_attempts queues behind it. If a statement is cancelled
+-- with SQLSTATE 55P03, nothing was applied — find the long transaction and run it again.
+set lock_timeout = '3s';
 alter table execution_attempts
     add column if not exists candidate_rank integer,
     add column if not exists candidate_score double precision,
@@ -96,7 +168,11 @@ alter table execution_attempts
         selection_reason is null
         or selection_reason in ('priority', 'explicit_hint', 'scored', 'fallback_after_failure')
     ) not valid;
--- separate statement, after the commit above: SHARE UPDATE EXCLUSIVE, blocks nobody
+-- The scan. SHARE UPDATE EXCLUSIVE, which blocks neither readers nor writers, and which is
+-- allowed to wait: measured, a queued SHARE UPDATE EXCLUSIVE let a later `select` through in
+-- 0.15 s and a later `insert` in 0.06 s. Only other SHARE UPDATE EXCLUSIVE work waits behind it
+-- (an `analyze` in the same run took 7.5 s), so there is nothing here to bound.
+reset lock_timeout;
 alter table execution_attempts
     validate constraint execution_attempts_selection_reason_valid;
 ```
@@ -107,11 +183,23 @@ using it here:
 
 ```sql
 insert into _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
-values (30, 'execution attempt candidate observability', now(), true, '\x…'::bytea, 0);
+values (30, 'execution attempt candidate observability (pre-applied by hand NOT VALID + VALIDATE, issue #250)', now(), true, '\x…'::bytea, 0);
 ```
 
-A wrong checksum is not silent: the next boot fails with `VersionMismatch(30)` and applies nothing.
-`0034` then runs on top and re-scans the table once, non-blocking, as described above.
+The description is free text — `sqlx` reads only `version` and `checksum` from this table
+(`sqlx-postgres-0.8.6`, `list_applied_migrations`) — so write the one above rather than the stock
+`execution attempt candidate observability`. The stock one is what the migrator writes when it runs
+`0030` as written, and if you use it here nothing afterwards can tell your hand-applied database
+apart from one that took the blocking scan.
+
+**Do the INSERT, or repeat the work.** If you run the SQL above and skip the ledger row, the next
+Moira boot finds `0030` still pending and a constraint already there, drops it, re-adds it
+`NOT VALID` and re-scans — safe, but a second full scan you did not need. A wrong checksum is not
+silent either: the next boot fails with `VersionMismatch(30)` and applies nothing.
+
+`0034` then runs on top: a few milliseconds of ACCESS EXCLUSIVE to re-install the constraint
+`NOT VALID`, bounded by `lock_timeout`, then one re-scan under SHARE UPDATE EXCLUSIVE that blocks
+neither readers nor writers — as described above.
 
 ### Breaking: `encrypted_content` now actually encrypts, and rolling back past this release hides those rows
 

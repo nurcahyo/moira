@@ -493,6 +493,192 @@ fn the_known_cases_are_the_ones_the_rule_is_reading() {
     );
 }
 
+/// The string literal bound by a `const NAME: &str = "…";`, read out of a source file.
+///
+/// Deliberately textual. The point of the two tests below is to pin a value that lives in Rust
+/// against a copy of it in a document, and a test that imported the constant could only ever
+/// compare the code to itself.
+fn string_constant(source: &str, name: &str) -> String {
+    let marker = format!("const {name}: &str =");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{name} must still be declared as `const {name}: &str = …`"));
+    let declaration = &source[start + marker.len()..];
+    let end = declaration
+        .find(';')
+        .unwrap_or_else(|| panic!("{name}'s declaration must end in `;`"));
+    let literal = &declaration[..end];
+    let open = literal
+        .find('"')
+        .unwrap_or_else(|| panic!("{name} must be a plain string literal"));
+    let close = literal
+        .rfind('"')
+        .expect("a literal with an opening quote has a closing one");
+    assert!(
+        close > open,
+        "{name} must be a single plain string literal, not a concatenation this parser would \
+         misread"
+    );
+    literal[open + 1..close].to_string()
+}
+
+/// The description `sqlx` derives from a migration's filename — everything after the first `_`,
+/// without `.sql`, with underscores as spaces (`sqlx-core-0.8.6/src/migrate/source.rs:113-117`).
+///
+/// This is what lands in `_sqlx_migrations.description` when the migrator runs the file itself,
+/// and therefore the one value that must mean *only* that.
+fn stock_description(file: &str) -> String {
+    file.trim_end_matches(".sql")
+        .split_once('_')
+        .expect("a migration filename is <version>_<description>.sql")
+        .1
+        .replace('_', " ")
+}
+
+fn release_notes() -> String {
+    fs::read_to_string(repository_root().join("docs/release-notes.md"))
+        .expect("read docs/release-notes.md")
+}
+
+/// The `description` the manual pre-step in the release notes tells an operator to write.
+fn manual_pre_step_description(notes: &str) -> String {
+    let insert = notes.find("insert into _sqlx_migrations").expect(
+        "the release notes must still carry the manual ledger INSERT for the sqlx-cli path",
+    );
+    let values = "values (30, '";
+    let start = notes[insert..]
+        .find(values)
+        .expect("the manual INSERT must still write version 30 with a literal description")
+        + insert
+        + values.len();
+    let end = notes[start..]
+        .find('\'')
+        .expect("the description literal in the manual INSERT must be closed");
+    notes[start..start + end].to_string()
+}
+
+/// Every ledger description an operator can read for `0030` means a different thing, so no two of
+/// them may be the same string — and the one the notes tell the operator to grep for has to be the
+/// one the code actually writes.
+///
+/// This is the smallest version of the rule the rest of this file enforces for SQL, applied to
+/// prose: an operator-facing claim is only worth the mechanism that keeps it true. The earlier
+/// draft of the release note quoted the preflight's description correctly *and* told the operator
+/// following the manual pre-step to insert the stock one, then told them the stock one means
+/// `0030` "ran as written" — so the reader who took the escape hatch was later misinformed by the
+/// same entry that sent them there.
+#[test]
+fn the_three_ledger_descriptions_for_0030_are_distinct_and_the_notes_quote_the_real_one() {
+    let notes = release_notes();
+    let preflight = fs::read_to_string(repository_root().join("src/infra/migration_preflight.rs"))
+        .expect("read src/infra/migration_preflight.rs");
+
+    let written_by_the_preflight = string_constant(&preflight, "PRE_APPLIED_DESCRIPTION");
+    let written_by_sqlx = stock_description("0030_execution_attempt_candidate_observability.sql");
+    let written_by_hand = manual_pre_step_description(&notes);
+
+    assert!(
+        notes.contains(&written_by_the_preflight),
+        "docs/release-notes.md tells an operator to read _sqlx_migrations to find out which path \
+         0030 took, but the description it shows is not the one \
+         src/infra/migration_preflight.rs writes:\n  code:  {written_by_the_preflight}\nUpdate the \
+         document, or PRE_APPLIED_DESCRIPTION, so the operator greps for a string that exists"
+    );
+    assert_ne!(
+        written_by_hand, written_by_sqlx,
+        "the manual pre-step tells an operator to record 0030 with the same description sqlx \
+         writes when it runs 0030 itself. Those are opposite outcomes — the manual path is taken \
+         precisely because the table is too big to scan under ACCESS EXCLUSIVE — and after this \
+         INSERT nothing can tell them apart"
+    );
+    assert_ne!(
+        written_by_hand, written_by_the_preflight,
+        "the manual pre-step must not claim to be the preflight: one is a procedure a human ran \
+         and may have run partially, the other is a transaction that either happened or did not"
+    );
+}
+
+/// Both halves that take ACCESS EXCLUSIVE on `execution_attempts` bound how long they wait for it,
+/// with the same value.
+///
+/// `NOT VALID` moves the *scan* out from under ACCESS EXCLUSIVE. It does not move the ACCESS
+/// EXCLUSIVE: every `ALTER TABLE` takes one, and a request for it that has to queue behind a
+/// long-running transaction parks every later reader of the table behind itself as well — so the
+/// safe shape still has an unbounded stall in it unless the wait is capped. Measured on PostgreSQL
+/// 16.14: a 12-second read on `execution_attempts` turned a `select count(*)` that arrived after
+/// the DDL into a 9.4-second block; with `lock_timeout = '3s'` the same `select` blocked 1.4 s and
+/// the DDL failed cleanly, recording nothing.
+///
+/// This is a tripwire, not the mechanism. That the preflight's bound actually *fires* is carried by
+/// `migration_preflight::tests::a_contended_pre_apply_gives_up_rather_than_queueing_and_is_retryable`,
+/// which holds a real lock against a real server. What this adds is the half no runtime test can
+/// reach — `0034` is SQL `sqlx` executes, with no place to assert from — and the agreement between
+/// the two values.
+#[test]
+fn the_access_exclusive_halves_bound_how_long_they_wait_for_the_lock() {
+    let preflight = fs::read_to_string(repository_root().join("src/infra/migration_preflight.rs"))
+        .expect("read src/infra/migration_preflight.rs");
+    let timeout = string_constant(&preflight, "ACCESS_EXCLUSIVE_LOCK_TIMEOUT");
+
+    // Everything before `#[cfg(test)]`, because the phrase "set local lock_timeout" appears in the
+    // test module's own prose and failure messages — a `contains` over the whole file would be
+    // satisfied by a comment about the thing rather than by the thing.
+    let production = preflight
+        .split_once("#[cfg(test)]")
+        .expect("src/infra/migration_preflight.rs must still have a test module")
+        .0;
+    assert!(
+        production.contains("set local lock_timeout = '{ACCESS_EXCLUSIVE_LOCK_TIMEOUT}'"),
+        "src/infra/migration_preflight.rs declares ACCESS_EXCLUSIVE_LOCK_TIMEOUT but its \
+         group-one transaction no longer applies it, so the wait for ACCESS EXCLUSIVE on \
+         execution_attempts is unbounded again"
+    );
+
+    let file = "0034_selection_reason_check_validates_without_blocking.sql";
+    let sql = fs::read_to_string(migrations_dir().join(file)).expect("read 0034");
+    let statements = statements(&sql);
+    let position = |predicate: &dyn Fn(&String) -> bool, what: &str| {
+        statements
+            .iter()
+            .position(predicate)
+            .unwrap_or_else(|| panic!("{file} must still contain {what}"))
+    };
+
+    let bound = position(
+        &|statement: &String| statement.starts_with("set local lock_timeout"),
+        "a `set local lock_timeout` in its first transaction",
+    );
+    let ddl = position(
+        &|statement: &String| {
+            statement.starts_with("alter table execution_attempts drop constraint")
+        },
+        "the drop-constraint that takes ACCESS EXCLUSIVE",
+    );
+    let commit = position(&|statement: &String| statement == "commit", "a commit");
+
+    assert!(
+        bound < ddl && ddl < commit,
+        "{file} sets lock_timeout at statement {bound}, drops the constraint at {ddl} and commits \
+         at {commit}. The bound has to be inside the transaction that takes ACCESS EXCLUSIVE and \
+         before the statement that takes it, or it applies to nothing"
+    );
+    assert!(
+        statements[bound].contains(&format!("'{timeout}'")),
+        "{file} waits `{}` for ACCESS EXCLUSIVE while src/infra/migration_preflight.rs waits \
+         `{timeout}` for the same lock on the same table. Two answers to one question is one \
+         answer too many",
+        statements[bound]
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|statement| statement.starts_with("set lock_timeout")),
+        "{file} sets lock_timeout without `local`, which outlives its transaction and silently \
+         applies to every migration sqlx runs afterwards on the same session — including the \
+         VALIDATE CONSTRAINT below it, which is allowed to wait"
+    );
+}
+
 /// Sanity on the exemption for configuration tables: it must be a decision about the *table*, not
 /// a hole big enough for the hot ones to fall through.
 #[test]

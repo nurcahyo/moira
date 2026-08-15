@@ -193,7 +193,13 @@ tl_count_skips() {
 # `tests/migration_constraint_safety.rs` +5, `tests/deepseek_v4_catalog.rs` 4 -> 8 = +4.
 # `declared` therefore moves 1582 -> 1596 and `passed` 1588 -> 1602 by the same 14, which is the
 # check that no existing test was displaced by the merge. The +6 doctest offset holds again.
-TL_TEST_COUNT_MINIMUM=1602
+#
+# 2026-08-16, item (c) of the same review: **1605**, +3, moved in the commit that adds them.
+# `src/infra/migration_preflight.rs` 5 -> 6 (the contended pre-apply, which needs a real server)
+# and `tests/migration_constraint_safety.rs` 5 -> 7 (the ledger-description pin and the
+# lock_timeout pin). Counted from the two targets directly — 6 and 7 passed — and confirmed
+# against the gate run recorded below rather than added to the constant on faith.
+TL_TEST_COUNT_MINIMUM=1605
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
