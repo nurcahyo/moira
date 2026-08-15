@@ -27,10 +27,12 @@
 -- safe one, and `tests/migration_constraint_safety.rs` pins that mechanically for every future
 -- `add constraint` against a high-volume table.
 --
--- **It does not make `0030` cheap.** A database that has not yet applied `0030` still applies it
--- first and still eats that scan under ACCESS EXCLUSIVE. Nothing appended after `0030` can change
--- what `0030` does; only editing `0030` could, and merged migrations are not edited in this
--- repository — `docs/project-structure.md:19`, `migrations/0018_admin_identity_granted_by_invite
+-- **It does not make `0030` cheap.** As far as the migration set is concerned, a database that has
+-- not yet applied `0030` still applies it first and still eats that scan under ACCESS EXCLUSIVE.
+-- Nothing appended after `0030` can change what `0030` does — the paragraph after next names the
+-- thing that can, and it is not a migration. Only editing `0030` could, and merged migrations are
+-- not edited in this repository — `docs/project-structure.md:19`,
+-- `migrations/0018_admin_identity_granted_by_invite
 -- .sql:20-21` ("`0012` is merged and is not edited"), and `tests/support/mod.rs:916` ("Editing
 -- 0003 is not an option either — it is already applied to every existing database and `sqlx`
 -- checksums migration files"). Changing the bytes of a shipped file makes every database that
@@ -38,10 +40,23 @@
 -- starts from an empty database — stays green. That trade is not worth taking to save a scan on
 -- a table that is empty on every install created after `0030` shipped.
 --
--- The residual is therefore one deploy: a database that crosses `0030` with a populated
--- `execution_attempts`. It is written down in `docs/release-notes.md` under "Unreleased", with
--- the manual pre-step that avoids it, rather than left for an operator to discover from a stalled
--- fleet.
+-- **What actually keeps `0030` from blocking is `src/infra/migration_preflight.rs`**, because the
+-- only code that runs *before* the migrator reaches `0030` is the code that calls the migrator.
+-- `db::migrate` pre-applies `0030`'s own three statements in this same order and records `0030` as
+-- applied, so `Migrator::run` skips it. This file remains the correction to the *definition* — the
+-- shape a fresh install ends on and the next author copies, pinned by
+-- `tests/migration_constraint_safety.rs`. The residual it does not cover is a deployment that
+-- migrates with `sqlx-cli` rather than a Moira process; `docs/release-notes.md` keeps the manual
+-- pre-step for that.
+--
+-- **This migration costs one full scan of `execution_attempts` on every database that already has
+-- the constraint.** `drop constraint` / `add … not valid` clears `pg_constraint.convalidated`, so
+-- the `VALIDATE CONSTRAINT` below re-scans the table even though every row already satisfies the
+-- check — PostgreSQL skips validation only for a constraint already *marked* valid, which this
+-- file has just un-marked. The scan takes SHARE UPDATE EXCLUSIVE and blocks nothing, but on a
+-- large table it is minutes of I/O and it is not a no-op. That is the price of having one
+-- unconditional, idempotent, plain-statement definition rather than a `DO` block that a reader —
+-- and `tests/migration_constraint_safety.rs`'s parser — would have to reason about.
 --
 -- ===================================================================================
 -- Idempotence, which `-- no-transaction` makes mandatory
@@ -53,8 +68,9 @@
 -- `VALIDATE CONSTRAINT` against an already-validated constraint is a no-op.
 --
 -- The constraint text is character-for-character `0030`'s. This migration changes *how* the
--- constraint is installed, never *what* it admits — and because `0030` already validated it,
--- there is no row anywhere that the re-validation below can fail on.
+-- constraint is installed, never *what* it admits — and because the constraint was already
+-- enforced before this file runs (by `0030`, or by the preflight that pre-applies it), there is no
+-- row anywhere that the re-validation below can fail on.
 
 begin;
 

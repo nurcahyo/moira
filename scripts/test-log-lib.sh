@@ -181,7 +181,19 @@ tl_count_skips() {
 # `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
 # with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
 # 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
-TL_TEST_COUNT_MINIMUM=1588
+#
+# Re-measured 2026-08-16 on the merge of `develop` into `fix/plan12-3-migrations`: **1602**
+# passed, source declaring 1596, by `MOIRA_TEST_REDIS_URL=… /usr/bin/make gates` with Postgres
+# and Redis up and zero skip lines. Measured, not derived.
+#
+# The +14 is this branch's own, and it is +14 rather than +18 because `tests/deepseek_v4_catalog.rs`
+# already existed on `develop` with four `0028` tests — the branch extends that file rather than
+# adding it, so only its four new `0035` tests are new attributes. Counted against `develop`
+# (declared 1582) file by file: `src/infra/migration_preflight.rs` +5,
+# `tests/migration_constraint_safety.rs` +5, `tests/deepseek_v4_catalog.rs` 4 -> 8 = +4.
+# `declared` therefore moves 1582 -> 1596 and `passed` 1588 -> 1602 by the same 14, which is the
+# check that no existing test was displaced by the merge. The +6 doctest offset holds again.
+TL_TEST_COUNT_MINIMUM=1602
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
