@@ -47,6 +47,44 @@
 // `connectClaudeApiKey`) rotates the existing row in place rather than
 // creating a second one. This component only changes the BUTTON LABEL
 // between "connect" and "re-acquire/rotate" phrasing, and only the label.
+//
+// ============================================================================
+// MODE A NEVER PROMISES SOMETHING THIS HOST CANNOT KEEP (issue #269 follow-up)
+// ============================================================================
+//
+// Mode A is gated by TWO independent server-resolved flags, both read at page
+// load and passed down as props — never discovered by clicking the button:
+//
+//   `cliAcquisitionEnabled`    an administrator turned this feature on for
+//                              the deployment (`CONSOLE_ALLOW_LOCAL_CLI_
+//                              CREDENTIALS`).
+//   `cliInteractiveAvailable`  THIS host can actually give `claude
+//                              setup-token` a terminal to render into
+//                              (`ptyIsAvailable()`, `lib/claude-cli.ts`).
+//
+// Before this flag existed, the panel rendered the promise paragraph
+// ("Signing in is interactive... this can take a few minutes") and an
+// enabled button whenever ONLY the first flag was true — which, since
+// `ptyIsAvailable()` is pinned `false` today (see that module's header), was
+// every deployment that turned Mode A on. Clicking the button then always
+// hit the acquire/start route's 409 refusal, rendered as a `role="alert"`
+// error directly under a paragraph that had just promised it would work.
+// The mechanism was correct; a promise sitting on top of its own refusal
+// was not.
+//
+// Now the promise paragraph and the button render ONLY when both flags are
+// true. When Mode A is on but this host cannot run the interactive step, the
+// panel renders one calm, non-error paragraph instead — what to do (run
+// `claude setup-token` in a terminal, paste the result below) — styled with
+// the same `.hint` treatment as the "an administrator has not turned this
+// on" notice, never `.problem`/`role="alert"`. It is guidance the operator
+// needed before clicking, not a report of something that just failed. The
+// route's own 409 (`claude_subscription_cli_pty_unavailable`) still exists
+// for defence in depth — a client posting directly, or a stale page — but
+// the shipped UI never lets an operator reach it by clicking a rendered
+// button. The day a real pty-capable executor exists, `ptyIsAvailable()`
+// starts returning `true` and the promise + button come back automatically;
+// nothing here changes.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -90,6 +128,16 @@ export interface ConnectClaudeSubscriptionPanelProps {
    * button that would 403.
    */
   readonly cliAcquisitionEnabled?: boolean;
+  /**
+   * Server-resolved: can THIS host actually run the interactive sign-in?
+   * (`ptyIsAvailable()`, see `lib/claude-cli.ts`.) Defaults to `false` — the
+   * same fixed answer that function returns today — so a caller that omits
+   * this prop gets the calm guidance notice, never the promise paragraph and
+   * a button that can only end in the 409 `claude_subscription_cli_pty_
+   * unavailable` refusal. See the block below for why this is checked at
+   * RENDER time rather than discovered by clicking the button once.
+   */
+  readonly cliInteractiveAvailable?: boolean;
   /** Status of the Mode A/C (oauth2, subscription) row. */
   readonly subscriptionStatus?: ClaudeCredentialStatusView;
   /** Status of the Mode B (api_key) row. */
@@ -184,6 +232,7 @@ export function ConnectClaudeSubscriptionPanel({
   fetchImpl,
   onConnected,
   cliAcquisitionEnabled = false,
+  cliInteractiveAvailable = false,
   subscriptionStatus = UNKNOWN_STATUS,
   keyStatus = UNKNOWN_STATUS,
   cliPollIntervalMs = CLI_POLL_INTERVAL_MS,
@@ -318,10 +367,41 @@ export function ConnectClaudeSubscriptionPanel({
       <p className={styles.intro}>{t(CONSOLE_MESSAGE_KEYS.claude_subscription_intro)}</p>
 
       {/* --- Mode A -------------------------------------------------------- */}
+      {/*
+       * Three states, checked in this order, and each is a DEAD END for the
+       * other two — never layered:
+       *
+       *   1. `!cliAcquisitionEnabled`   — an administrator has not turned Mode
+       *      A on for this deployment at all. Unrelated to what this host can
+       *      do; the disabled notice says so.
+       *   2. `!cliInteractiveAvailable` — turned on, but THIS host cannot give
+       *      `claude setup-token` a terminal (`ptyIsAvailable()`,
+       *      `lib/claude-cli.ts` — pinned `false` today; see that module's
+       *      header for the investigation). Neither the promise paragraph
+       *      (`cli_intro`, "this can take a few minutes") nor the button is
+       *      rendered here — the operator must never see an affordance that
+       *      can only end in the acquire/start route's 409. The guidance
+       *      below is informational, styled with `.hint` (same treatment as
+       *      state 1's notice), never `.problem`/`role="alert"`: it is not
+       *      reporting a failed action, it is stating a fact the operator
+       *      needed BEFORE clicking. Both flags are known from the page's own
+       *      server-side render (`page.tsx`), never discovered by a click.
+       *   3. Both true — the only state where the promise and an enabled
+       *      button are shown together, because here the promise is one this
+       *      host can actually keep. The day a real pty-capable executor
+       *      exists, `ptyIsAvailable()` starts returning `true` and this
+       *      branch starts rendering on its own — no second code path.
+       */}
       <div className={styles.subsection}>
         <h3 className={styles.subheading}>{t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_heading)}</h3>
         <StatusLine status={subscriptionStatus} />
-        {cliAcquisitionEnabled ? (
+        {!cliAcquisitionEnabled ? (
+          <p className={styles.hint}>{t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled_notice)}</p>
+        ) : !cliInteractiveAvailable ? (
+          <p className={styles.hint}>
+            {t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_interactive_unavailable_notice)}
+          </p>
+        ) : (
           <>
             <p className={styles.intro}>{t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_intro)}</p>
             <Button
@@ -361,8 +441,6 @@ export function ConnectClaudeSubscriptionPanel({
               </p>
             )}
           </>
-        ) : (
-          <p className={styles.hint}>{t(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled_notice)}</p>
         )}
       </div>
 

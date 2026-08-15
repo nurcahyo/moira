@@ -2932,6 +2932,20 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "Shown in place of the Mode A button when the console reports the opt-in flag is off.",
   },
+  [K.claude_subscription_cli_interactive_unavailable_notice]: {
+    key: K.claude_subscription_cli_interactive_unavailable_notice,
+    message:
+      "This host has no terminal to hand the Claude CLI, so automatic sign-in cannot run here. " +
+      "Run `claude setup-token` yourself in a terminal, then paste the result in the field " +
+      "below.",
+    description:
+      "Shown in place of the Mode A promise paragraph and button — not as an alert — when the " +
+      "page's server-side render already knows ptyIsAvailable() (lib/claude-cli.ts) is false, so " +
+      "the operator never sees a button that can only 409. This is guidance, not an error: it " +
+      "renders with the panel's normal informational styling (the same treatment as " +
+      "cli_disabled_notice), never role=\"alert\". Distinct from cli_pty_unavailable, which stays " +
+      "reserved for the 409 acquire/start still returns in case a client posts anyway.",
+  },
   [K.claude_subscription_cli_disabled]: {
     key: K.claude_subscription_cli_disabled,
     message: "This deployment has not turned on automatic acquisition.",

@@ -40,6 +40,13 @@ export interface LlmSettingsPanelsProps {
   readonly providers: readonly LlmProviderView[];
   /** Server-resolved: is Mode A (CLI-assisted Claude acquisition) turned on? */
   readonly cliAcquisitionEnabled: boolean;
+  /**
+   * Server-resolved: can THIS host actually run the interactive sign-in
+   * (`ptyIsAvailable()`, `lib/claude-cli.ts`)? Independent of
+   * `cliAcquisitionEnabled` — see `ConnectClaudeSubscriptionPanel`'s own
+   * header for why the panel needs both flags separately, at render time.
+   */
+  readonly cliInteractiveAvailable: boolean;
   /** Status of the Claude subscription (oauth2) and API-key (api_key) rows. */
   readonly claudeSubscriptionStatus: ClaudeCredentialStatusView;
   readonly claudeKeyStatus: ClaudeCredentialStatusView;
@@ -49,6 +56,7 @@ export function LlmSettingsPanels({
   defaultBaseUrl,
   providers,
   cliAcquisitionEnabled,
+  cliInteractiveAvailable,
   claudeSubscriptionStatus,
   claudeKeyStatus,
 }: LlmSettingsPanelsProps) {
@@ -60,6 +68,7 @@ export function LlmSettingsPanels({
       <ConnectVllmPanel defaultBaseUrl={defaultBaseUrl} onConnected={reload} />
       <ConnectClaudeSubscriptionPanel
         cliAcquisitionEnabled={cliAcquisitionEnabled}
+        cliInteractiveAvailable={cliInteractiveAvailable}
         subscriptionStatus={claudeSubscriptionStatus}
         keyStatus={claudeKeyStatus}
         onConnected={reload}
