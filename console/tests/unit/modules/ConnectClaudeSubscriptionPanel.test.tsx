@@ -12,7 +12,15 @@ import userEvent from "@testing-library/user-event";
 
 import { CONSOLE_CATALOG } from "@/lib/i18n";
 import { CONSOLE_MESSAGE_KEYS, type ConsoleMessageKey } from "@/lib/i18n/keys";
+import type { ClaudeCredentialStatusView } from "@/lib/llm-view";
 import { ConnectClaudeSubscriptionPanel } from "@/modules/llm/ConnectClaudeSubscriptionPanel";
+
+const NOT_CONNECTED: ClaudeCredentialStatusView = { kind: "not_connected", status: null, expiresAt: null };
+const CONNECTED_ACTIVE: ClaudeCredentialStatusView = {
+  kind: "connected",
+  status: "active",
+  expiresAt: null,
+};
 
 /** Unmistakable, and asserted absent from every rendered node. */
 const TOKEN = "sk-ant-oat01-unmistakable-subscription-token-4f9c2b";
@@ -163,5 +171,240 @@ describe("ConnectClaudeSubscriptionPanel", () => {
       copy(CONSOLE_MESSAGE_KEYS.claude_subscription_token_invalid),
     );
     expect(send.calls.length).toBe(1);
+  });
+});
+
+describe("ConnectClaudeSubscriptionPanel — Mode A (CLI-assisted)", () => {
+  test("disabled by default: shows the disabled notice and no acquire button", () => {
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={scriptedFetch([{ status: 200, body: {} }])} />);
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled_notice))).toBeDefined();
+    expect(
+      screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    ).toBeNull();
+  });
+
+  test("when enabled and nothing is connected, the button reads 'acquire', not 'reacquire'", () => {
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        cliAcquisitionEnabled
+        subscriptionStatus={NOT_CONNECTED}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    ).toBeDefined();
+    expect(
+      screen.queryByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+    ).toBeNull();
+  });
+
+  test("when enabled and already connected, the button reads 're-acquire and rotate'", () => {
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        cliAcquisitionEnabled
+        subscriptionStatus={CONNECTED_ACTIVE}
+      />,
+    );
+    expect(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_reacquire) }),
+    ).toBeDefined();
+  });
+
+  test("clicking posts an empty body to the acquire endpoint — nothing user-supplied travels with it", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+    ]);
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={send}
+        cliAcquisitionEnabled
+        subscriptionStatus={NOT_CONNECTED}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    );
+
+    await waitFor(() => expect(send.calls.length).toBe(1));
+    expect(send.calls[0]?.url).toBe("/api/settings/llm/claude-subscription/acquire");
+    expect(send.calls[0]?.method).toBe("POST");
+    expect(send.calls[0]?.body).toEqual({});
+  });
+
+  test("a successful acquisition announces 'created' and fires onConnected", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+    ]);
+    const connected: string[] = [];
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={send}
+        cliAcquisitionEnabled
+        subscriptionStatus={NOT_CONNECTED}
+        onConnected={() => connected.push("yes")}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    );
+    expect(await screen.findByText(copy(CONSOLE_MESSAGE_KEYS.claude_subscription_created))).toBeDefined();
+    await waitFor(() => expect(connected).toEqual(["yes"]));
+  });
+
+  test("a keyed CLI refusal (e.g. not signed in) is rendered as its own alert", async () => {
+    const send = scriptedFetch([
+      {
+        status: 409,
+        body: {
+          error: {
+            code: "claude_cli_mint_failed",
+            message_key: CONSOLE_MESSAGE_KEYS.claude_subscription_cli_not_signed_in,
+          },
+        },
+      },
+    ]);
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={send}
+        cliAcquisitionEnabled
+        subscriptionStatus={NOT_CONNECTED}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_submit) }),
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      copy(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_not_signed_in),
+    );
+  });
+});
+
+describe("ConnectClaudeSubscriptionPanel — Mode B (Anthropic API key)", () => {
+  const API_KEY = "sk-ant-unmistakable-console-api-key-9f1a2b";
+
+  test("the field is masked, exactly like the subscription-token field", () => {
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={scriptedFetch([{ status: 200, body: {} }])} />);
+    const input = field(CONSOLE_MESSAGE_KEYS.claude_api_key_label) as HTMLInputElement;
+    expect(input.type).toBe("password");
+  });
+
+  test("submission is blocked until the field carries something", () => {
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={scriptedFetch([{ status: 200, body: {} }])} />);
+    const submit = screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) });
+    expect((submit as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("it posts to the console's own API-key endpoint with { api_key }", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+    ]);
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={send} />);
+
+    await userEvent.type(field(CONSOLE_MESSAGE_KEYS.claude_api_key_label), API_KEY);
+    await userEvent.click(screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) }));
+
+    await waitFor(() => expect(send.calls.length).toBe(1));
+    expect(send.calls[0]?.url).toBe("/api/settings/llm/claude-api-key");
+    expect(send.calls[0]?.method).toBe("POST");
+    expect(send.calls[0]?.body).toEqual({ api_key: API_KEY });
+  });
+
+  test("the field is cleared and the key never appears in the rendered DOM after a successful save", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+    ]);
+    const { container } = render(<ConnectClaudeSubscriptionPanel fetchImpl={send} />);
+
+    const input = field(CONSOLE_MESSAGE_KEYS.claude_api_key_label) as HTMLInputElement;
+    await userEvent.type(input, API_KEY);
+    await userEvent.click(screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) }));
+
+    await waitFor(() => expect(input.value).toBe(""));
+    expect(container.innerHTML).not.toContain(API_KEY);
+  });
+
+  // Two separate tests, not one test with two `render()` calls — same
+  // reasoning as the paste-mode tests above: `cleanup()` runs between tests,
+  // not between two renders inside one.
+  test("a first save (nothing existed yet) announces 'created'", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "created" } },
+    ]);
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={send} />);
+    await userEvent.type(field(CONSOLE_MESSAGE_KEYS.claude_api_key_label), API_KEY);
+    await userEvent.click(screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) }));
+    expect(await screen.findByText(copy(CONSOLE_MESSAGE_KEYS.claude_api_key_created))).toBeDefined();
+    expect(screen.queryByText(copy(CONSOLE_MESSAGE_KEYS.claude_api_key_updated))).toBeNull();
+  });
+
+  test("a second save (a credential already existed) announces 'updated', not 'created'", async () => {
+    const send = scriptedFetch([
+      { status: 200, body: { provider_id: "p1", credential_id: "c1", outcome: "rotated" } },
+    ]);
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={send} />);
+    await userEvent.type(field(CONSOLE_MESSAGE_KEYS.claude_api_key_label), API_KEY);
+    await userEvent.click(screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) }));
+    expect(await screen.findByText(copy(CONSOLE_MESSAGE_KEYS.claude_api_key_updated))).toBeDefined();
+    expect(screen.queryByText(copy(CONSOLE_MESSAGE_KEYS.claude_api_key_created))).toBeNull();
+  });
+
+  test("a keyed refusal (wrong shape) is rendered as its own alert", async () => {
+    const send = scriptedFetch([
+      {
+        status: 400,
+        body: {
+          error: { code: "invalid_request", message_key: CONSOLE_MESSAGE_KEYS.claude_api_key_wrong_shape },
+        },
+      },
+    ]);
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={send} />);
+    await userEvent.type(field(CONSOLE_MESSAGE_KEYS.claude_api_key_label), "sk-proj-not-anthropic");
+    await userEvent.click(screen.getByRole("button", { name: copy(CONSOLE_MESSAGE_KEYS.claude_api_key_submit) }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      copy(CONSOLE_MESSAGE_KEYS.claude_api_key_wrong_shape),
+    );
+  });
+});
+
+describe("ConnectClaudeSubscriptionPanel — status display", () => {
+  test("renders the neutral 'unknown' status when no status prop is supplied (the safe default)", () => {
+    render(<ConnectClaudeSubscriptionPanel fetchImpl={scriptedFetch([{ status: 200, body: {} }])} />);
+    expect(
+      screen.getAllByText(copy(CONSOLE_MESSAGE_KEYS.claude_connect_status_unknown)).length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  test("renders 'connected' with no expiry when the subscription row is active", () => {
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        subscriptionStatus={CONNECTED_ACTIVE}
+      />,
+    );
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_connect_status_connected))).toBeDefined();
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_connect_status_no_expiry))).toBeDefined();
+  });
+
+  test("renders 'connected, but disabled' when the row exists but is not active", () => {
+    render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        keyStatus={{ kind: "connected", status: "disabled", expiresAt: null }}
+      />,
+    );
+    expect(screen.getByText(copy(CONSOLE_MESSAGE_KEYS.claude_connect_status_disabled))).toBeDefined();
+  });
+
+  test("never renders a masked secret or a fingerprint — the status view carries neither", () => {
+    const { container } = render(
+      <ConnectClaudeSubscriptionPanel
+        fetchImpl={scriptedFetch([{ status: 200, body: {} }])}
+        subscriptionStatus={CONNECTED_ACTIVE}
+        keyStatus={CONNECTED_ACTIVE}
+      />,
+    );
+    expect(container.innerHTML).not.toMatch(/mask|fingerprint/i);
   });
 });

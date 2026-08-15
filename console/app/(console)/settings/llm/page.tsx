@@ -36,11 +36,15 @@
 // choosing. The page says so instead.
 
 import { consoleRuntime } from "@/lib/auth-runtime";
+import {
+  loadClaudeApiKeyStatus,
+  loadClaudeSubscriptionStatus,
+} from "@/lib/claude-subscription";
 import { consoleEnv } from "@/lib/env";
 import { isMoiraRequestError } from "@/lib/errors";
 import { CONSOLE_MESSAGE_KEYS, t } from "@/lib/i18n";
 import { loadLlmSettings } from "@/lib/llm-settings";
-import { LOCAL_VLLM_BASE_URL, type LlmSettingsView } from "@/lib/llm-view";
+import { LOCAL_VLLM_BASE_URL, type ClaudeCredentialStatusView, type LlmSettingsView } from "@/lib/llm-view";
 import { moiraClientForSession } from "@/lib/moira-session";
 import { LlmSettingsPanels } from "@/modules/llm/LlmSettingsPanels";
 import { headers } from "next/headers";
@@ -50,17 +54,29 @@ import styles from "./page.module.css";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Everything the screen renders, or `null` when Moira could not be reached. */
-async function load(): Promise<LlmSettingsView | null> {
+/** Everything the screen renders. */
+interface LlmPageData {
+  readonly settings: LlmSettingsView;
+  readonly claudeSubscriptionStatus: ClaudeCredentialStatusView;
+  readonly claudeApiKeyStatus: ClaudeCredentialStatusView;
+}
+
+/** `null` when Moira could not be reached. */
+async function load(): Promise<LlmPageData | null> {
   const runtimeState = await consoleRuntime();
   if (!runtimeState.ok) return null;
 
   const client = moiraClientForSession(consoleEnv(), runtimeState.auth, await headers());
-  return loadLlmSettings(client);
+  const [settings, claudeSubscriptionStatus, claudeApiKeyStatus] = await Promise.all([
+    loadLlmSettings(client),
+    loadClaudeSubscriptionStatus(client),
+    loadClaudeApiKeyStatus(client),
+  ]);
+  return { settings, claudeSubscriptionStatus, claudeApiKeyStatus };
 }
 
 export default async function LlmSettingsPage() {
-  let data: LlmSettingsView | null;
+  let data: LlmPageData | null;
   try {
     data = await load();
   } catch (error) {
@@ -79,7 +95,7 @@ export default async function LlmSettingsPage() {
         </p>
       ) : (
         <>
-          {data.generalRouteId === null && (
+          {data.settings.generalRouteId === null && (
             <p className={styles.problem} role="alert">
               {t(CONSOLE_MESSAGE_KEYS.llm_general_route_missing)}
             </p>
@@ -91,7 +107,10 @@ export default async function LlmSettingsPage() {
               `LlmSettingsPanels`. */}
           <LlmSettingsPanels
             defaultBaseUrl={LOCAL_VLLM_BASE_URL}
-            providers={data.providers}
+            providers={data.settings.providers}
+            cliAcquisitionEnabled={consoleEnv().allowLocalCliCredentials}
+            claudeSubscriptionStatus={data.claudeSubscriptionStatus}
+            claudeKeyStatus={data.claudeApiKeyStatus}
           />
         </>
       )}

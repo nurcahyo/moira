@@ -116,6 +116,28 @@ export interface ConsoleEnv {
    * the variable named.
    */
   readonly allowInsecureUrls: boolean;
+  /**
+   * Opt-in: let the console's own BFF spawn the locally installed `claude`
+   * CLI (`claude setup-token`) to mint a Claude subscription credential
+   * itself, rather than requiring an operator to run the command and paste
+   * the result. See `docs/claude-subscription-sidecar.md` and
+   * `lib/claude-cli.ts`.
+   *
+   * Default `false`. This is COMMAND EXECUTION ON THE CONSOLE HOST, gated
+   * because it is meaningfully different from every other knob in this file:
+   * it does not change what the console TRUSTS, it changes what the console
+   * DOES. It is also single-operator by nature — the `claude` CLI's signed-in
+   * session on the host belongs to whoever ran `claude login` there, so this
+   * is documented as local/dev-oriented and is a poor fit for a shared
+   * deployment where the console host is not one person's machine.
+   *
+   * Deliberately NOT refused in production the way `allowInsecureUrls` is: a
+   * single-operator production console (the ownership model
+   * `docs/console-architecture.md`'s invitations section describes) is a
+   * legitimate place to run this, and NODE_ENV is not a proxy for "shared
+   * deployment".
+   */
+  readonly allowLocalCliCredentials: boolean;
 }
 
 /** Where the Better Auth handler is mounted. Fixed; the route file mirrors it. */
@@ -361,6 +383,8 @@ export function readConsoleEnv(source: EnvSource): ConsoleEnv {
 
   checkNothingIsPublic(source, problems);
 
+  const allowLocalCliCredentials = parseBoolean(source["CONSOLE_ALLOW_LOCAL_CLI_CREDENTIALS"]);
+
   if (problems.length > 0) throw new ConsoleConfigError(problems);
 
   return {
@@ -375,6 +399,7 @@ export function readConsoleEnv(source: EnvSource): ConsoleEnv {
     secretEncryptionKey,
     consoleDatabaseUrl,
     allowInsecureUrls,
+    allowLocalCliCredentials,
   };
 }
 

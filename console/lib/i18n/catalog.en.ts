@@ -2789,19 +2789,23 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
   /* --- the "Connect Claude subscription" panel (issue #211) --------------- */
   [K.claude_subscription_heading]: {
     key: K.claude_subscription_heading,
-    message: "Connect Claude subscription",
+    message: "Connect a Claude credential",
     description:
-      "Heading of the panel that stores a long-lived Claude subscription token as an oauth2 " +
-      "provider credential.",
+      "Heading of the panel offering all three acquisition modes: CLI-assisted, an official " +
+      "API key, and a pasted subscription token.",
   },
   [K.claude_subscription_intro]: {
     key: K.claude_subscription_intro,
     message:
-      "Paste the output of `claude setup-token`, run on a machine where you are signed in to " +
-      "your Claude subscription. The console stores it encrypted and never shows it again.",
+      "An Anthropic API key below works with this console's normal provider chain today. A " +
+      "subscription token, acquired automatically or pasted, is stored for the separate " +
+      "Agent-SDK / sidecar route and is not read by a direct Messages API call - see the " +
+      "documentation on the Claude subscription sidecar for what consumes it.",
     description:
-      "Rendered under the panel heading. Names the exact command an operator needs to run " +
-      "locally to produce the value this field wants.",
+      "Rendered under the panel heading. States the load-bearing distinction between Mode B " +
+      "(works today, direct execution) and Modes A/C (a subscription token, storage only " +
+      "until the sidecar/Agent-SDK route or the oauth-token-refresh worker exist) - the exact " +
+      "overstatement plans/12-feature-expansion-brainstorm.md warns against making.",
   },
   [K.claude_subscription_token_label]: {
     key: K.claude_subscription_token_label,
@@ -2867,6 +2871,200 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     description:
       "The provider list was truncated before a match could be confirmed absent, so the " +
       "console refused to guess rather than risk creating a duplicate provider row.",
+  },
+
+  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up) ------------- */
+  [K.claude_subscription_cli_heading]: {
+    key: K.claude_subscription_cli_heading,
+    message: "Acquire automatically",
+    description: "Sub-heading of Mode A: mint the token by running the local claude CLI.",
+  },
+  [K.claude_subscription_cli_intro]: {
+    key: K.claude_subscription_cli_intro,
+    message:
+      "Runs the claude CLI on this console's own host and stores the token it prints, " +
+      "without you having to run or paste anything. Only available when an administrator " +
+      "has turned this on for this deployment, and only useful when the CLI on this host is " +
+      "already signed in to a Claude subscription.",
+    description:
+      "Explains Mode A in the panel. Deliberately does not name the opt-in environment " +
+      "variable — that belongs to deployment configuration, not to translatable copy.",
+  },
+  [K.claude_subscription_cli_submit]: {
+    key: K.claude_subscription_cli_submit,
+    message: "Acquire and save",
+    description: "Submit control for Mode A when no credential is connected yet.",
+  },
+  [K.claude_subscription_cli_reacquire]: {
+    key: K.claude_subscription_cli_reacquire,
+    message: "Re-acquire and rotate",
+    description:
+      "Submit control for Mode A when a credential already exists. Posts to the exact same " +
+      "endpoint as the first acquisition; the chain underneath rotates the existing row.",
+  },
+  [K.claude_subscription_cli_pending]: {
+    key: K.claude_subscription_cli_pending,
+    message: "Running the CLI...",
+    description: "Announced politely while the CLI-mint request is in flight.",
+  },
+  [K.claude_subscription_cli_disabled_notice]: {
+    key: K.claude_subscription_cli_disabled_notice,
+    message:
+      "An administrator has not turned this on for this deployment. Paste a token below " +
+      "instead, or ask an administrator to enable it.",
+    description:
+      "Shown in place of the Mode A button when the console reports the opt-in flag is off.",
+  },
+  [K.claude_subscription_cli_disabled]: {
+    key: K.claude_subscription_cli_disabled,
+    message: "This deployment has not turned on automatic acquisition.",
+    description: "403 from the acquire endpoint itself, in case the button was reachable anyway.",
+  },
+  [K.claude_subscription_cli_binary_missing]: {
+    key: K.claude_subscription_cli_binary_missing,
+    message: "The claude command was not found on this console's host.",
+    description: "The acquire endpoint's process launch failed with ENOENT.",
+  },
+  [K.claude_subscription_cli_not_signed_in]: {
+    key: K.claude_subscription_cli_not_signed_in,
+    message: "The claude CLI on this host does not appear to be signed in to a subscription.",
+    description:
+      "Best-effort classification of a non-zero exit whose output matched a " +
+      "not-signed-in pattern. Never the raw CLI output.",
+  },
+  [K.claude_subscription_cli_timeout]: {
+    key: K.claude_subscription_cli_timeout,
+    message: "The claude CLI did not finish in time.",
+    description: "The process ran past the acquire endpoint's bounded timeout and was killed.",
+  },
+  [K.claude_subscription_cli_output_too_large]: {
+    key: K.claude_subscription_cli_output_too_large,
+    message: "The claude CLI printed more output than the console will read.",
+    description: "The process exceeded the acquire endpoint's bounded output size and was killed.",
+  },
+  [K.claude_subscription_cli_failed]: {
+    key: K.claude_subscription_cli_failed,
+    message: "The claude CLI exited with an error.",
+    description:
+      "A non-zero exit that did not match the not-signed-in heuristic. Never the raw CLI output.",
+  },
+  [K.claude_subscription_cli_invalid_output]: {
+    key: K.claude_subscription_cli_invalid_output,
+    message: "The claude CLI did not print anything the console recognizes as a token.",
+    description: "The process exited zero but stdout carried no non-empty line to use.",
+  },
+
+  /* --- Mode B: an official Anthropic Console API key ------------------------ */
+  [K.claude_api_key_heading]: {
+    key: K.claude_api_key_heading,
+    message: "Connect an Anthropic API key",
+    description: "Heading of the panel that stores an official Anthropic Console API key.",
+  },
+  [K.claude_api_key_intro]: {
+    key: K.claude_api_key_intro,
+    message:
+      "The fully supported way to reach Claude models: an API key from the Anthropic " +
+      "Console, billed separately from any subscription. Works with this console's normal " +
+      "provider chain today - add a model and a routing policy afterwards on this same page.",
+    description: "Explains Mode B and how it differs from the subscription-token modes below it.",
+  },
+  [K.claude_api_key_label]: {
+    key: K.claude_api_key_label,
+    message: "Anthropic API key",
+    description: "Label of Mode B's single field.",
+  },
+  [K.claude_api_key_hint]: {
+    key: K.claude_api_key_hint,
+    message: "Starts with sk-ant-. Never shown again after this is saved.",
+    description: "Hint under the API key field.",
+  },
+  [K.claude_api_key_submit]: {
+    key: K.claude_api_key_submit,
+    message: "Save API key",
+    description: "Submit control for Mode B.",
+  },
+  [K.claude_api_key_pending]: {
+    key: K.claude_api_key_pending,
+    message: "Saving the API key...",
+    description: "Announced politely while the Mode B save request is in flight.",
+  },
+  [K.claude_api_key_created]: {
+    key: K.claude_api_key_created,
+    message: "Saved. A new Anthropic API key credential was created.",
+    description: "Announced after a Mode B save when no matching credential existed yet.",
+  },
+  [K.claude_api_key_updated]: {
+    key: K.claude_api_key_updated,
+    message: "Saved. The existing Anthropic API key credential was updated with this value.",
+    description: "Announced after a Mode B save when a matching credential already existed.",
+  },
+  [K.claude_api_key_required]: {
+    key: K.claude_api_key_required,
+    message: "Enter the API key before saving.",
+    description: "Mode B's field was submitted empty.",
+  },
+  [K.claude_api_key_too_long]: {
+    key: K.claude_api_key_too_long,
+    message: "That API key is longer than the console will accept.",
+    description: "The pasted value exceeded the console's bound on an Anthropic API key.",
+  },
+  [K.claude_api_key_invalid]: {
+    key: K.claude_api_key_invalid,
+    message: "That does not look like a single key - check for an extra line in the paste.",
+    description: "The pasted value contained a control character, most likely a stray newline.",
+  },
+  [K.claude_api_key_wrong_shape]: {
+    key: K.claude_api_key_wrong_shape,
+    message: "That does not look like an Anthropic API key.",
+    description:
+      "The pasted value does not start with the prefix every Anthropic Console API key " +
+      "carries - most likely a key copied from a different provider.",
+  },
+  [K.claude_api_key_request_body_invalid]: {
+    key: K.claude_api_key_request_body_invalid,
+    message: "The console could not read that API-key request.",
+    description: "Emitted by the /api/settings/llm/claude-api-key handler for a malformed body.",
+  },
+
+  /* --- the paste fallback's own sub-heading, and shared connect-status copy - */
+  [K.claude_subscription_paste_heading]: {
+    key: K.claude_subscription_paste_heading,
+    message: "Or paste a token",
+    description:
+      "Sub-heading distinguishing Mode C (paste) from Mode A above it, once both are shown " +
+      "on the same panel.",
+  },
+  [K.claude_connect_status_connected]: {
+    key: K.claude_connect_status_connected,
+    message: "Connected",
+    description: "Status line when a matching credential row exists and is usable.",
+  },
+  [K.claude_connect_status_not_connected]: {
+    key: K.claude_connect_status_not_connected,
+    message: "Not connected yet",
+    description: "Status line when no matching provider or credential row exists yet.",
+  },
+  [K.claude_connect_status_unknown]: {
+    key: K.claude_connect_status_unknown,
+    message: "Could not determine the current status.",
+    description:
+      "Status line when a list this lookup read was truncated before a match could be " +
+      "confirmed absent - not a claim either way.",
+  },
+  [K.claude_connect_status_disabled]: {
+    key: K.claude_connect_status_disabled,
+    message: "Connected, but currently disabled.",
+    description: "Status line when a matching credential row exists but its status is not active.",
+  },
+  [K.claude_connect_status_expires]: {
+    key: K.claude_connect_status_expires,
+    message: "Expires {date}.",
+    description: "Appended to the status line when Moira reports an expiry for the credential.",
+  },
+  [K.claude_connect_status_no_expiry]: {
+    key: K.claude_connect_status_no_expiry,
+    message: "No known expiry.",
+    description: "Appended to the status line when Moira reports no expiry for the credential.",
   },
 
   /* --- the /graph screen (plan 12 §4, issue #234) --------------------------- */

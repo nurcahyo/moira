@@ -512,6 +512,45 @@ export const CONSOLE_MESSAGE_KEYS = {
   claude_subscription_request_body_invalid: "console.claudeSubscription.request_body_invalid",
   claude_subscription_list_truncated: "console.claudeSubscription.list_truncated",
 
+  /* --- Mode A: CLI-assisted acquisition (issue #223 follow-up) ------------ */
+  claude_subscription_cli_heading: "console.claudeSubscription.cli_heading",
+  claude_subscription_cli_intro: "console.claudeSubscription.cli_intro",
+  claude_subscription_cli_submit: "console.claudeSubscription.cli_submit",
+  claude_subscription_cli_reacquire: "console.claudeSubscription.cli_reacquire",
+  claude_subscription_cli_pending: "console.claudeSubscription.cli_pending",
+  claude_subscription_cli_disabled_notice: "console.claudeSubscription.cli_disabled_notice",
+  claude_subscription_cli_disabled: "console.claudeSubscription.cli_disabled",
+  claude_subscription_cli_binary_missing: "console.claudeSubscription.cli_binary_missing",
+  claude_subscription_cli_not_signed_in: "console.claudeSubscription.cli_not_signed_in",
+  claude_subscription_cli_timeout: "console.claudeSubscription.cli_timeout",
+  claude_subscription_cli_output_too_large: "console.claudeSubscription.cli_output_too_large",
+  claude_subscription_cli_failed: "console.claudeSubscription.cli_failed",
+  claude_subscription_cli_invalid_output: "console.claudeSubscription.cli_invalid_output",
+
+  /* --- Mode B: an official Anthropic Console API key ----------------------- */
+  claude_api_key_heading: "console.claudeApiKey.heading",
+  claude_api_key_intro: "console.claudeApiKey.intro",
+  claude_api_key_label: "console.claudeApiKey.label",
+  claude_api_key_hint: "console.claudeApiKey.hint",
+  claude_api_key_submit: "console.claudeApiKey.submit",
+  claude_api_key_pending: "console.claudeApiKey.pending",
+  claude_api_key_created: "console.claudeApiKey.created",
+  claude_api_key_updated: "console.claudeApiKey.updated",
+  claude_api_key_required: "console.claudeApiKey.required",
+  claude_api_key_too_long: "console.claudeApiKey.too_long",
+  claude_api_key_invalid: "console.claudeApiKey.invalid",
+  claude_api_key_wrong_shape: "console.claudeApiKey.wrong_shape",
+  claude_api_key_request_body_invalid: "console.claudeApiKey.request_body_invalid",
+
+  /* --- the paste fallback's own sub-heading, and shared connect-status copy */
+  claude_subscription_paste_heading: "console.claudeSubscription.paste_heading",
+  claude_connect_status_connected: "console.claudeConnect.status_connected",
+  claude_connect_status_not_connected: "console.claudeConnect.status_not_connected",
+  claude_connect_status_unknown: "console.claudeConnect.status_unknown",
+  claude_connect_status_disabled: "console.claudeConnect.status_disabled",
+  claude_connect_status_expires: "console.claudeConnect.status_expires",
+  claude_connect_status_no_expiry: "console.claudeConnect.status_no_expiry",
+
   /* --- the /graph screen (plan 12 §4, issue #234) -------------------------- */
   graph_intro: "console.graph.intro",
   graph_request_failed: "console.graph.request_failed",
