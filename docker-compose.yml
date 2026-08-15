@@ -54,6 +54,40 @@ services:
       - ./deploy/keycloak/tls.crt:/opt/keycloak/certs/tls.crt:ro
       - ./deploy/keycloak/tls.key:/opt/keycloak/certs/tls.key:ro
 
+  # Manual test/dev entry for the pinned image built by
+  # scripts/build-claude-runner-image.sh (deploy/claude-runner/Dockerfile) —
+  # issue #272, see docs/claude-runners.md. This is NOT how a runner gets
+  # provisioned in production: that is the moira-runner service's job, and it
+  # creates containers itself over the Docker Engine API per the frozen
+  # runner control contract, one per provisioned instance, never through this
+  # compose entry. This service exists so an operator can sanity-check the
+  # pinned image by hand — start it, `docker compose logs -f claude-runner`
+  # for the authorization URL, attach to paste a code — before trusting
+  # moira-runner to do the unattended equivalent. The `HostConfig` shape below
+  # (no binds, dropped capabilities, no new privileges) mirrors what the
+  # control contract requires moira-runner to set on every container it
+  # creates, so a manual run here exercises the same constraints.
+  #
+  # LOCAL DEVELOPMENT / MANUAL VERIFICATION ONLY. Gated behind the
+  # `claude-runner` profile for the same reason `dev-idp` is: `docker compose
+  # up -d --wait` (what `make up` runs) must not start it by accident. Start
+  # and stop it exactly like `keycloak` above — name the service, and never
+  # use a bare `compose down`, which would also tear down this repo's
+  # postgres/redis default-profile services:
+  #
+  #   docker compose --profile claude-runner up -d claude-runner
+  #   docker compose --profile claude-runner rm --stop --force --volumes claude-runner
+  claude-runner:
+    image: moira-claude-runner:local
+    profiles: ["claude-runner"]
+    tty: true
+    stdin_open: true
+    command: ["claude", "setup-token"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+
 volumes:
   moira-postgres:
   moira-redis:
