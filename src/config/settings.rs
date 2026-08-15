@@ -545,6 +545,10 @@ pub struct SkillExecutionSettings {
     /// Ceiling on the response body a skill tool feeds back to the model. A skill target
     /// is a third-party endpoint: without a bound, one reply can consume the whole context
     /// budget (`docs/context-budgeting.md`) or the execution's remaining deadline.
+    ///
+    /// It is also a **memory** ceiling: `HttpSkillTool` reads the body as a stream and stops
+    /// at this many bytes rather than buffering the whole reply and slicing it afterwards, so
+    /// the figure here is the most one in-flight skill call can put on the heap.
     pub maximum_response_bytes: usize,
     /// Budget for resolving a skill target hostname during the execution-time SSRF check.
     pub dns_timeout_ms: u64,

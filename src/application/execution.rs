@@ -42,7 +42,7 @@ use crate::{
     orchestration::{
         RigRuntimeFactory, RuntimeCacheKey, RuntimeFactory, RuntimeModelHandle, RuntimeStreamItem,
         SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolSpec, ToolCallRecord,
-        ToolLoopContext, build_skill_tool_set, rig_chat_history, run_tool_loop,
+        ToolLoopContext, ToolLoopFailure, build_skill_tool_set, rig_chat_history, run_tool_loop,
     },
     security::{Actor, ActorType, CredentialAadParts, SecretCipher, credential_aad},
 };
@@ -1008,25 +1008,7 @@ impl MoiraExecutionService {
                         for event in output.events {
                             events.push_existing(event);
                         }
-                        // Issue #84. One `ToolResult` per dispatched call, carrying the
-                        // classification and nothing else: no arguments (model-authored),
-                        // no output (target-authored, possibly a credential echo), and no
-                        // URL. All four tool event types are filtered out of the public SSE
-                        // stream by `map_runtime_event`, so these stay on the runtime-event
-                        // and audit surfaces where an operator can see them.
-                        for tool_call in &output.tool_calls {
-                            events.push(
-                                RuntimeEventType::ToolResult,
-                                json!({
-                                    "attempt_id": attempt_id,
-                                    "tool_name": tool_call.tool_name,
-                                    "outcome": tool_call.outcome,
-                                    "failure_kind": tool_call.failure_kind,
-                                    "guard_key": tool_call.guard_key,
-                                    "guard_reason": tool_call.guard_reason,
-                                }),
-                            );
-                        }
+                        push_tool_result_events(events, attempt_id, &output.tool_calls);
                         events.push(
                             RuntimeEventType::ExecutionCompleted,
                             json!({ "attempt_id": attempt_id }),
@@ -1045,7 +1027,11 @@ impl MoiraExecutionService {
                             failure: None,
                         });
                     }
-                    Ok(Err(FailedAttempt { failure, usage })) => {
+                    Ok(Err(FailedAttempt {
+                        failure,
+                        usage,
+                        tool_calls,
+                    })) => {
                         self.state
                             .circuits
                             .on_failure(
@@ -1125,6 +1111,13 @@ impl MoiraExecutionService {
                             started,
                             usage,
                         ));
+                        // Emitted before the attempt's own failure event because that is the
+                        // order they happened in: a tool loop dispatches, and *then* runs out
+                        // of turns or loses the provider. Issue #252 — the failure arm used to
+                        // have no tool events at all, so an outbound `POST`/`DELETE` that had
+                        // already fired was invisible on every surface the moment the attempt
+                        // around it failed.
+                        push_tool_result_events(events, attempt_id, &tool_calls);
                         events.push(
                             RuntimeEventType::ProviderAttemptFailed,
                             json!({ "attempt_id": attempt_id, "failure_class": failure.class }),
@@ -2401,9 +2394,20 @@ fn structured_output_from_text(
 /// `insert_usage_record` is skipped on. Every failure raised before or instead of a complete
 /// reply keeps that default through the [`From`] impl below, so `?` still means "no reply, so
 /// nothing measured" and only a site with real counts in hand has to say so.
+///
+/// # Why the tool calls travel with it too
+///
+/// Issue #84 added the second thing a failed attempt can leave behind: a tool loop dispatches
+/// real outbound HTTP against an operator's third-party API — `HttpMethod` admits `Post`,
+/// `Put`, `Patch` and `Delete` — and then may fail on a later turn. Those mutations happened;
+/// carrying their [`ToolCallRecord`]s here is what lets the failure arm emit the same
+/// `ToolResult` runtime events the success arm does, so a `DELETE` that fired is auditable
+/// instead of invisible. Empty for every path that dispatched nothing, which is all of them
+/// but the tool loop.
 struct FailedAttempt {
     failure: ExecutionFailure,
     usage: UsageSummary,
+    tool_calls: Vec<ToolCallRecord>,
 }
 
 impl From<ExecutionFailure> for FailedAttempt {
@@ -2411,7 +2415,37 @@ impl From<ExecutionFailure> for FailedAttempt {
         Self {
             failure,
             usage: UsageSummary::default(),
+            tool_calls: Vec::new(),
         }
+    }
+}
+
+/// Issue #84. One `ToolResult` per dispatched call, carrying the classification and nothing
+/// else: no arguments (model-authored), no output (target-authored, possibly a credential
+/// echo), and no URL. All four tool event types are filtered out of the public SSE stream by
+/// `map_runtime_event`, so these stay on the runtime-event and audit surfaces where an
+/// operator can see them.
+///
+/// Shared by the success and the failure arm rather than written twice: the records mean the
+/// same thing on both, and the failure arm is the one where an operator most needs them
+/// (issue #252 — a mutation that fired and then lost its attempt).
+fn push_tool_result_events(
+    events: &mut EventCollector,
+    attempt_id: Uuid,
+    tool_calls: &[ToolCallRecord],
+) {
+    for tool_call in tool_calls {
+        events.push(
+            RuntimeEventType::ToolResult,
+            json!({
+                "attempt_id": attempt_id,
+                "tool_name": tool_call.tool_name,
+                "outcome": tool_call.outcome,
+                "failure_kind": tool_call.failure_kind,
+                "guard_key": tool_call.guard_key,
+                "guard_reason": tool_call.guard_reason,
+            }),
+        );
     }
 }
 
@@ -2444,6 +2478,7 @@ async fn execute_rig_completion(
             return Err(FailedAttempt {
                 failure,
                 usage: output.usage,
+                tool_calls: Vec::new(),
             });
         }
     };
@@ -2464,25 +2499,41 @@ async fn execute_rig_completion(
 /// not reachable with an `output_schema` — `execute_inner` refuses that combination before
 /// a candidate is chosen (finding F48) — so `structured_output` is always `None` here.
 ///
-/// **Usage is the final turn's, not a sum.** `UsageSummary` feeds `usage_records`, whose
-/// rows are per attempt; summing turns would report one figure the provider will invoice as
-/// several, and `usage_from_rig` is the only sanctioned source either way. The under-count
-/// is real and is the same shape the retry path already has; widening it is a separate
-/// decision from enabling tools.
+/// **On success, usage is the final turn's, not a sum.** `UsageSummary` feeds `usage_records`,
+/// whose rows are per attempt, and `usage_from_rig` is the only sanctioned source either way.
+/// The under-count on that path is real and is filed separately (issue #252 finding 4); it is
+/// not what the failure arm below does, because a failed loop has no final turn to report and
+/// reporting nothing was the actual hole.
+///
+/// **On failure, both the counts and the dispatch records survive.** A bare `?` here dropped
+/// them: a loop that made four billed completions and issued four outbound calls reported
+/// `UsageSummary::default()` — read as *unknown*, so `usage_records` skipped the row entirely
+/// — and no `ToolResult` event anywhere. Same correction, and same reason, as the
+/// `execute_rig_completion` arm above.
 async fn execute_rig_tool_loop(
     handle: Arc<RuntimeModelHandle>,
     request: CompletionRequest,
     context: ToolLoopContext<'_>,
 ) -> Result<ExecutionRunOutput, FailedAttempt> {
-    let outcome = run_tool_loop(&handle, request, context).await?;
-    Ok(ExecutionRunOutput {
-        text: outcome.text,
-        structured_output: None,
-        usage: outcome.usage,
-        provider_request_id: outcome.provider_request_id,
-        events: Vec::new(),
-        tool_calls: outcome.tool_calls,
-    })
+    match run_tool_loop(&handle, request, context).await {
+        Ok(outcome) => Ok(ExecutionRunOutput {
+            text: outcome.text,
+            structured_output: None,
+            usage: outcome.usage,
+            provider_request_id: outcome.provider_request_id,
+            events: Vec::new(),
+            tool_calls: outcome.tool_calls,
+        }),
+        Err(ToolLoopFailure {
+            failure,
+            usage,
+            tool_calls,
+        }) => Err(FailedAttempt {
+            failure,
+            usage,
+            tool_calls,
+        }),
+    }
 }
 
 /// Everything the streaming path needs to record time-to-first-token, grouped so the
@@ -2682,7 +2733,15 @@ async fn execute_rig_stream(
     // invoice for this call either way.
     let structured_output = match structured_output_from_text(wants_structured, &text) {
         Ok(structured_output) => structured_output,
-        Err(failure) => return Err(FailedAttempt { failure, usage }),
+        // The streamed path advertises no tools (`execute_inner` refuses the combination),
+        // so there is never a dispatch record to carry here.
+        Err(failure) => {
+            return Err(FailedAttempt {
+                failure,
+                usage,
+                tool_calls: Vec::new(),
+            });
+        }
     };
     Ok(ExecutionRunOutput {
         text,

@@ -46,6 +46,6 @@ pub use runtime_factory::{
 };
 pub use skill_tool::{
     HttpSkillTool, SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolBuildError,
-    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopOutcome, build_skill_tool_set,
-    run_tool_loop,
+    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopFailure, ToolLoopOutcome,
+    build_skill_tool_set, run_tool_loop,
 };
