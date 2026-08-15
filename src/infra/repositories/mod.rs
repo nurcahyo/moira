@@ -114,10 +114,10 @@ pub use public::{
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
 };
 // Issue #275 (workstream R2 of #272).
-pub(crate) use runners::{runner_wrong_state, version_conflict as runner_version_conflict};
 pub use runners::{
     ClaudeRunnerInsert, ClaudeRunnerRepository, PgClaudeRunnerRepository, RunnerStateUpdate,
 };
+pub(crate) use runners::{runner_wrong_state, version_conflict as runner_version_conflict};
 pub use runtime::{
     ExecutionAttemptInsert, ExecutionAttemptUpdate, PgRuntimeRepository,
     RuntimeCredentialCandidate, RuntimeRepository, UsageRecordInsert,

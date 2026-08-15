@@ -92,6 +92,20 @@ and `request_timeout_ms`. While `enabled` is false the whole surface's write sid
 `503 runner_service_disabled` before any network call. Production start-up refuses an enabled
 runner with no token, and refuses a non-loopback `http://` base URL.
 
+### What is measured, and what is not
+
+State this before relying on the flow, because the gap is easy to read past:
+
+- **Measured.** Container start with a daemon-allocated tty, the authorization URL scraped from the
+  tty stream, and code submission over the Engine API attach endpoint — the last reproduced twice
+  against the real hardened runner image. Every Moira-side behaviour on this page is covered by
+  `tests/claude_runners.rs` against a fake runner service.
+- **Not measured, anywhere.** Capturing the minted token from a *genuinely valid* authorization
+  code. The invalid-code path exercises the whole exchange and fails at the far end, so the
+  remaining risk is small — but "small" is not "proven", and no test in this repository or the
+  runner's can close it, because doing so needs a real Claude account completing a real login.
+  Treat the first production finalize as the experiment that settles it.
+
 Honest limit, repeated from issue #272: **N containers on ONE Claude account is not N× capacity.**
 Rate limits attach to the account. Multi-instance is legitimate only when each instance is a
 distinct account or seat you actually hold.
