@@ -10,7 +10,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { POST as ACQUIRE_START_POST } from "@/app/api/settings/llm/claude-subscription/acquire/start/route";
-import { resetClaudeCliJobRegistryForTests, setClaudeCliSpawnerForTests } from "@/lib/claude-cli";
+import {
+  resetClaudeCliJobRegistryForTests,
+  setClaudeCliPtyAvailableForTests,
+  setClaudeCliSpawnerForTests,
+} from "@/lib/claude-cli";
 import type { ResolvedAuthConfig } from "@/lib/auth-config";
 import type { ConsoleAuth } from "@/lib/auth";
 import type { ConsoleRuntime } from "@/lib/auth-runtime";
@@ -69,6 +73,16 @@ function install(
     readonly session?: unknown;
     readonly runtime?: ConsoleRuntime;
     readonly env?: ConsoleEnv;
+    /**
+     * `ptyIsAvailable()` is a fixed `false` in shipped code (see
+     * `lib/claude-cli.ts`'s header) — this override lets these tests still
+     * exercise "a job actually starts", the behavior that machinery is
+     * READY for once a real pty-capable executor exists. Defaults to `true`
+     * so every test other than the pty-gate's own describe block behaves as
+     * if that day had already come; the pty-gate tests override it to
+     * `false` (or leave it unset) to prove today's real, fixed answer.
+     */
+    readonly ptyAvailable?: boolean;
   } = {},
 ): void {
   stub = createMoiraStub(options.handlers ?? {});
@@ -86,6 +100,7 @@ function install(
     clientFor: () =>
       new MoiraClient({ baseUrl: MOIRA_STUB_BASE_URL, systemKey: "sk_test_stub", fetch: stub.fetch }),
   });
+  setClaudeCliPtyAvailableForTests(options.ptyAvailable ?? true);
 }
 
 function request(): Request {
@@ -109,6 +124,7 @@ beforeEach(() => {
 afterEach(() => {
   setConsoleApiDependenciesForTests(null);
   setClaudeCliSpawnerForTests(null);
+  setClaudeCliPtyAvailableForTests(null);
   resetClaudeCliJobRegistryForTests();
 });
 
@@ -135,6 +151,36 @@ describe("POST .../acquire/start — the opt-in gate", () => {
     setClaudeCliSpawnerForTests(fakeClaudeChild().spawner);
     const response = await ACQUIRE_START_POST(request());
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The pty gate (issue #269 follow-up) — checked after the opt-in gate,      */
+/* before ever spawning anything                                             */
+/* -------------------------------------------------------------------------- */
+
+describe("POST .../acquire/start — the pty gate", () => {
+  test("refuses with a keyed 409 by DEFAULT — ptyIsAvailable() is fixed false in shipped code — and never spawns", async () => {
+    install({ ptyAvailable: false });
+    const child = fakeClaudeChild();
+    setClaudeCliSpawnerForTests(child.spawner);
+
+    const response = await ACQUIRE_START_POST(request());
+    expect(response.status).toBe(409);
+    const body = errorOf(await json(response));
+    expect(body["code"]).toBe("claude_cli_pty_unavailable");
+    expect(body["message_key"]).toBe(CONSOLE_MESSAGE_KEYS.claude_subscription_cli_pty_unavailable);
+    expect(child.calls.length).toBe(0);
+    expect(stub.routes()).toEqual([]);
+  });
+
+  test("the opt-in gate is still checked FIRST — disabled wins over the pty answer", async () => {
+    install({ env: DISABLED_ENV, ptyAvailable: true });
+    const response = await ACQUIRE_START_POST(request());
+    expect(response.status).toBe(403);
+    expect(errorOf(await json(response))["message_key"]).toBe(
+      CONSOLE_MESSAGE_KEYS.claude_subscription_cli_disabled,
+    );
   });
 });
 

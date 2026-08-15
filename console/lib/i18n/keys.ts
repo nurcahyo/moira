@@ -525,6 +525,7 @@ export const CONSOLE_MESSAGE_KEYS = {
   claude_subscription_cli_open_link: "console.claudeSubscription.cli_open_link",
   claude_subscription_cli_disabled_notice: "console.claudeSubscription.cli_disabled_notice",
   claude_subscription_cli_disabled: "console.claudeSubscription.cli_disabled",
+  claude_subscription_cli_pty_unavailable: "console.claudeSubscription.cli_pty_unavailable",
   claude_subscription_cli_binary_missing: "console.claudeSubscription.cli_binary_missing",
   claude_subscription_cli_not_signed_in: "console.claudeSubscription.cli_not_signed_in",
   claude_subscription_cli_timeout: "console.claudeSubscription.cli_timeout",

@@ -2937,6 +2937,18 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message: "This deployment has not turned on automatic acquisition.",
     description: "403 from the acquire endpoint itself, in case the button was reachable anyway.",
   },
+  [K.claude_subscription_cli_pty_unavailable]: {
+    key: K.claude_subscription_cli_pty_unavailable,
+    message:
+      "This host cannot run the interactive sign-in: it has no terminal to give the Claude CLI. " +
+      "Run `claude setup-token` in a terminal and paste the token below instead.",
+    description:
+      "409 from acquire/start, refused BEFORE spawning anything. `ptyIsAvailable()` " +
+      "(lib/claude-cli.ts) is an honest capability statement, not a per-host probe: neither a " +
+      "plain pipe nor wrapping the spawn in the system `script(1)` was found to give the CLI a " +
+      "real terminal from inside a server process (both measured; see that module's header), so " +
+      "this is reached on every host today, not only a minimal/distroless one.",
+  },
   [K.claude_subscription_cli_binary_missing]: {
     key: K.claude_subscription_cli_binary_missing,
     message: "The claude command was not found on this console's host.",

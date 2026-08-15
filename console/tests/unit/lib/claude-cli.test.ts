@@ -19,9 +19,11 @@ import {
   extractAuthorizationUrlCandidate,
   extractSetupTokenCandidate,
   peekClaudeCliJob,
+  ptyIsAvailable,
   resetClaudeCliJobRegistryForTests,
   setClaudeCliJobResult,
   setClaudeCliJobStorageFailed,
+  setClaudeCliPtyAvailableForTests,
   startClaudeCliJob,
   takeClaudeCliJobToken,
 } from "@/lib/claude-cli";
@@ -33,6 +35,36 @@ function sleep(ms: number): Promise<void> {
 
 afterEach(() => {
   resetClaudeCliJobRegistryForTests();
+  setClaudeCliPtyAvailableForTests(null);
+});
+
+/* -------------------------------------------------------------------------- */
+/* ptyIsAvailable — an honest capability statement, fixed at `false` today   */
+/* (issue #269 follow-up: neither a plain pipe nor `script(1)` gives the CLI */
+/* a real terminal from inside a spawned server process — see the module's  */
+/* own header for the investigation this is pinned by)                      */
+/* -------------------------------------------------------------------------- */
+
+describe("ptyIsAvailable", () => {
+  test("is false by default — the real, shipped answer today", () => {
+    expect(ptyIsAvailable()).toBe(false);
+  });
+
+  test("the test seam can force it true, to exercise the rest of the pipeline as if a real pty existed", () => {
+    setClaudeCliPtyAvailableForTests(true);
+    expect(ptyIsAvailable()).toBe(true);
+  });
+
+  test("the test seam can also force it false explicitly, distinct from merely being unset", () => {
+    setClaudeCliPtyAvailableForTests(false);
+    expect(ptyIsAvailable()).toBe(false);
+  });
+
+  test("`null` restores the real default", () => {
+    setClaudeCliPtyAvailableForTests(true);
+    setClaudeCliPtyAvailableForTests(null);
+    expect(ptyIsAvailable()).toBe(false);
+  });
 });
 
 /* -------------------------------------------------------------------------- */

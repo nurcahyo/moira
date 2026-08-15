@@ -50,41 +50,77 @@
 // `execFile`/`spawn` give you with no further work) produces ZERO bytes of
 // output, for as long as you wait. Verified locally: piping stdin from
 // /dev/null and capturing stdout+stderr for a full 10 seconds with no
-// timeout at all yields 0 bytes on both streams. Re-running the same command
-// under a pseudo-terminal (macOS `script -q <file> claude setup-token`)
-// DOES render the interactive UI — a spinner, then a "Browser didn't open?
-// Use the url below" fallback line carrying the authorization URL as an OSC 8
-// hyperlink. So the CLI's interactive UI (built on Ink) requires a real TTY
-// to render at all; it is not merely slow over a plain pipe, it is silent.
+// timeout at all yields 0 bytes on both streams. The CLI's interactive UI
+// (built on Ink) requires a real TTY to render at all; it is not merely slow
+// over a plain pipe, it is silent.
 //
-// Consequence: `startClaudeCliJob`'s SHIPPED spawner (`nodeProcessSpawner`)
-// uses a plain pipe, matching this module's existing no-shell, PATH-resolved,
-// zero-user-input invariants (see "THE THREE HARD RULES" below) — and so,
-// TODAY, `authorizationUrl` on a real job will be `null` for the job's whole
-// life, and the job will end in the `timeout` failure once its budget
-// expires, never in `succeeded`. `extractAuthorizationUrlCandidate` below
-// still scans captured output for a URL on every call, so this becomes
-// useful automatically the day a future CLI version (or a different
-// invocation) prints one over a plain pipe — no caller of this module needs
-// to change. Making it render TODAY would need a pseudo-terminal allocated
-// per spawn, which Node's `child_process` cannot do on its own — the
-// standard fix is the native `node-pty` package (no pure-JS equivalent
-// exists). That is a new native dependency shipped into a distroless,
-// Trivy-gated production image (see `console/Dockerfile`) for a mode the
-// console's own docs already scope as "local/dev-oriented, not a fit for a
-// console host shared across operators" — a call this module deliberately
-// leaves to the owner rather than making unilaterally. See this PR's
-// description for the full reasoning. `ProcessSpawner` below is the seam a
-// pty-capable spawner would plug into with no other change required.
+// TWO fixes for that were investigated, and BOTH were ruled out — this is
+// worth spelling out because the first attempt looked promising before it
+// was actually measured in the shape that matters.
 //
-// What DOES improve today, independent of the TTY question: the request that
-// starts a job returns in milliseconds instead of blocking (and eventually
-// 409-ing) for up to the whole budget; the budget is minutes, not a 20-second
-// `execFile` timeout that reliably fires mid-login; output is still bounded;
-// the child is still killed and reaped rather than left running past its
-// budget; and the failure the operator sees is a keyed, ACTIONABLE message
-// that names the fallback — never a bare 409. See
-// `CONSOLE_MESSAGE_KEYS.claude_subscription_cli_timeout` in `catalog.en.ts`.
+//   1. The native `node-pty` package (allocate a real pty per spawn). Ruled
+//      out on its own terms without needing to measure anything: it is a
+//      native addon with no pure-JS equivalent, shipped into a distroless,
+//      Trivy-CRITICAL/HIGH-gated production image (`console/Dockerfile`) for
+//      a mode the console's own docs already scope as "local/dev-oriented,
+//      not a fit for a console host shared across operators". That is an
+//      architecture decision, not a bug fix, and this module does not make
+//      it unilaterally — see this PR's description for the full reasoning.
+//
+//   2. Wrapping the spawn in the SYSTEM `script(1)` instead — zero new
+//      dependencies, already on every macOS and Linux dev machine. This
+//      looked like it worked: `script -q <file> claude setup-token` run
+//      interactively from a real terminal DOES render the CLI's spinner and
+//      authorization URL. But that test was run FROM a terminal — exactly
+//      the condition a Next.js server process does not have. Measured from a
+//      shape that actually matches how this module spawns a child (stdin NOT
+//      a tty, as a server process's own stdin never is):
+//
+//          $ /usr/bin/script -q /dev/null claude setup-token
+//          script: tcgetattr/ioctl: Operation not supported on socket
+//
+//      BSD `script` (macOS, and the BSDs) requires a controlling terminal
+//      already attached to ITS OWN stdin — it does not allocate one from
+//      nothing, it borrows the one it inherits. A server process has none,
+//      so `script` fails before `claude` ever starts, on the exact platform
+//      this is most likely to be run on locally. (util-linux `script -qec`
+//      on Linux allocates its own pty independently and likely WOULD work —
+//      but shipping a feature that silently only works on one platform and
+//      silently fails on another is worse than shipping neither; a console
+//      feature's behavior should not depend on which OS the operator's
+//      laptop happens to run.)
+//
+// Consequence: `nodeProcessSpawner` is a plain, unwrapped pipe — the same
+// shape PR #263 shipped, because no dependency-free way to give it a pty was
+// found. `ptyIsAvailable()` says so honestly: it returns `false`
+// unconditionally today, not a per-host capability probe, because there is
+// currently no host shape (with or without `script`, with or without a real
+// terminal) this module can turn into a working pty from inside a spawned
+// server child. `.../acquire/start` calls it and refuses IMMEDIATELY —
+// before ever creating a job — with a keyed message naming the
+// `claude setup-token` + paste fallback. That is deliberately NOT "start a
+// job, let it run the full multi-minute budget, then report failure": once
+// success is known to be impossible, making the operator wait five minutes
+// to be told so would be a slower, still-opaque version of the exact bug
+// #269 exists to fix, one layer up. `setClaudeCliPtyAvailableForTests` lets
+// tests override this to exercise the REST of the pipeline (the job
+// registry, both routes, the panel's polling UI) as if a real pty existed —
+// that machinery is unchanged, tested, and ready for the day `ptyIsAvailable`
+// has something real to report; only today's answer is fixed at "no".
+// `extractAuthorizationUrlCandidate` still scans captured output for a URL
+// on every call for the same reason — inert today, no caller needs to change
+// the day it stops being inert.
+//
+// What improves regardless of the pty question at all: `.../acquire/start`
+// answers in milliseconds — either a job id, or (today, always) an honest
+// refusal — instead of blocking for up to 20 seconds and then 409-ing with a
+// message that named nothing actionable. The job registry itself still
+// bounds a hypothetical run by wall-clock minutes rather than a 20-second
+// `execFile` timeout, still bounds output, still kills and reaps a child
+// rather than leaving one running past its budget, and still turns every
+// failure into a keyed, ACTIONABLE message — never a bare 409. See
+// `CONSOLE_MESSAGE_KEYS.claude_subscription_cli_pty_unavailable` and
+// `claude_subscription_cli_timeout` in `catalog.en.ts`.
 //
 // ============================================================================
 // WHAT THIS MODULE OWNS, AND WHAT IT DELIBERATELY DOES NOT
@@ -182,7 +218,8 @@ export interface SpawnedProcessHandle {
 export type ProcessSpawner = (file: string, args: readonly string[]) => SpawnedProcessHandle;
 
 /**
- * The shipped spawner. Plain pipes — see this module's header for why that
+ * The shipped spawner. Plain pipes — see this module's header for the full
+ * investigation (plain pipe, then `script(1)`, both ruled out) into why that
  * means `claude setup-token`'s interactive UI renders nothing today, and why
  * that is a documented limitation rather than a bug this module can fix on
  * its own.
@@ -217,6 +254,45 @@ let spawnerOverride: ProcessSpawner | null = null;
 /** Test seam. Never called from shipped code paths. */
 export function setClaudeCliSpawnerForTests(spawner: ProcessSpawner | null): void {
   spawnerOverride = spawner;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Whether this host can run the interactive step at all                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `null` (the default) means "no test override — use the real, fixed
+ * answer". Distinguished from `false` so a test can also explicitly force
+ * the unavailable path without relying on the production default.
+ */
+let ptyAvailableOverride: boolean | null = null;
+
+/** Test seam. Never called from shipped code paths. */
+export function setClaudeCliPtyAvailableForTests(value: boolean | null): void {
+  ptyAvailableOverride = value;
+}
+
+/**
+ * Whether this host can give `claude setup-token` a real terminal to render
+ * its interactive UI into. An honest capability statement, not a per-host
+ * probe: see this module's header for the investigation this answer is
+ * pinned by (plain pipe: silent; `script(1)`: requires a controlling
+ * terminal this server process does not have, on the platform this is most
+ * likely to run on). There is currently no host shape this module can turn
+ * into a working answer other than `false` — that is fixed today, not
+ * computed, and stays fixed until a real pty-capable executor exists.
+ *
+ * `.../acquire/start` calls this BEFORE ever creating a job and refuses
+ * immediately when it is `false`, rather than starting a job that can only
+ * ever expire — see `CLAUDE_CLI_JOB_BUDGET_MS`'s own callers.
+ *
+ * `setClaudeCliPtyAvailableForTests` lets a test force `true` to exercise
+ * the REST of this module (the job registry) and both routes as if a real
+ * pty-capable spawner existed, without needing one — that machinery is
+ * unchanged by this answer being fixed at `false` today.
+ */
+export function ptyIsAvailable(): boolean {
+  return ptyAvailableOverride ?? false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -270,17 +346,18 @@ export function extractSetupTokenCandidate(stdout: string): string {
 
 /**
  * Best-effort authorization-URL scan over captured output. Inert today (the
- * shipped spawner captures nothing to scan — see this module's header), kept
- * so a future TTY-capable spawner needs no change here or in either route
- * handler to start actually surfacing a URL.
+ * shipped spawner captures nothing to scan — see this module's header and
+ * `ptyIsAvailable`), kept so a future pty-capable executor needs no change
+ * here or in either route handler to start actually surfacing a URL.
  *
- * Stops at whitespace, an ESC byte, or `]` — a raw OSC 8 hyperlink escape
- * (`\x1b]8;id=…;URL\x1b\\`) glues its terminator directly onto the URL with
- * no separating whitespace, and `]` is not a legal unencoded URL character,
- * so both are safe boundaries.
+ * Stops at whitespace, an ESC byte, a BEL byte, or `]` — a raw OSC 8
+ * hyperlink escape (`\x1b]8;id=…;URL\x1b\\`, or BEL-terminated as
+ * `\x1b]8;id=…;URL\x07`) glues its terminator directly onto the URL with no
+ * separating whitespace, and none of ESC/BEL/`]` is a legal unencoded URL
+ * character, so all three are safe boundaries.
  */
 export function extractAuthorizationUrlCandidate(combinedOutput: string): string | null {
-  const match = /https?:\/\/[^\s\x1b\]]+/.exec(combinedOutput);
+  const match = /https?:\/\/[^\s\x1b\x07\]]+/.exec(combinedOutput);
   return match === null ? null : match[0];
 }
 

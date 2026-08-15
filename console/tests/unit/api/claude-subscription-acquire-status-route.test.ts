@@ -11,7 +11,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { POST as ACQUIRE_START_POST } from "@/app/api/settings/llm/claude-subscription/acquire/start/route";
 import { GET as ACQUIRE_STATUS_GET } from "@/app/api/settings/llm/claude-subscription/acquire/status/route";
-import { resetClaudeCliJobRegistryForTests, setClaudeCliSpawnerForTests, startClaudeCliJob } from "@/lib/claude-cli";
+import {
+  resetClaudeCliJobRegistryForTests,
+  setClaudeCliPtyAvailableForTests,
+  setClaudeCliSpawnerForTests,
+  startClaudeCliJob,
+} from "@/lib/claude-cli";
 import {
   CLAUDE_SUBSCRIPTION_PROVIDER_DISPLAY_NAME,
   CLAUDE_SUBSCRIPTION_PROVIDER_TYPE,
@@ -154,6 +159,12 @@ function install(
     clientFor: () =>
       new MoiraClient({ baseUrl: MOIRA_STUB_BASE_URL, systemKey: "sk_test_stub", fetch: stub.fetch }),
   });
+  // `ptyIsAvailable()` is fixed `false` in shipped code (see
+  // `lib/claude-cli.ts`'s header); `startJob` below goes through the real
+  // `POST .../acquire/start` handler, which refuses before spawning unless
+  // this is overridden — every test in this file is about what happens
+  // AFTER a job exists, so it needs one to actually start.
+  setClaudeCliPtyAvailableForTests(true);
 }
 
 function startRequest(): Request {
@@ -190,6 +201,7 @@ beforeEach(() => {
 afterEach(() => {
   setConsoleApiDependenciesForTests(null);
   setClaudeCliSpawnerForTests(null);
+  setClaudeCliPtyAvailableForTests(null);
   resetClaudeCliJobRegistryForTests();
 });
 
