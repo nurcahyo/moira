@@ -429,6 +429,25 @@
         ],
         "type": "object"
       },
+      "AgentFlowRunResult": {
+        "description": "`POST /api/v1/admin/flows/{id}/run` response: the finalized flow run plus one step-run row\nper step attempted, in step order. Returned with `200` even when the run failed — a\nstep failure is data (the run's `status` is `failed` and the aborting step's\n`error_summary` names why), not an HTTP error.",
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/AgentFlowRunRecord"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/AgentFlowStepRunRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "run",
+          "steps"
+        ],
+        "type": "object"
+      },
       "AgentFlowStepCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -496,6 +515,58 @@
           "on_failure",
           "input_mapping",
           "metadata",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AgentFlowStepRunRecord": {
+        "description": "One `agent_flow_step_runs` row — a single step's execution within a flow run (issue #214,\nplan 12 §3). Append-only, produced by the flow orchestrator, never authored through the\nadmin CRUD surface. `execution_id` correlates the step to the underlying pipeline execution\nso an operator can join it against `execution_attempts`/`usage_records`/audit rows;\n`error_summary` carries a sanitized failure reason (a message key, never a provider body)\non the step that aborted the run (decision 15).",
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "execution_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flow_run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FlowStepRunStatus"
+          },
+          "step_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "flow_run_id",
+          "step_id",
+          "status",
           "created_at"
         ],
         "type": "object"
@@ -3089,6 +3160,20 @@
         ],
         "type": "object"
       },
+      "EvalRunRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/eval-suites/{id}/run` body. `agent_profile_id` names the target the\nsuite's cases are graded against; when omitted it falls back to the suite's\n`metadata.target_agent_profile_id`. If neither resolves, the run is refused with\n`eval_target_missing` — an eval with no subject cannot measure anything.",
+        "properties": {
+          "agent_profile_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "EvalRunStatus": {
         "enum": [
           "pending",
@@ -3415,6 +3500,14 @@
         ],
         "type": "string"
       },
+      "FlowRunRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/flows/{id}/run` body. The optional `input` seeds the first step's\nprompt; when omitted the first step runs with an empty prompt (a flow whose first step\nreads only from its agent profile's preamble is legitimate). A step may still declare\n`input_mapping` to draw from `run_input` or a literal instead of the previous step's\noutput — see `application::flow_eval_execution` for the passing convention.",
+        "properties": {
+          "input": {}
+        },
+        "type": "object"
+      },
       "FlowRunStatus": {
         "enum": [
           "running",
@@ -3428,6 +3521,16 @@
         "enum": [
           "abort",
           "continue"
+        ],
+        "type": "string"
+      },
+      "FlowStepRunStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "failed",
+          "skipped"
         ],
         "type": "string"
       },
@@ -18680,6 +18783,113 @@
         ]
       }
     },
+    "/api/v1/admin/eval-suites/{id}/run": {
+      "post": {
+        "operationId": "run_eval_suite",
+        "parameters": [
+          {
+            "description": "Eval suite identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Completed eval run with per-case pass/fail results",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Runs every case of a suite against a target agent profile through the normal execution\npipeline and grades the output (issue #214, plan 12 §3, the execution half). Offline,\ninline, `exact_match`/`contains`/`schema_valid` only (decision 14 — no LLM-judge). No\n`If-Match`: this appends a new `eval_runs` row, it does not mutate the versioned suite.",
+        "tags": [
+          "admin-eval-suites"
+        ]
+      }
+    },
     "/api/v1/admin/eval-suites/{id}/runs": {
       "get": {
         "operationId": "list_eval_runs",
@@ -19525,6 +19735,113 @@
             "consumerKeyAuth": []
           }
         ],
+        "tags": [
+          "admin-flows"
+        ]
+      }
+    },
+    "/api/v1/admin/flows/{id}/run": {
+      "post": {
+        "operationId": "run_flow",
+        "parameters": [
+          {
+            "description": "Flow identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlowRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentFlowRunResult"
+                }
+              }
+            },
+            "description": "Finalized flow run with one step-run row per step attempted",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "summary": "Executes a flow's steps in order through the normal execution pipeline, fail-closed\n(issue #214, plan 12 §3, the execution half). Sequential-only (decision 13); a step\nfailure aborts the run and marks it `failed` (decision 15). Returns `200` with the\nfinalized run and its step-run rows even when the run failed — a step failure is data (the\nrun `status` and the aborting step's `error_summary`), not an HTTP error. No `If-Match`:\nthis appends new run rows, it does not mutate the versioned flow.",
         "tags": [
           "admin-flows"
         ]

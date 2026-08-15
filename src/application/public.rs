@@ -1044,6 +1044,7 @@ impl PublicExecutionService {
                 provider_hint: request.provider,
                 model_hint,
                 credential_hint: request.credential_id,
+                agent_profile_hint: None,
                 options: ExecutionOptions {
                     temperature: request.temperature,
                     max_tokens: request.max_output_tokens,

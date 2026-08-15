@@ -102,6 +102,8 @@ impl MoiraExecutionService {
             provider_hint: request.provider_id,
             model_hint: request.provider_model_id,
             credential_hint: request.credential_id,
+            // The diagnostic path never targets a profile directly — the route still names it.
+            agent_profile_hint: None,
             options,
             metadata: request.metadata,
         }
@@ -202,7 +204,15 @@ impl MoiraExecutionService {
         // runtime cannot use is refused here, before any provider is chosen, any credential is
         // decrypted and any attempt row is written — see `agent_profile_failure` for the
         // reasoning and for why the two answers carry different codes.
-        let agent_profile = match route.agent_profile_id {
+        //
+        // Issue #214 (plan 12 §3): a flow step or an eval case targets a specific agent profile
+        // directly (`command.agent_profile_hint`), not via the route. When present it overrides
+        // the route's own profile; route/model selection is untouched, only the profile's
+        // preamble/parameters/`skill_refs` change. The hint is a server-set field with no public
+        // request surface, so it needs no scope gate here — the runners in
+        // `application::flow_eval_execution` are trusted internal callers of this pipeline. The
+        // same fail-closed resolution and refusal path applies to the hinted id.
+        let agent_profile = match command.agent_profile_hint.or(route.agent_profile_id) {
             Some(id) => {
                 let resolution = AgentProfileResolution::classify(
                     self.runtime_repo.find_agent_profile_reference(id).await?,
@@ -3631,6 +3641,7 @@ mod tests {
                 provider_hint: None,
                 model_hint: None,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options: ExecutionOptions {
                     stream,
                     output_schema: Some(json!({
@@ -3741,6 +3752,7 @@ mod tests {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions {
                 output_schema: Some(json!({
                     "title": "Answer",
@@ -3840,6 +3852,7 @@ mod tests {
             provider_hint: Some(Uuid::now_v7()),
             model_hint: Some(Uuid::now_v7()),
             credential_hint: Some(Uuid::now_v7()),
+            agent_profile_hint: None,
             options: ExecutionOptions::default(),
             metadata: Value::Null,
         };
@@ -3870,6 +3883,7 @@ mod tests {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions::default(),
             metadata: Value::Null,
         };
@@ -4153,6 +4167,7 @@ mod tests {
                 provider_hint,
                 model_hint,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options: ExecutionOptions::default(),
                 metadata: Value::Null,
             }
@@ -4284,6 +4299,7 @@ mod tests {
                 provider_hint: None,
                 model_hint: None,
                 credential_hint: None,
+                agent_profile_hint: None,
                 options,
                 metadata: Value::Null,
             }

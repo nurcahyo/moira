@@ -3,25 +3,25 @@ use sqlx::Row;
 
 use crate::{
     domain::{
-        AgentFlowRecord, AgentFlowRunRecord, AgentFlowStepRecord, AgentProfileGraphRow,
-        AgentRouteEdgeRow, ApiKeyRecord, ApplicationExecutionPolicyRecord, ApplicationRecord,
-        ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent, AuditLogRecord,
-        AuditResult, ConversationContentPersistence, ConversationMessageRecord,
+        AgentFlowRecord, AgentFlowRunRecord, AgentFlowStepRecord, AgentFlowStepRunRecord,
+        AgentProfileGraphRow, AgentRouteEdgeRow, ApiKeyRecord, ApplicationExecutionPolicyRecord,
+        ApplicationRecord, ApplicationRoutingDefaultsRecord, AttemptSelectionReason, AuditEvent,
+        AuditLogRecord, AuditResult, ConversationContentPersistence, ConversationMessageRecord,
         ConversationMessageRole, ConversationMessageType, ConversationPolicyRecord,
         ConversationRecord, ConversationStatus, CredentialRecord, CredentialScope,
         CredentialStatus, CredentialSummary, CredentialType, EmbeddingPolicyRecord, EvalCaseRecord,
         EvalRunRecord, EvalRunStatus, EvalSuiteRecord, EvalTriggerKind, ExecutionFailureClass,
-        FlowRunStatus, FlowStepGraphRow, FlowStepOnFailure, GradingKind, HistoryStrategy,
-        HttpMethod, KeyStatus, MemoryConsentMode, MemoryPolicyRecord, MemoryRecord, MemoryScope,
-        MemorySensitivity, MemoryStatus, MemoryType, NamedStatusGraphRow, OwnerScope,
-        ProviderConfig, ProviderHealthStatus, ProviderKind, ProviderModelRecord,
-        ProviderModelRuntimeConfig, ProviderRecord, ProviderRuntimePolicyRecord, ProviderType,
-        PublicResponseRecord, PublicResponseStatus, PublicUsageSummary, RagCollectionRecord,
-        RagCollectionStatus, RagCollectionVisibility, RagDocumentRecord, RagDocumentStatus,
-        RagIngestionStatus, ResourceStatus, ResponsePersistenceMode, RetrievalPolicyRecord,
-        RouteDefinitionRecord, RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus,
-        ScopeType, SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus,
-        TrustedJwtIssuerRecord,
+        FlowRunStatus, FlowStepGraphRow, FlowStepOnFailure, FlowStepRunStatus, GradingKind,
+        HistoryStrategy, HttpMethod, KeyStatus, MemoryConsentMode, MemoryPolicyRecord,
+        MemoryRecord, MemoryScope, MemorySensitivity, MemoryStatus, MemoryType,
+        NamedStatusGraphRow, OwnerScope, ProviderConfig, ProviderHealthStatus, ProviderKind,
+        ProviderModelRecord, ProviderModelRuntimeConfig, ProviderRecord,
+        ProviderRuntimePolicyRecord, ProviderType, PublicResponseRecord, PublicResponseStatus,
+        PublicUsageSummary, RagCollectionRecord, RagCollectionStatus, RagCollectionVisibility,
+        RagDocumentRecord, RagDocumentStatus, RagIngestionStatus, ResourceStatus,
+        ResponsePersistenceMode, RetrievalPolicyRecord, RouteDefinitionRecord,
+        RouteSelectionStrategy, RoutingPolicyRecord, RuntimePolicyStatus, ScopeType,
+        SkillHttpExecutorRecord, SkillKind, SkillRecord, SkillStatus, TrustedJwtIssuerRecord,
     },
     error::AppError,
     security::{ContentIdentity, ContentOpener, warn_content_storage_ambiguous},
@@ -1111,6 +1111,70 @@ pub fn agent_flow_run_record_from_row(
         flow_id: row.try_get("flow_id")?,
         status: flow_run_status_from_db(row.try_get::<String, _>("status")?)?,
         metadata: row.try_get("metadata")?,
+        created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+pub fn flow_run_status_to_db(value: &FlowRunStatus) -> &'static str {
+    match value {
+        FlowRunStatus::Running => "running",
+        FlowRunStatus::Completed => "completed",
+        FlowRunStatus::Failed => "failed",
+        FlowRunStatus::Cancelled => "cancelled",
+    }
+}
+
+pub fn flow_step_run_status_from_db(value: String) -> Result<FlowStepRunStatus, AppError> {
+    match value.as_str() {
+        "pending" => Ok(FlowStepRunStatus::Pending),
+        "running" => Ok(FlowStepRunStatus::Running),
+        "completed" => Ok(FlowStepRunStatus::Completed),
+        "failed" => Ok(FlowStepRunStatus::Failed),
+        "skipped" => Ok(FlowStepRunStatus::Skipped),
+        _ => Err(AppError::Internal(format!(
+            "unknown flow step run status {value}"
+        ))),
+    }
+}
+
+pub fn flow_step_run_status_to_db(value: &FlowStepRunStatus) -> &'static str {
+    match value {
+        FlowStepRunStatus::Pending => "pending",
+        FlowStepRunStatus::Running => "running",
+        FlowStepRunStatus::Completed => "completed",
+        FlowStepRunStatus::Failed => "failed",
+        FlowStepRunStatus::Skipped => "skipped",
+    }
+}
+
+pub fn eval_run_status_to_db(value: &EvalRunStatus) -> &'static str {
+    match value {
+        EvalRunStatus::Pending => "pending",
+        EvalRunStatus::Running => "running",
+        EvalRunStatus::Completed => "completed",
+        EvalRunStatus::Failed => "failed",
+    }
+}
+
+pub fn eval_trigger_kind_to_db(value: &EvalTriggerKind) -> &'static str {
+    match value {
+        EvalTriggerKind::OfflineManual => "offline_manual",
+        EvalTriggerKind::OfflineCi => "offline_ci",
+        EvalTriggerKind::OnlineSampled => "online_sampled",
+    }
+}
+
+pub fn agent_flow_step_run_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AgentFlowStepRunRecord, AppError> {
+    Ok(AgentFlowStepRunRecord {
+        id: row.try_get("id")?,
+        flow_run_id: row.try_get("flow_run_id")?,
+        step_id: row.try_get("step_id")?,
+        execution_id: row.try_get("execution_id")?,
+        status: flow_step_run_status_from_db(row.try_get::<String, _>("status")?)?,
+        error_summary: row.try_get("error_summary")?,
         created_at: row.try_get("created_at")?,
         completed_at: row.try_get("completed_at")?,
     })

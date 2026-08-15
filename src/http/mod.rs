@@ -686,6 +686,9 @@ fn admin_routes() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(agent_platform::delete_eval_case))
         .routes(routes!(agent_platform::list_eval_runs))
+        // Issue #214 (plan 12 §3) — the execution half: run a suite / run a flow. Kept
+        // contiguous with the evals/flows CRUD block above for the same rebase-friendly reason.
+        .routes(routes!(agent_platform::run_eval_suite))
         .routes(routes!(
             agent_platform::list_flows,
             agent_platform::create_flow
@@ -696,6 +699,7 @@ fn admin_routes() -> OpenApiRouter<AppState> {
             agent_platform::delete_flow
         ))
         .routes(routes!(agent_platform::list_flow_runs))
+        .routes(routes!(agent_platform::run_flow))
         // Issue #234 (plan 12 §4) — the derived, read-only relationship graph.
         .routes(routes!(graph::get_graph))
 }
@@ -799,9 +803,11 @@ mod tests {
             "/api/v1/admin/eval-suites/{id}/cases",
             "/api/v1/admin/eval-suites/{id}/cases/{case_id}",
             "/api/v1/admin/eval-suites/{id}/runs",
+            "/api/v1/admin/eval-suites/{id}/run",
             "/api/v1/admin/flows",
             "/api/v1/admin/flows/{id}",
             "/api/v1/admin/flows/{id}/runs",
+            "/api/v1/admin/flows/{id}/run",
             "/api/v1/admin/graph",
             "/api/v1/admin/runtime/diagnose",
             "/api/v1/admin/rag-collections",
@@ -873,7 +879,9 @@ mod tests {
         //   eval-suite runs list = 1 (9); flows list/create/get/patch/delete = 5, flow
         //   runs list = 1 (6). No execution endpoint for either. 9 + 6 = 15.
         // + issue #83's rolling provider-health read surface: GET /api/v1/admin/providers/health = 1.
-        assert_eq!(operation_count, 184);
+        // + issue #214 (plan 12 §3) the execution half: POST .../eval-suites/{id}/run and
+        //   POST .../flows/{id}/run = 2.
+        assert_eq!(operation_count, 186);
     }
 
     #[test]
