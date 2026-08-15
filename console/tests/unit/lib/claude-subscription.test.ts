@@ -221,6 +221,36 @@ describe("connectClaudeSubscription — the oauth2 credential", () => {
     expect(result.credentialId).toBe(CREDENTIAL_ID);
   });
 
+  test("never rotates an oauth2 credential belonging to a DIFFERENT provider", async () => {
+    // Regression for the plan-12 review finding. `listProviderCredentials` is called with
+    // `providerId`, but Moira's handler ignores every `PageQuery` filter and answers 200 with an
+    // unfiltered page (`src/domain/admin.rs:40-50`, pinned by a test). Until this predicate
+    // existed, the match was `credential_type === "oauth2"` alone, so the page's first oauth2 row
+    // — from any provider in the deployment — was rotated: its sealed secret overwritten with the
+    // Claude token, and the intended provider left with none.
+    //
+    // The stub is what hid this. It keys on the bare path and ignores the query, and every row
+    // the fixtures built already carried the right `provider_id`, so the bug was structurally
+    // untestable. This row deliberately carries a foreign one.
+    const FOREIGN_PROVIDER_ID = "11111111-1111-4111-8111-111111111111";
+    const FOREIGN_CREDENTIAL_ID = "22222222-2222-4222-8222-222222222222";
+    const { stub, client } = clientFor({
+      [CREDENTIAL_LIST]: () => ({
+        status: 200,
+        body: page([
+          credentialRecord({ id: FOREIGN_CREDENTIAL_ID, provider_id: FOREIGN_PROVIDER_ID }),
+        ]),
+      }),
+    });
+
+    const result = await connectClaudeSubscription(client, { accessToken: TOKEN });
+
+    expect(stub.routes()).not.toContain(CREDENTIAL_ROTATE);
+    expect(stub.routes()).toContain(CREDENTIAL_CREATE);
+    expect(result.outcome).toBe("created");
+    expect(result.credentialId).not.toBe(FOREIGN_CREDENTIAL_ID);
+  });
+
   test("re-enables a rotated credential that came back disabled", async () => {
     const { stub, client } = clientFor({
       [CREDENTIAL_LIST]: () => ({ status: 200, body: page([credentialRecord()]) }),

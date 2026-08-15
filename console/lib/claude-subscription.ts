@@ -290,7 +290,15 @@ async function connectAnthropicCredential(
   });
   const existingCredential = findFirstOnPage(
     credentialPage,
-    (row) => row.credential_type === args.credentialType && row.status !== "deleted",
+    // `provider_id` MUST be re-checked here. It is passed to the request above, but Moira's
+    // handler ignores every filter in `PageQuery` and returns an unfiltered page with a 200 —
+    // see the docstring at `src/domain/admin.rs:40-50`, which pins that behaviour with a test.
+    // Without this predicate the rotate below can overwrite an oauth2 credential belonging to a
+    // completely different provider.
+    (row) =>
+      row.provider_id === provider.id &&
+      row.credential_type === args.credentialType &&
+      row.status !== "deleted",
   );
 
   if (existingCredential === null) {
@@ -475,7 +483,11 @@ async function loadAnthropicCredentialStatus(
     limit: LIST_PAGE_LIMIT,
   });
   const credential = credentialPage.data.find(
-    (row) => row.credential_type === credentialType && row.status !== "deleted",
+    // Same reason as the rotate path above: the `providerId` argument is not applied server-side.
+    (row) =>
+      row.provider_id === provider.id &&
+      row.credential_type === credentialType &&
+      row.status !== "deleted",
   );
   if (credential === undefined) {
     return credentialPage.pagination.has_more
