@@ -422,10 +422,10 @@ impl JobHandler for OAuthTokenRefreshHandler {
                         "oauth credential refresh failed; will retry on the next due poll"
                     );
                     skipped += 1;
-                    if let Ok(record) = admin_repo.get_credential(id).await {
-                        if let Ok(provider) = admin_repo.get_provider(record.provider_id).await {
-                            *refresh_failures.entry(provider.provider_type).or_insert(0) += 1;
-                        }
+                    if let Ok(record) = admin_repo.get_credential(id).await
+                        && let Ok(provider) = admin_repo.get_provider(record.provider_id).await
+                    {
+                        *refresh_failures.entry(provider.provider_type).or_insert(0) += 1;
                     }
                 }
             }
