@@ -8,6 +8,14 @@ rust-version = "1.97"
 # suppresses `error[unlicensed]` for workspace members actually marked unpublishable, so
 # without this line `cargo deny check` fails on a crate that has no `license` field by design.
 publish = false
+# Since `src/bin/moira-runner.rs` landed (#284) this crate has two binaries, and a bare
+# `cargo run` cannot guess between them — it exits 101 with "could not determine which binary
+# to run". That broke every documented call site at once: `make migrate`, `make run`,
+# `make start`, `make setup` (through `scripts/bootstrap-key.sh`), `make execute-test`,
+# `make keyring`, `scripts/rotate-keys.sh`, and the README's own bootstrap instructions.
+# Naming the default here fixes all of them in one place; `moira-runner` is still reachable
+# as `cargo run --bin moira-runner`, exactly as `docs/moira-runner.md` documents it.
+default-run = "moira"
 
 [features]
 default = []
