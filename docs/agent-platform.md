@@ -137,23 +137,86 @@ There is no migration, because no automatic repair is safe: silently unbinding t
 would make the skill call unauthenticated, and silently widening the provider's `base_url`
 would grant the entitlement the rule exists to withhold.
 
+**A soft-deleted provider is the second way a working row stops working, and no host
+comparison can see it.** The execution-time lookup requires the credential's owning
+`providers` row to be live, because a provider that no longer exists declares no host and so
+entitles no destination. That refuses a credential whose own row is still `active`, unexpired
+and undeleted — nothing about the credential changed — and it is invisible to the host rule,
+because such a provider's `base_url` may name the executor's `allowed_host` exactly. The
+inventory query below therefore checks `providers.deleted_at` **first** and reports these
+separately as `reason = 'provider_deleted'`; repairing the `base_url` of a deleted provider
+fixes nothing. At execution the message names the real cause ("belongs to a provider that has
+been deleted; the credential itself is still live") rather than blaming the credential. Only
+repairs 2 and 3 below apply — never repair 1.
+
 **Find the affected rows before you deploy:**
 
 ```sql
-select e.skill_id, e.allowed_host, c.id as credential_id, p.id as provider_id, p.base_url
-from skill_http_executors e
-join provider_credentials c on c.id = e.credential_id
-join providers p on p.id = c.provider_id
-where e.credential_id is not null
-  and (p.base_url is null
-       or lower(split_part(split_part(regexp_replace(p.base_url, '^[a-zA-Z]+://', ''), '/', 1), ':', 1))
-           is distinct from lower(e.allowed_host));
+with binding as (
+    select e.skill_id,
+           e.allowed_host,
+           c.id         as credential_id,
+           p.id         as provider_id,
+           p.base_url,
+           p.deleted_at as provider_deleted_at,
+           -- The authority: base_url with the scheme, any userinfo, and everything from the
+           -- first '/', '?' or '#' removed. btrim matches the code's own base_url.trim().
+           regexp_replace(
+             regexp_replace(
+               regexp_replace(btrim(p.base_url), '^[A-Za-z][A-Za-z0-9+.-]*://', ''),
+               '^[^/?#]*@', ''),
+             '[/?#].*$', '') as authority
+    from skill_http_executors e
+    join provider_credentials c on c.id = e.credential_id
+    join providers p            on p.id = c.provider_id
+    where e.credential_id is not null
+)
+select skill_id,
+       allowed_host,
+       credential_id,
+       provider_id,
+       base_url,
+       case when provider_deleted_at is not null then 'provider_deleted'
+            else 'host_mismatch' end as reason
+from (
+    select b.*,
+           -- An IPv6 literal keeps its brackets, because Url::host_str() returns them and
+           -- allowed_host is stored as that function produced it. Splitting on ':' here
+           -- would return '[' and report every IPv6 provider as broken.
+           case when b.authority like '[%'
+                then lower(left(b.authority, position(']' in b.authority)))
+                else lower(split_part(b.authority, ':', 1))
+           end as base_url_host
+    from binding b
+) resolved
+where provider_deleted_at is not null
+   or base_url is null
+   or base_url_host is distinct from lower(allowed_host)
+order by reason, skill_id;
 ```
+
+**The query over-reports, and you must not treat a hit as proof.** Postgres has no URL parser,
+so the host above is extracted with string operations while `credential_binding_permits_host`
+uses `Url::host_str()`. The extraction handles the forms that actually diverge in practice —
+scheme, userinfo (`https://api.vendor.example@evil.example/`), port, path/query/fragment,
+surrounding whitespace, bracketed IPv6 literals — but it does not normalise an IPv6 address
+(`[0:0:0:0:0:0:0:1]` against `[::1]`), apply IDNA/punycode, or percent-decode. Those forms
+compare unequal in SQL and equal in the code, so the query can name a row the code accepts; it
+cannot miss a row the code refuses. That direction is the safe one for *finding* rows, but
+"the query returned N rows" is not the set that is broken — confirm each one before repairing
+it, especially before repair 1.
 
 **Repair each one, in whichever way is actually true of your deployment:**
 
-1. Give the provider a `base_url` naming the executor's host, if that provider really does
-   serve it (`PATCH /api/v1/admin/providers/{id}`, an audited write).
+1. **Give the provider a `base_url` naming the executor's host — only if that provider really
+   is served there.** `providers.base_url` is not a label for this rule: it is that provider's
+   live completion endpoint. `RigRuntimeFactory::build_completion_model` hands it to the
+   openai / anthropic / gemini / deepseek client builder **together with the decrypted API
+   key**, so setting it redirects every completion for that provider, and that provider's key,
+   to the host you name. For the case this section singles out — a provider left on its vendor
+   default with `base_url = NULL` — that is exactly the wrong repair: it does not grant the
+   skill an exception, it moves the provider. Use repair 2 or 3 there.
+   (`PATCH /api/v1/admin/providers/{id}`, an audited write.)
 2. Repoint the executor at a credential whose provider does serve that host
    (`PATCH /api/v1/admin/skills/{id}/executor` with a new `credential_id`).
 3. `DELETE /api/v1/admin/skills/{id}/executor` and re-import, if the executor was wrong.

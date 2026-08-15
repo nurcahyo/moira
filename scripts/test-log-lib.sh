@@ -147,6 +147,15 @@ tl_count_skips() {
 # assertion it briefly had, because clippy correctly asked for `const { assert!(..) }` and a
 # compile-time check is the better home for it.
 #
+# Re-measured 2026-08-15 on `fix/plan12-1-credentials-r2`: **1562** passed, source declaring
+# 1556, by `/usr/bin/make gates` with Postgres and Redis up and zero skip lines. 1561 of those
+# were already there before this branch's last commit; the +1 is
+# `the_documented_inventory_query_finds_every_row_the_binding_rule_refuses`. So 103 of the 104
+# this line moves is drift the constant accumulated across the merges since the measurement
+# above — the same drift the paragraph above records happening once already, which is the
+# argument for moving it on every commit that touches the count rather than when someone
+# notices. While it sat at 1458 the "any net drop reds it" claim was false by that margin.
+#
 # The gap between passed and declared is the doctests. `tl_declared_tests` counts `#[test]` /
 # `#[tokio::test]` attributes only, while both the local `cargo test --workspace` and CI's
 # `__doc__` shard (`scripts/ci-shard-run.sh`, `cargo test --all-features --doc`) also run the
@@ -158,7 +167,7 @@ tl_count_skips() {
 # it" true, and it is the reason the line above had become a lie. The cost is real and belongs
 # to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
 # until this number moves with it. That is the intended failure, not a flake.
-TL_TEST_COUNT_MINIMUM=1458
+TL_TEST_COUNT_MINIMUM=1562
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

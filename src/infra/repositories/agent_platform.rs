@@ -417,10 +417,17 @@ impl PgAgentPlatformRepository {
     /// the skill, and no caller-supplied scope may redirect it to a different row. The
     /// active/not-expired/not-deleted filters are the same, so a revoked or expired
     /// credential yields [`SkillCredentialOutcome::Unusable`] here just as it yields no
-    /// candidate there. The provider join carries `deleted_at is null` for the same reason:
-    /// a soft-deleted provider no longer declares anything, so nothing it owns is entitled to
-    /// a destination — and a credential nobody can see on the admin plane must not keep being
-    /// sent by a skill.
+    /// candidate there. A soft-deleted provider is refused for the same reason: it no longer
+    /// declares anything, so nothing it owns is entitled to a destination — and a credential
+    /// nobody can see on the admin plane must not keep being sent by a skill.
+    ///
+    /// That last rule is tested for in Rust rather than joined away with
+    /// `and p.deleted_at is null`, so the outcome can be
+    /// [`SkillCredentialOutcome::ProviderDeleted`] instead of an indistinguishable
+    /// [`SkillCredentialOutcome::Unusable`]. The behaviour is identical — nothing is
+    /// decrypted either way — but the operator-facing message can then name the table that is
+    /// actually wrong. `providers.id` is `credential.provider_id`'s foreign key, so the join
+    /// still matches exactly one row.
     ///
     /// Never returns a secret the executor's destination is not entitled to. `allowed_host`
     /// is the executor's SSRF-validated host, and the credential's owning provider must
@@ -451,9 +458,10 @@ impl PgAgentPlatformRepository {
                     c.nonce, c.encrypted_payload, c.secret_fingerprint, c.masked_secret, \
                     c.status, c.priority, c.expires_at, c.last_validated_at, c.last_used_at, \
                     c.metadata, c.display_name, c.created_at, c.updated_at, c.deleted_at, \
-                    c.version, p.base_url as provider_base_url \
+                    c.version, p.base_url as provider_base_url, \
+                    p.deleted_at as provider_deleted_at \
              from provider_credentials c \
-             join providers p on p.id = c.provider_id and p.deleted_at is null \
+             join providers p on p.id = c.provider_id \
              where c.id = $1 and c.status = 'active' and c.deleted_at is null \
                and (c.expires_at is null or c.expires_at > now())",
         )
@@ -463,6 +471,14 @@ impl PgAgentPlatformRepository {
         else {
             return Ok(SkillCredentialOutcome::Unusable);
         };
+
+        // Checked before the host rule, and the inventory query in `docs/agent-platform.md`
+        // classifies in the same order: repairing the `base_url` of a deleted provider fixes
+        // nothing, so an operator must not be sent down that path first.
+        let provider_deleted_at: Option<DateTime<Utc>> = row.try_get("provider_deleted_at")?;
+        if provider_deleted_at.is_some() {
+            return Ok(SkillCredentialOutcome::ProviderDeleted);
+        }
 
         let provider_base_url: Option<String> = row.try_get("provider_base_url")?;
         if !credential_binding_permits_host(provider_base_url.as_deref(), allowed_host) {

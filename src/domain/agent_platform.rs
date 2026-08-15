@@ -341,15 +341,29 @@ pub fn credential_binding_permits_host(
 
 /// What resolving a `skill_http_executors.credential_id` produced.
 ///
-/// Three outcomes rather than `Option`, because "there is no usable row" and "the row is
-/// real but is not entitled to this destination" call for different operator remedies and
-/// must not collapse into one message.
+/// Four outcomes rather than `Option`, because "there is no usable row", "the row is real but
+/// its provider is gone" and "the row is real but is not entitled to this destination" call
+/// for different operator remedies and must not collapse into one message. They did once:
+/// a soft-deleted provider arrived as [`Unusable`](Self::Unusable), so the operator was told
+/// the credential was "missing, expired or revoked" while the `provider_credentials` row sat
+/// there active and unexpired, pointing them at the one table that was fine.
 #[derive(Debug)]
 pub enum SkillCredentialOutcome {
     Resolved(Box<crate::domain::ResolvedCredential>),
     /// No live, active, unexpired `provider_credentials` row answers the id, or it carries
     /// no secret field with an HTTP form.
     Unusable,
+    /// The credential row itself is live, but its owning `providers` row is soft-deleted.
+    ///
+    /// A provider that no longer exists declares nothing, so it entitles no destination —
+    /// and a credential nobody can see on the admin plane must not keep being sent by a
+    /// skill. Distinct from [`Unusable`](Self::Unusable) because the remedy is on the
+    /// provider or the executor, not on the credential, and distinct from
+    /// [`HostNotEntitled`](Self::HostNotEntitled) because such a row's `base_url` may name
+    /// the executor's host exactly: no host comparison can find it. Reported separately by
+    /// the pre-deploy inventory query in `docs/agent-platform.md`, which is the only tool an
+    /// operator has for finding these before an upgrade turns them into failed executions.
+    ProviderDeleted,
     /// The row exists, but its provider's configured `base_url` host is not the executor's
     /// `allowed_host` — see [`credential_binding_permits_host`]. Refused **before**
     /// decryption: a secret that is not going to be sent is not worth unsealing.

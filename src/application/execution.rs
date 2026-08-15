@@ -1526,6 +1526,11 @@ impl MoiraExecutionService {
     /// admin write path (`application::agent_platform::patch_executor`); it is re-checked
     /// here because a row written before the rule existed, or by anything that reaches the
     /// table without going through that handler, would otherwise still send the secret.
+    ///
+    /// The owning provider must also still be live. Each of the three refusals below names a
+    /// different table, because each has a different remedy and an operator sent to the wrong
+    /// one finds nothing wrong there — `docs/agent-platform.md` carries the pre-deploy
+    /// inventory query that finds all three before an upgrade turns them into failures.
     async fn skill_credential(
         &self,
         profile: &AgentProfileRecord,
@@ -1551,6 +1556,30 @@ impl MoiraExecutionService {
                     format!(
                         "agent profile '{}' needs skill '{skill_key}', whose credential \
                          {credential_id} is missing, expired or revoked",
+                        profile.profile_key
+                    ),
+                ));
+            }
+            SkillCredentialOutcome::ProviderDeleted => {
+                // Not `CredentialNotFound`, and not the "missing, expired or revoked" wording
+                // above: the `provider_credentials` row is active, unexpired and present, and
+                // an operator sent to look at it finds nothing wrong. What changed is one
+                // table over. Same class as `HostNotEntitled` because the remedy has the same
+                // shape — an admin-plane edit — and the same reason for being fail-closed: a
+                // provider nobody can see must not keep having its secrets sent.
+                tracing::warn!(
+                    profile_key = %profile.profile_key,
+                    skill_key,
+                    %credential_id,
+                    allowed_host,
+                    "refusing to send a skill credential whose owning provider is soft-deleted"
+                );
+                return Err(ExecutionFailure::new(
+                    ExecutionFailureClass::SkillUnavailable,
+                    format!(
+                        "agent profile '{}' needs skill '{skill_key}', whose credential \
+                         {credential_id} belongs to a provider that has been deleted; the \
+                         credential itself is still live",
                         profile.profile_key
                     ),
                 ));
