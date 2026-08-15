@@ -2954,7 +2954,1044 @@ export const CONSOLE_CATALOG: Readonly<Record<ConsoleMessageKey, CatalogEntry>> 
     message: "Relationship graph canvas",
     description: "Accessible label for the react-flow canvas region.",
   },
+
+  /* ------------------------------------------------------------------------ */
+  /* The authenticated chrome — plan 12 §5/§3/§6, issue #83 nav links         */
+  /* ------------------------------------------------------------------------ */
+  [K.chrome_nav_skills]: {
+    key: K.chrome_nav_skills,
+    message: "Skills",
+    description: "Navigation link to `/skills`, the tool/guard skill registry and OpenAPI import screen.",
+  },
+  [K.chrome_nav_provider_health]: {
+    key: K.chrome_nav_provider_health,
+    message: "Provider health",
+    description: "Navigation link to `/providers/health`, the rolling reachability dashboard (issue #83).",
+  },
+  [K.chrome_nav_evals]: {
+    key: K.chrome_nav_evals,
+    message: "Evals",
+    description: "Navigation link to `/evals`, the eval suite/case/run screen (plan 12 §3).",
+  },
+  [K.chrome_nav_flows]: {
+    key: K.chrome_nav_flows,
+    message: "Flows",
+    description: "Navigation link to `/flows`, the multi-agent flow authoring screen (plan 12 §6).",
+  },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /skills screen (plan 12 §5, issue #237)                              */
+  /* ------------------------------------------------------------------------ */
+  [K.page_skills_title]: {
+    key: K.page_skills_title,
+    message: "Skill registry",
+    description: "Heading of `/skills`. Deliberately not the same English as the nav link's `console.chrome.nav_skills`.",
+  },
+  [K.skills_page_intro]: {
+    key: K.skills_page_intro,
+    message:
+      "A tool skill is offered to a model as a callable action; a guard skill is a deterministic " +
+      "policy check that may only narrow access. Freshly created or imported skills start in " +
+      "draft and take no effect until enabled.",
+    description: "Rendered under the `/skills` heading, explaining the tool/guard split and the draft lifecycle before the list below it.",
+  },
+  [K.skills_load_failed]: {
+    key: K.skills_load_failed,
+    message: "The console could not read the skill registry from Moira.",
+    description: "Rendered instead of the whole screen when the server-side read throws. The page still answers below 400 so the a11y walker's status gate stays green through a backend outage.",
+  },
+  [K.skills_request_failed]: {
+    key: K.skills_request_failed,
+    message: "The skills screen could not complete that request. Nothing was changed.",
+    description: "Fallback failure text for a browser-side call to this screen's own route handlers that produced no readable keyed refusal.",
+  },
+  [K.skills_request_body_invalid]: {
+    key: K.skills_request_body_invalid,
+    message: "This screen's own request was malformed before it reached Moira — a fault in the console, not in what you typed.",
+    description: "A skills route handler could not read its own request body, or read one with no usable fields. Reachable only through a console bug or a hand-made request.",
+  },
+  [K.skills_skill_key_required]: {
+    key: K.skills_skill_key_required,
+    message: "Give this skill a key before creating it.",
+    description: "The console's own 400 when `skill_key` is missing or blank on `POST /api/skills`.",
+  },
+  [K.skills_display_name_required]: {
+    key: K.skills_display_name_required,
+    message: "Give this skill a display name.",
+    description: "The console's own 400 when `display_name` is missing or blank, on create or on the edit form's save.",
+  },
+  [K.skills_kind_required]: {
+    key: K.skills_kind_required,
+    message: "Choose whether this skill is a tool or a guard.",
+    description: "The console's own 400 when `kind` is absent or not one of the two values `SkillKind` allows.",
+  },
+  [K.skills_bulk_enable_empty]: {
+    key: K.skills_bulk_enable_empty,
+    message: "Select at least one skill before enabling in bulk.",
+    description: "The console's own 400 when `POST /api/skills/bulk-enable` is called with an empty `skill_ids` list.",
+  },
+  [K.skills_import_document_required]: {
+    key: K.skills_import_document_required,
+    message: "Paste an OpenAPI document before importing.",
+    description: "The console's own 400 when the import request carries no `document` field at all.",
+  },
+  [K.skills_executor_method_invalid]: {
+    key: K.skills_executor_method_invalid,
+    message: "Choose a valid HTTP method for this executor.",
+    description: "The console's own 400 when the executor edit form's `method` field is missing or not one of GET/POST/PUT/PATCH/DELETE.",
+  },
+  [K.skills_executor_url_required]: {
+    key: K.skills_executor_url_required,
+    message: "Give this executor a URL template.",
+    description: "The console's own 400 when the executor edit form's `url_template` field is blank.",
+  },
+  [K.skills_executor_timeout_invalid]: {
+    key: K.skills_executor_timeout_invalid,
+    message: "The executor's timeout must be a positive number of milliseconds.",
+    description: "The console's own 400 when the executor edit form's `timeout_ms` field is not a positive number.",
+  },
+  [K.skills_list_heading]: {
+    key: K.skills_list_heading,
+    message: "Registered skills",
+    description: "Heading of the section listing every skill row.",
+  },
+  [K.skills_list_empty]: {
+    key: K.skills_list_empty,
+    message: "No skill is registered yet.",
+    description: "Empty state for the skill list, on a deployment with no skills authored or imported.",
+  },
+  [K.skills_kind_tool]: {
+    key: K.skills_kind_tool,
+    message: "Tool",
+    description: "Badge text for a skill whose `kind` is `tool`.",
+  },
+  [K.skills_kind_guard]: {
+    key: K.skills_kind_guard,
+    message: "Guard",
+    description: "Badge text for a skill whose `kind` is `guard`.",
+  },
+  [K.skills_status_draft]: {
+    key: K.skills_status_draft,
+    message: "Draft",
+    description: "Badge text for a skill whose `status` is `draft` — freshly authored or imported, not yet reviewed.",
+  },
+  [K.skills_status_enabled]: {
+    key: K.skills_status_enabled,
+    message: "Skill enabled",
+    description: "Badge text for a skill whose `status` is `enabled` — callable by an agent.",
+  },
+  [K.skills_status_disabled]: {
+    key: K.skills_status_disabled,
+    message: "Skill disabled",
+    description: "Badge text for a skill whose `status` is `disabled`.",
+  },
+  [K.skills_no_description]: {
+    key: K.skills_no_description,
+    message: "No description.",
+    description: "Rendered in place of a skill's description when it is null or blank.",
+  },
+  [K.skills_tags_none]: {
+    key: K.skills_tags_none,
+    message: "No tags.",
+    description: "Rendered in place of a skill's tag list when it is empty.",
+  },
+  [K.skills_select_for_bulk_enable]: {
+    key: K.skills_select_for_bulk_enable,
+    message: "Select for bulk-enable",
+    description: "Accessible name of the per-row checkbox that adds a skill to the bulk-enable selection.",
+  },
+  [K.skills_enable]: {
+    key: K.skills_enable,
+    message: "Enable skill",
+    description: "The per-row control that appears when a skill is draft or disabled.",
+  },
+  [K.skills_disable]: {
+    key: K.skills_disable,
+    message: "Disable skill",
+    description: "The per-row control that appears when a skill is enabled.",
+  },
+  [K.skills_edit]: {
+    key: K.skills_edit,
+    message: "Edit skill",
+    description: "Opens the inline edit form for a skill's display name, description and tags.",
+  },
+  [K.skills_edit_cancel]: {
+    key: K.skills_edit_cancel,
+    message: "Discard skill edits",
+    description: "Closes the inline edit form without saving.",
+  },
+  [K.skills_edit_save]: {
+    key: K.skills_edit_save,
+    message: "Save skill",
+    description: "Submits the inline edit form's `PATCH`.",
+  },
+  [K.skills_edit_saved]: {
+    key: K.skills_edit_saved,
+    message: "Skill updated.",
+    description: "Announced after a successful edit, before the page reloads the server-rendered list.",
+  },
+  [K.skills_delete]: {
+    key: K.skills_delete,
+    message: "Delete skill",
+    description: "Opens the delete confirmation dialog for one skill row.",
+  },
+  [K.skills_delete_confirm_title]: {
+    key: K.skills_delete_confirm_title,
+    message: "Delete this skill?",
+    description: "Title of `DangerConfirmDialog` for a skill deletion.",
+  },
+  [K.skills_delete_confirm_body]: {
+    key: K.skills_delete_confirm_body,
+    message: "This removes the skill and its HTTP executor, if it has one. This cannot be undone from this screen.",
+    description: "Body of `DangerConfirmDialog` for a skill deletion, announced via `role=\"alert\"`.",
+  },
+  [K.skills_delete_confirm_action]: {
+    key: K.skills_delete_confirm_action,
+    message: "Delete permanently",
+    description: "Label of the destructive confirm button in the skill deletion dialog.",
+  },
+  [K.skills_bulk_enable_button]: {
+    key: K.skills_bulk_enable_button,
+    message: "Enable selected skills",
+    description: "Submits `POST /api/skills/bulk-enable` for every checked row.",
+  },
+  [K.skills_bulk_enable_none_selected]: {
+    key: K.skills_bulk_enable_none_selected,
+    message: "Select at least one skill above before enabling in bulk.",
+    description: "Rendered as a hint under a disabled bulk-enable button when nothing is checked.",
+  },
+  [K.skills_bulk_enable_done]: {
+    key: K.skills_bulk_enable_done,
+    message: "Selected skills were enabled.",
+    description: "Announced after a successful bulk-enable, before the page reloads the server-rendered list.",
+  },
+  [K.skills_field_skill_key_label]: {
+    key: K.skills_field_skill_key_label,
+    message: "Skill key",
+    description: "Label of the `skill_key` field on the create-skill form.",
+  },
+  [K.skills_field_skill_key_hint]: {
+    key: K.skills_field_skill_key_hint,
+    message: "A stable identifier for this skill. It cannot be changed after creation.",
+    description: "Hint under the `skill_key` field.",
+  },
+  [K.skills_field_display_name_label]: {
+    key: K.skills_field_display_name_label,
+    message: "Skill display name",
+    description: "Label of the `display_name` field, shared by the create-skill form and the edit form.",
+  },
+  [K.skills_field_kind_label]: {
+    key: K.skills_field_kind_label,
+    message: "Kind",
+    description: "Label of the tool/guard `kind` select on the create-skill form.",
+  },
+  [K.skills_field_description_label]: {
+    key: K.skills_field_description_label,
+    message: "Description",
+    description: "Label of the `description` field, shared by the create-skill form and the edit form.",
+  },
+  [K.skills_field_tags_label]: {
+    key: K.skills_field_tags_label,
+    message: "Tags",
+    description: "Label of the `tags` field, shared by the create-skill form and the edit form.",
+  },
+  [K.skills_field_tags_hint]: {
+    key: K.skills_field_tags_hint,
+    message: "Comma-separated. Used for filtering and grouping only.",
+    description: "Hint under the `tags` field, explaining the comma-separated input format.",
+  },
+  [K.skills_create_heading]: {
+    key: K.skills_create_heading,
+    message: "Add a skill",
+    description: "Heading of the create-skill form.",
+  },
+  [K.skills_create_submit]: {
+    key: K.skills_create_submit,
+    message: "Create skill",
+    description: "Submit button of the create-skill form.",
+  },
+  [K.skills_create_success]: {
+    key: K.skills_create_success,
+    message: "Skill created as a draft. Enable it below once it is ready.",
+    description: "Announced after `POST /api/skills` succeeds, before the page reloads the server-rendered list.",
+  },
+  [K.skills_import_heading]: {
+    key: K.skills_import_heading,
+    message: "Import from an OpenAPI document",
+    description: "Heading of the OpenAPI import panel (plan 12 §5, issue #237).",
+  },
+  [K.skills_import_intro]: {
+    key: K.skills_import_intro,
+    message:
+      "Paste an OpenAPI 3.x document. Each operation becomes one draft skill with an HTTP " +
+      "executor, capped at 300 operations per import. Nothing is enabled automatically — review " +
+      "the results below and enable what you want an agent to call.",
+    description: "Explains the import pipeline's cap and draft-first behaviour above the paste field (plan 12 §5 decision 22/23).",
+  },
+  [K.skills_import_field_label]: {
+    key: K.skills_import_field_label,
+    message: "OpenAPI document (JSON)",
+    description: "Label of the textarea that accepts the pasted OpenAPI spec.",
+  },
+  [K.skills_import_field_hint]: {
+    key: K.skills_import_field_hint,
+    message: "Paste the full JSON document, or choose a file to load it from.",
+    description: "Hint under the import textarea, naming both the paste and file-picker paths.",
+  },
+  [K.skills_import_submit]: {
+    key: K.skills_import_submit,
+    message: "Import skills",
+    description: "Submit button of the OpenAPI import panel.",
+  },
+  [K.skills_import_invalid_json]: {
+    key: K.skills_import_invalid_json,
+    message: "That is not valid JSON. Check the pasted document and try again.",
+    description: "Rendered client-side when the pasted text fails to parse as JSON, before anything is sent to the console's own route handler.",
+  },
+  [K.skills_import_success]: {
+    key: K.skills_import_success,
+    message: "Imported {count} skill(s) as drafts.",
+    description: "Announced after a successful import, with `{count}` filled from `imported_count`.",
+  },
+  [K.skills_import_results_heading]: {
+    key: K.skills_import_results_heading,
+    message: "Imported drafts",
+    description: "Heading over the list of skills the last import created, rendered above the main skill list.",
+  },
+  [K.skills_executor_heading]: {
+    key: K.skills_executor_heading,
+    message: "HTTP executor",
+    description: "Heading of the per-skill executor panel.",
+  },
+  [K.skills_executor_show]: {
+    key: K.skills_executor_show,
+    message: "Show executor",
+    description: "Expands a skill row's executor panel, triggering the on-demand `GET .../executor` fetch.",
+  },
+  [K.skills_executor_hide]: {
+    key: K.skills_executor_hide,
+    message: "Hide executor",
+    description: "Collapses a skill row's executor panel.",
+  },
+  [K.skills_executor_loading]: {
+    key: K.skills_executor_loading,
+    message: "Loading the executor…",
+    description: "Shown while the on-demand executor fetch is in flight.",
+  },
+  [K.skills_executor_none]: {
+    key: K.skills_executor_none,
+    message: "This skill has no HTTP executor. It cannot be called until one is imported.",
+    description: "Rendered when `GET /api/skills/{id}/executor` answers 404 — the normal state for a hand-authored skill, since there is no create-executor endpoint on this surface.",
+  },
+  [K.skills_executor_load_failed]: {
+    key: K.skills_executor_load_failed,
+    message: "The console could not read this skill's executor.",
+    description: "Rendered when the on-demand executor fetch fails for a reason other than 404.",
+  },
+  [K.skills_executor_allowed_host_label]: {
+    key: K.skills_executor_allowed_host_label,
+    message: "Allowed host",
+    description: "Read-only label for `allowed_host`, derived server-side from `url_template` and never editable directly.",
+  },
+  [K.skills_executor_method_label]: {
+    key: K.skills_executor_method_label,
+    message: "HTTP method",
+    description: "Label of the executor edit form's method select.",
+  },
+  [K.skills_executor_url_label]: {
+    key: K.skills_executor_url_label,
+    message: "URL template",
+    description: "Label of the executor edit form's `url_template` field.",
+  },
+  [K.skills_executor_timeout_label]: {
+    key: K.skills_executor_timeout_label,
+    message: "Timeout (ms)",
+    description: "Label of the executor edit form's `timeout_ms` field.",
+  },
+  [K.skills_executor_key_row_label]: {
+    key: K.skills_executor_key_row_label,
+    message: "Executor credential row",
+    description: "Label of the executor edit form's `credential_id` field — a row identifier only, never a secret value.",
+  },
+  [K.skills_executor_key_row_hint]: {
+    key: K.skills_executor_key_row_hint,
+    message: "The id of a provider credential row this executor authenticates with. Leave blank for none.",
+    description: "Hint under the executor's `credential_id` field, stating plainly that it names a row rather than holding a value.",
+  },
+  [K.skills_executor_save]: {
+    key: K.skills_executor_save,
+    message: "Save executor",
+    description: "Submit button of the executor edit form.",
+  },
+  [K.skills_executor_saved]: {
+    key: K.skills_executor_saved,
+    message: "Executor updated.",
+    description: "Announced after a successful executor `PATCH`.",
+  },
+  [K.skills_executor_delete]: {
+    key: K.skills_executor_delete,
+    message: "Delete executor",
+    description: "Opens the delete confirmation dialog for a skill's HTTP executor.",
+  },
+  [K.skills_executor_delete_confirm_title]: {
+    key: K.skills_executor_delete_confirm_title,
+    message: "Delete this executor?",
+    description: "Title of `DangerConfirmDialog` for an executor deletion.",
+  },
+  [K.skills_executor_delete_confirm_body]: {
+    key: K.skills_executor_delete_confirm_body,
+    message: "The skill stays, but it can no longer be called until a new executor exists.",
+    description: "Body of `DangerConfirmDialog` for an executor deletion, announced via `role=\"alert\"`.",
+  },
+  [K.skills_executor_delete_confirm_action]: {
+    key: K.skills_executor_delete_confirm_action,
+    message: "Delete executor permanently",
+    description: "Label of the destructive confirm button in the executor deletion dialog.",
+  },
+  [K.skills_executor_deleted]: {
+    key: K.skills_executor_deleted,
+    message: "Executor deleted.",
+    description: "Announced after a successful executor deletion.",
+  },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /providers/health screen (issue #83)                                 */
+  /* ------------------------------------------------------------------------ */
+  [K.page_provider_health_title]: {
+    key: K.page_provider_health_title,
+    message: "Provider health dashboard",
+    description: "Heading of `/providers/health`. Deliberately not the same English as `console.chrome.nav_provider_health`.",
+  },
+  [K.providerhealth_page_intro]: {
+    key: K.providerhealth_page_intro,
+    message: "A rolling reachability window for every enabled provider, refreshed on each visit to this page.",
+    description: "Rendered under the `/providers/health` heading.",
+  },
+  [K.providerhealth_load_failed]: {
+    key: K.providerhealth_load_failed,
+    message: "The console could not read provider health from Moira.",
+    description: "Rendered instead of the table when the server-side read throws. The page still answers below 400 so the a11y walker's status gate stays green through a backend outage.",
+  },
+  [K.providerhealth_table_label]: {
+    key: K.providerhealth_table_label,
+    message: "Provider reachability",
+    description: "Accessible name of the provider health table.",
+  },
+  [K.providerhealth_column_provider]: {
+    key: K.providerhealth_column_provider,
+    message: "Provider name",
+    description: "Column header for `display_name`.",
+  },
+  [K.providerhealth_column_type]: {
+    key: K.providerhealth_column_type,
+    message: "Provider kind",
+    description: "Column header for `provider_type`.",
+  },
+  [K.providerhealth_column_status]: {
+    key: K.providerhealth_column_status,
+    message: "Health status",
+    description: "Column header for the healthy/degraded/unhealthy/unknown badge.",
+  },
+  [K.providerhealth_column_probes]: {
+    key: K.providerhealth_column_probes,
+    message: "Probes (successful / total)",
+    description: "Column header for `probes_successful`/`probes_total`.",
+  },
+  [K.providerhealth_column_latency]: {
+    key: K.providerhealth_column_latency,
+    message: "Average latency",
+    description: "Column header for `average_latency_ms`.",
+  },
+  [K.providerhealth_column_last_probe]: {
+    key: K.providerhealth_column_last_probe,
+    message: "Last probed",
+    description: "Column header for `last_probe_at`.",
+  },
+  [K.providerhealth_column_last_success]: {
+    key: K.providerhealth_column_last_success,
+    message: "Last succeeded",
+    description: "Column header for `last_success_at`.",
+  },
+  [K.providerhealth_column_last_failure]: {
+    key: K.providerhealth_column_last_failure,
+    message: "Last failed",
+    description: "Column header for `last_failure_at`.",
+  },
+  [K.providerhealth_status_healthy]: {
+    key: K.providerhealth_status_healthy,
+    message: "Healthy",
+    description: "Badge text for `ProviderHealthStatus.healthy`.",
+  },
+  [K.providerhealth_status_degraded]: {
+    key: K.providerhealth_status_degraded,
+    message: "Degraded",
+    description: "Badge text for `ProviderHealthStatus.degraded`.",
+  },
+  [K.providerhealth_status_unhealthy]: {
+    key: K.providerhealth_status_unhealthy,
+    message: "Unhealthy",
+    description: "Badge text for `ProviderHealthStatus.unhealthy`.",
+  },
+  [K.providerhealth_status_unknown]: {
+    key: K.providerhealth_status_unknown,
+    message: "Not yet probed",
+    description: "Badge text for `ProviderHealthStatus.unknown` — a provider with no snapshot in the rolling window, never probed or not probed recently enough.",
+  },
+  [K.providerhealth_empty]: {
+    key: K.providerhealth_empty,
+    message: "No provider is enabled yet.",
+    description: "Empty state for the health table on a deployment with no enabled providers.",
+  },
+  [K.providerhealth_never]: {
+    key: K.providerhealth_never,
+    message: "Never",
+    description: "Rendered in place of a null timestamp column (last probed/succeeded/failed).",
+  },
+  [K.providerhealth_latency_unknown]: {
+    key: K.providerhealth_latency_unknown,
+    message: "No data",
+    description: "Rendered in place of a null `average_latency_ms`.",
+  },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /evals screen (plan 12 §3)                                           */
+  /* ------------------------------------------------------------------------ */
+  [K.page_evals_title]: {
+    key: K.page_evals_title,
+    message: "Eval suites",
+    description: "Heading of `/evals`.",
+  },
+  [K.evals_page_intro]: {
+    key: K.evals_page_intro,
+    message: "Author suites of graded cases, then trigger and review runs against them.",
+    description: "Rendered under the `/evals` heading.",
+  },
+  [K.evals_load_failed]: {
+    key: K.evals_load_failed,
+    message: "The console could not read eval suites from Moira.",
+    description: "Rendered instead of the whole screen when the server-side read throws. The page still answers below 400 so the a11y walker's status gate stays green through a backend outage.",
+  },
+  [K.evals_request_failed]: {
+    key: K.evals_request_failed,
+    message: "The evals screen could not complete that request. Nothing was changed.",
+    description: "Fallback failure text for a browser-side call to this screen's own route handlers that produced no readable keyed refusal.",
+  },
+  [K.evals_request_body_invalid]: {
+    key: K.evals_request_body_invalid,
+    message: "This eval request was malformed before it reached Moira — a fault in the console, not in what you typed.",
+    description: "An evals route handler could not read its own request body, or read one with no usable fields.",
+  },
+  [K.evals_suite_key_required]: {
+    key: K.evals_suite_key_required,
+    message: "Give this suite a key before creating it.",
+    description: "The console's own 400 when `suite_key` is missing or blank on `POST /api/evals/suites`.",
+  },
+  [K.evals_display_name_required]: {
+    key: K.evals_display_name_required,
+    message: "Give this suite a display name.",
+    description: "The console's own 400 when `display_name` is missing or blank, on create or on the edit form's save.",
+  },
+  [K.evals_grading_kind_required]: {
+    key: K.evals_grading_kind_required,
+    message: "Choose a grading kind for this case.",
+    description: "The console's own 400 when `grading_kind` is absent or not one of the three `GradingKind` values.",
+  },
+  [K.evals_case_input_required]: {
+    key: K.evals_case_input_required,
+    message: "Give this case an input.",
+    description: "The console's own 400 when the case form's `input` field is empty.",
+  },
+  [K.evals_case_expected_required]: {
+    key: K.evals_case_expected_required,
+    message: "Give this case an expected value.",
+    description: "The console's own 400 when the case form's `expected` field is empty.",
+  },
+  [K.evals_run_not_available]: {
+    key: K.evals_run_not_available,
+    message: "Triggering a run isn't available on this deployment yet. This backend endpoint is landing in a follow-up release.",
+    description: "Rendered when `POST /api/evals/suites/{id}/run` answers its deliberate 501 stub — the Moira operation is not in the committed spec yet (see that route's header).",
+  },
+  [K.evals_suites_heading]: {
+    key: K.evals_suites_heading,
+    message: "Suites",
+    description: "Heading of the section listing every eval suite row.",
+  },
+  [K.evals_suites_empty]: {
+    key: K.evals_suites_empty,
+    message: "No eval suite is authored yet.",
+    description: "Empty state for the suite list.",
+  },
+  [K.evals_status_active]: {
+    key: K.evals_status_active,
+    message: "Suite active",
+    description: "Badge text for an eval suite whose `status` is `active`.",
+  },
+  [K.evals_status_inactive]: {
+    key: K.evals_status_inactive,
+    message: "Suite not active",
+    description: "Badge text for an eval suite whose `status` is not `active` — `disabled` or `deleted`.",
+  },
+  [K.evals_expand]: {
+    key: K.evals_expand,
+    message: "Show cases and runs",
+    description: "Expands a suite row's cases and runs panels.",
+  },
+  [K.evals_collapse]: {
+    key: K.evals_collapse,
+    message: "Hide cases and runs",
+    description: "Collapses a suite row's cases and runs panels.",
+  },
+  [K.evals_edit]: {
+    key: K.evals_edit,
+    message: "Edit suite",
+    description: "Opens the inline edit form for a suite's display name and description.",
+  },
+  [K.evals_edit_cancel]: {
+    key: K.evals_edit_cancel,
+    message: "Discard suite edits",
+    description: "Closes the suite's inline edit form without saving.",
+  },
+  [K.evals_edit_save]: {
+    key: K.evals_edit_save,
+    message: "Save suite",
+    description: "Submits the suite's inline edit form's `PATCH`.",
+  },
+  [K.evals_edit_saved]: {
+    key: K.evals_edit_saved,
+    message: "Suite updated.",
+    description: "Announced after a successful suite edit.",
+  },
+  [K.evals_delete]: {
+    key: K.evals_delete,
+    message: "Delete suite",
+    description: "Opens the delete confirmation dialog for one suite row.",
+  },
+  [K.evals_delete_confirm_title]: {
+    key: K.evals_delete_confirm_title,
+    message: "Delete this suite?",
+    description: "Title of `DangerConfirmDialog` for a suite deletion.",
+  },
+  [K.evals_delete_confirm_body]: {
+    key: K.evals_delete_confirm_body,
+    message: "This removes the suite, its cases and its run history. There is no restore operation on this surface.",
+    description: "Body of `DangerConfirmDialog` for a suite deletion, announced via `role=\"alert\"`. Unlike skills, eval suites have no enable/disable — this really is the one-way door.",
+  },
+  [K.evals_delete_confirm_action]: {
+    key: K.evals_delete_confirm_action,
+    message: "Delete suite permanently",
+    description: "Label of the destructive confirm button in the suite deletion dialog.",
+  },
+  [K.evals_field_suite_key_label]: {
+    key: K.evals_field_suite_key_label,
+    message: "Suite key",
+    description: "Label of the `suite_key` field on the create-suite form.",
+  },
+  [K.evals_field_suite_key_hint]: {
+    key: K.evals_field_suite_key_hint,
+    message: "A stable identifier for this suite. It cannot be changed after creation.",
+    description: "Hint under the `suite_key` field.",
+  },
+  [K.evals_field_display_name_label]: {
+    key: K.evals_field_display_name_label,
+    message: "Suite display name",
+    description: "Label of the `display_name` field, shared by the create-suite form and the edit form.",
+  },
+  [K.evals_field_description_label]: {
+    key: K.evals_field_description_label,
+    message: "Suite description",
+    description: "Label of the `description` field, shared by the create-suite form and the edit form.",
+  },
+  [K.evals_create_heading]: {
+    key: K.evals_create_heading,
+    message: "Add an eval suite",
+    description: "Heading of the create-suite form.",
+  },
+  [K.evals_create_submit]: {
+    key: K.evals_create_submit,
+    message: "Create suite",
+    description: "Submit button of the create-suite form.",
+  },
+  [K.evals_create_success]: {
+    key: K.evals_create_success,
+    message: "Suite created. Add cases below, then trigger a run.",
+    description: "Announced after `POST /api/evals/suites` succeeds.",
+  },
+  [K.evals_cases_heading]: {
+    key: K.evals_cases_heading,
+    message: "Cases",
+    description: "Heading of the section listing one suite's cases.",
+  },
+  [K.evals_cases_empty]: {
+    key: K.evals_cases_empty,
+    message: "No case is authored for this suite yet.",
+    description: "Empty state for the case list.",
+  },
+  [K.evals_case_grading_label]: {
+    key: K.evals_case_grading_label,
+    message: "Grading kind",
+    description: "Label of the case form's `grading_kind` select.",
+  },
+  [K.evals_case_input_label]: {
+    key: K.evals_case_input_label,
+    message: "Input (JSON)",
+    description: "Label of the case form's `input` field.",
+  },
+  [K.evals_case_input_hint]: {
+    key: K.evals_case_input_hint,
+    message: "The input passed to the agent under test, as JSON.",
+    description: "Hint under the case form's `input` field.",
+  },
+  [K.evals_case_expected_label]: {
+    key: K.evals_case_expected_label,
+    message: "Expected (JSON)",
+    description: "Label of the case form's `expected` field.",
+  },
+  [K.evals_case_expected_hint]: {
+    key: K.evals_case_expected_hint,
+    message: "What the grader compares the result against, as JSON.",
+    description: "Hint under the case form's `expected` field.",
+  },
+  [K.evals_case_add_submit]: {
+    key: K.evals_case_add_submit,
+    message: "Add case",
+    description: "Submit button of the case form.",
+  },
+  [K.evals_case_added]: {
+    key: K.evals_case_added,
+    message: "Case added.",
+    description: "Announced after `POST /api/evals/suites/{id}/cases` succeeds.",
+  },
+  [K.evals_case_invalid_json]: {
+    key: K.evals_case_invalid_json,
+    message: "Input and expected must both be valid JSON.",
+    description: "Rendered client-side when either JSON field fails to parse, before anything is sent to the console's own route handler.",
+  },
+  [K.evals_case_delete]: {
+    key: K.evals_case_delete,
+    message: "Delete case",
+    description: "Removes one case. `EvalCaseRecord` carries no version, so this is a direct action with no confirmation dialog — a case is a small, easily re-added row.",
+  },
+  [K.evals_grading_exact_match]: {
+    key: K.evals_grading_exact_match,
+    message: "Exact match",
+    description: "Option label for `GradingKind.exact_match`.",
+  },
+  [K.evals_grading_contains]: {
+    key: K.evals_grading_contains,
+    message: "Contains",
+    description: "Option label for `GradingKind.contains`.",
+  },
+  [K.evals_grading_schema_valid]: {
+    key: K.evals_grading_schema_valid,
+    message: "Schema valid",
+    description: "Option label for `GradingKind.schema_valid`.",
+  },
+  [K.evals_runs_heading]: {
+    key: K.evals_runs_heading,
+    message: "Eval runs",
+    description: "Heading of the section listing one suite's eval runs.",
+  },
+  [K.evals_runs_empty]: {
+    key: K.evals_runs_empty,
+    message: "No run has been triggered for this suite yet.",
+    description: "Empty state for the run list.",
+  },
+  [K.evals_run_trigger]: {
+    key: K.evals_run_trigger,
+    message: "Run this suite",
+    description: "Triggers `POST /api/evals/suites/{id}/run` — currently the deferred stub, see `console.evals.run_not_available`.",
+  },
+  [K.evals_run_status_pending]: {
+    key: K.evals_run_status_pending,
+    message: "Run pending",
+    description: "Badge text for `EvalRunStatus.pending`.",
+  },
+  [K.evals_run_status_running]: {
+    key: K.evals_run_status_running,
+    message: "Run in progress",
+    description: "Badge text for `EvalRunStatus.running`.",
+  },
+  [K.evals_run_status_completed]: {
+    key: K.evals_run_status_completed,
+    message: "Run completed",
+    description: "Badge text for `EvalRunStatus.completed`.",
+  },
+  [K.evals_run_status_failed]: {
+    key: K.evals_run_status_failed,
+    message: "Run failed",
+    description: "Badge text for `EvalRunStatus.failed`.",
+  },
+  [K.evals_run_score_label]: {
+    key: K.evals_run_score_label,
+    message: "Score",
+    description: "Label for a run's `score` field.",
+  },
+  [K.evals_run_score_none]: {
+    key: K.evals_run_score_none,
+    message: "Not scored",
+    description: "Rendered in place of a null `score`.",
+  },
+  [K.evals_run_created_label]: {
+    key: K.evals_run_created_label,
+    message: "Triggered",
+    description: "Label for a run row's `created_at` timestamp.",
+  },
+
+  /* ------------------------------------------------------------------------ */
+  /* The /flows screen (plan 12 §6)                                           */
+  /* ------------------------------------------------------------------------ */
+  [K.page_flows_title]: {
+    key: K.page_flows_title,
+    message: "Multi-agent flows",
+    description: "Heading of `/flows`. Deliberately not the same English as `console.chrome.nav_flows`.",
+  },
+  [K.flows_page_intro]: {
+    key: K.flows_page_intro,
+    message:
+      "A flow is an ordered, sequential list of steps, each running one agent profile. Author the " +
+      "steps below, then trigger and review runs.",
+    description: "Rendered under the `/flows` heading, naming the sequential-only MVP shape (decision 13).",
+  },
+  [K.flows_load_failed]: {
+    key: K.flows_load_failed,
+    message: "The console could not read flows from Moira.",
+    description: "Rendered instead of the whole screen when the server-side read throws. The page still answers below 400 so the a11y walker's status gate stays green through a backend outage.",
+  },
+  [K.flows_request_failed]: {
+    key: K.flows_request_failed,
+    message: "The flows screen could not complete that request. Nothing was changed.",
+    description: "Fallback failure text for a browser-side call to this screen's own route handlers that produced no readable keyed refusal.",
+  },
+  [K.flows_request_body_invalid]: {
+    key: K.flows_request_body_invalid,
+    message: "This flow request was malformed before it reached Moira — a fault in the console, not in what you typed.",
+    description: "A flows route handler could not read its own request body, or read one with no usable fields.",
+  },
+  [K.flows_flow_key_required]: {
+    key: K.flows_flow_key_required,
+    message: "Give this flow a key before creating it.",
+    description: "The console's own 400 when `flow_key` is missing or blank on `POST /api/flows`.",
+  },
+  [K.flows_display_name_required]: {
+    key: K.flows_display_name_required,
+    message: "Give this flow a display name.",
+    description: "The console's own 400 when `display_name` is missing or blank, on create or on the edit form's save.",
+  },
+  [K.flows_steps_invalid]: {
+    key: K.flows_steps_invalid,
+    message: "Every step needs a step key, an order, and an agent profile.",
+    description: "The console's own 400 when the step list carries an entry missing one of its three required fields.",
+  },
+  [K.flows_run_not_available]: {
+    key: K.flows_run_not_available,
+    message: "Triggering a flow run isn't available on this deployment yet. This backend endpoint is landing in a follow-up release.",
+    description: "Rendered when `POST /api/flows/{id}/run` answers its deliberate 501 stub — the Moira operation is not in the committed spec yet (see that route's header).",
+  },
+  [K.flows_list_heading]: {
+    key: K.flows_list_heading,
+    message: "Authored flows",
+    description: "Heading of the section listing every flow row.",
+  },
+  [K.flows_list_empty]: {
+    key: K.flows_list_empty,
+    message: "No flow is authored yet.",
+    description: "Empty state for the flow list.",
+  },
+  [K.flows_status_active]: {
+    key: K.flows_status_active,
+    message: "Flow active",
+    description: "Badge text for a flow whose `status` is `active`.",
+  },
+  [K.flows_status_inactive]: {
+    key: K.flows_status_inactive,
+    message: "Flow not active",
+    description: "Badge text for a flow whose `status` is not `active` — `disabled` or `deleted`.",
+  },
+  [K.flows_expand]: {
+    key: K.flows_expand,
+    message: "Show steps and runs",
+    description: "Expands a flow row's steps and runs panels.",
+  },
+  [K.flows_collapse]: {
+    key: K.flows_collapse,
+    message: "Hide steps and runs",
+    description: "Collapses a flow row's steps and runs panels.",
+  },
+  [K.flows_edit]: {
+    key: K.flows_edit,
+    message: "Edit flow",
+    description: "Opens the inline edit form for a flow's display name, description and step list.",
+  },
+  [K.flows_edit_cancel]: {
+    key: K.flows_edit_cancel,
+    message: "Discard flow edits",
+    description: "Closes the flow's inline edit form without saving.",
+  },
+  [K.flows_edit_save]: {
+    key: K.flows_edit_save,
+    message: "Save flow",
+    description: "Submits the flow's inline edit form's `PATCH`.",
+  },
+  [K.flows_edit_saved]: {
+    key: K.flows_edit_saved,
+    message: "Flow updated.",
+    description: "Announced after a successful flow edit.",
+  },
+  [K.flows_delete]: {
+    key: K.flows_delete,
+    message: "Delete flow",
+    description: "Opens the delete confirmation dialog for one flow row.",
+  },
+  [K.flows_delete_confirm_title]: {
+    key: K.flows_delete_confirm_title,
+    message: "Delete this flow?",
+    description: "Title of `DangerConfirmDialog` for a flow deletion.",
+  },
+  [K.flows_delete_confirm_body]: {
+    key: K.flows_delete_confirm_body,
+    message: "This removes the flow, its steps and its run history. There is no restore operation on this surface.",
+    description: "Body of `DangerConfirmDialog` for a flow deletion, announced via `role=\"alert\"`.",
+  },
+  [K.flows_delete_confirm_action]: {
+    key: K.flows_delete_confirm_action,
+    message: "Delete flow permanently",
+    description: "Label of the destructive confirm button in the flow deletion dialog.",
+  },
+  [K.flows_field_flow_key_label]: {
+    key: K.flows_field_flow_key_label,
+    message: "Flow key",
+    description: "Label of the `flow_key` field on the create-flow form.",
+  },
+  [K.flows_field_flow_key_hint]: {
+    key: K.flows_field_flow_key_hint,
+    message: "A stable identifier for this flow. It cannot be changed after creation.",
+    description: "Hint under the `flow_key` field.",
+  },
+  [K.flows_field_display_name_label]: {
+    key: K.flows_field_display_name_label,
+    message: "Flow display name",
+    description: "Label of the `display_name` field, shared by the create-flow form and the edit form.",
+  },
+  [K.flows_field_description_label]: {
+    key: K.flows_field_description_label,
+    message: "Flow description",
+    description: "Label of the `description` field, shared by the create-flow form and the edit form.",
+  },
+  [K.flows_create_heading]: {
+    key: K.flows_create_heading,
+    message: "Add a flow",
+    description: "Heading of the create-flow form.",
+  },
+  [K.flows_create_submit]: {
+    key: K.flows_create_submit,
+    message: "Create flow",
+    description: "Submit button of the create-flow form.",
+  },
+  [K.flows_create_success]: {
+    key: K.flows_create_success,
+    message: "Flow created.",
+    description: "Announced after `POST /api/flows` succeeds.",
+  },
+  [K.flows_steps_heading]: {
+    key: K.flows_steps_heading,
+    message: "Steps, in order",
+    description: "Heading of the step builder, shared by the create-flow form and the edit form.",
+  },
+  [K.flows_steps_empty]: {
+    key: K.flows_steps_empty,
+    message: "No step is added yet. A flow with no steps can be authored but cannot run.",
+    description: "Empty state for the step builder's current list.",
+  },
+  [K.flows_step_key_label]: {
+    key: K.flows_step_key_label,
+    message: "Step key",
+    description: "Label of one step row's `step_key` field in the step builder.",
+  },
+  [K.flows_step_order_label]: {
+    key: K.flows_step_order_label,
+    message: "Step order",
+    description: "Label of one step row's `step_order` field in the step builder.",
+  },
+  [K.flows_step_agent_profile_label]: {
+    key: K.flows_step_agent_profile_label,
+    message: "Agent profile",
+    description: "Label of one step row's `agent_profile_id` select in the step builder.",
+  },
+  [K.flows_step_agent_profile_none]: {
+    key: K.flows_step_agent_profile_none,
+    message: "Choose an agent profile",
+    description: "Placeholder option of the agent-profile select before anything is chosen.",
+  },
+  [K.flows_step_on_failure_label]: {
+    key: K.flows_step_on_failure_label,
+    message: "On failure",
+    description: "Label of one step row's `on_failure` select in the step builder.",
+  },
+  [K.flows_on_failure_abort]: {
+    key: K.flows_on_failure_abort,
+    message: "Abort the flow",
+    description: "Option label for `FlowStepOnFailure.abort`.",
+  },
+  [K.flows_on_failure_continue]: {
+    key: K.flows_on_failure_continue,
+    message: "Continue to the next step",
+    description: "Option label for `FlowStepOnFailure.continue`.",
+  },
+  [K.flows_step_add]: {
+    key: K.flows_step_add,
+    message: "Add step",
+    description: "Adds a new blank row to the step builder's local list.",
+  },
+  [K.flows_step_remove]: {
+    key: K.flows_step_remove,
+    message: "Remove step",
+    description: "Removes one row from the step builder's local list.",
+  },
+  [K.flows_step_agent_profiles_load_failed]: {
+    key: K.flows_step_agent_profiles_load_failed,
+    message: "The console could not read the agent profile list. Steps can still be authored by pasting a profile id.",
+    description: "Rendered when the server-side agent-profile read fails; the step builder degrades to a free-text id field rather than blocking flow authoring entirely.",
+  },
+  [K.flows_runs_heading]: {
+    key: K.flows_runs_heading,
+    message: "Flow runs",
+    description: "Heading of the section listing one flow's runs.",
+  },
+  [K.flows_runs_empty]: {
+    key: K.flows_runs_empty,
+    message: "No run has been triggered for this flow yet.",
+    description: "Empty state for the run list.",
+  },
+  [K.flows_run_trigger]: {
+    key: K.flows_run_trigger,
+    message: "Run this flow",
+    description: "Triggers `POST /api/flows/{id}/run` — currently the deferred stub, see `console.flows.run_not_available`.",
+  },
+  [K.flows_run_status_running]: {
+    key: K.flows_run_status_running,
+    message: "Flow run in progress",
+    description: "Badge text for `FlowRunStatus.running`.",
+  },
+  [K.flows_run_status_completed]: {
+    key: K.flows_run_status_completed,
+    message: "Flow run completed",
+    description: "Badge text for `FlowRunStatus.completed`.",
+  },
+  [K.flows_run_status_failed]: {
+    key: K.flows_run_status_failed,
+    message: "Flow run failed",
+    description: "Badge text for `FlowRunStatus.failed`.",
+  },
+  [K.flows_run_status_cancelled]: {
+    key: K.flows_run_status_cancelled,
+    message: "Flow run cancelled",
+    description: "Badge text for `FlowRunStatus.cancelled`.",
+  },
+  [K.flows_run_created_label]: {
+    key: K.flows_run_created_label,
+    message: "Flow run triggered",
+    description: "Label for a flow run row's `created_at` timestamp.",
+  },
 };
 
-/** Every entry, as a plain array. */
 export const CONSOLE_CATALOG_ENTRIES: readonly CatalogEntry[] = Object.values(CONSOLE_CATALOG);

@@ -1571,6 +1571,746 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* Skills (plan 12 §5) — tool/guard registry, HTTP executors, OpenAPI import  */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/SkillKind`. */
+export type SkillKind = "tool" | "guard";
+
+/** `#/components/schemas/SkillStatus`. `draft` -> `enabled`/`disabled`. */
+export type SkillStatus = "draft" | "enabled" | "disabled";
+
+/**
+ * `#/components/schemas/HttpMethod` as it applies to `skill_http_executors`.
+ *
+ * Named `SkillExecutorMethod` here rather than `HttpMethod` — `lib/moira-client.ts`
+ * already exports a `HttpMethod` for the four verbs `MoiraOperation.method` uses
+ * (`GET | POST | PATCH | DELETE`, no `PUT`), and reusing the name for a
+ * differently-membered wire enum is exactly the kind of drift this file's own
+ * contract machinery exists to catch elsewhere.
+ */
+export type SkillExecutorMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+/** `#/components/schemas/SkillRecord`. */
+export interface SkillRecord {
+  id: string;
+  skill_key: string;
+  display_name: string;
+  kind: SkillKind;
+  params_schema: JsonValue;
+  tags: string[];
+  status: SkillStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const SKILL_RECORD_CONTRACT = {
+  schema: "SkillRecord",
+  required: [
+    "id",
+    "skill_key",
+    "display_name",
+    "kind",
+    "params_schema",
+    "tags",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillRecord,
+    (typeof SKILL_RECORD_CONTRACT)["required"][number],
+    (typeof SKILL_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillCreateRequest`. `additionalProperties: false`. */
+export interface SkillCreateRequest {
+  skill_key: string;
+  display_name: string;
+  kind: SkillKind;
+  description?: string | null;
+  metadata?: JsonValue;
+  params_schema?: JsonValue;
+  tags?: string[];
+}
+
+export const SKILL_CREATE_REQUEST_CONTRACT = {
+  schema: "SkillCreateRequest",
+  required: ["skill_key", "display_name", "kind"],
+  optional: ["description", "metadata", "params_schema", "tags"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillCreateRequest,
+    (typeof SKILL_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillPatchRequest`. `additionalProperties: false`.
+ *
+ * `kind` and `status` are absent — `kind` is immutable after creation and
+ * `status` moves only through enable/disable, mirroring `ProviderPatchRequest`'s
+ * treatment of `provider_type`.
+ */
+export interface SkillPatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+  params_schema?: JsonValue;
+  tags?: string[] | null;
+}
+
+export const SKILL_PATCH_REQUEST_CONTRACT = {
+  schema: "SkillPatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata", "params_schema", "tags"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillPatchRequest,
+    (typeof SKILL_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillBulkEnableRequest`. No `If-Match` — a multi-row operation with no single row version. */
+export interface SkillBulkEnableRequest {
+  skill_ids: string[];
+}
+
+export const SKILL_BULK_ENABLE_REQUEST_CONTRACT = {
+  schema: "SkillBulkEnableRequest",
+  required: ["skill_ids"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillBulkEnableRequest,
+    (typeof SKILL_BULK_ENABLE_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_BULK_ENABLE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillBulkEnableResponse`. */
+export interface SkillBulkEnableResponse {
+  data: SkillRecord[];
+}
+
+export const SKILL_BULK_ENABLE_RESPONSE_CONTRACT = {
+  schema: "SkillBulkEnableResponse",
+  required: ["data"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillBulkEnableResponse,
+    (typeof SKILL_BULK_ENABLE_RESPONSE_CONTRACT)["required"][number],
+    (typeof SKILL_BULK_ENABLE_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillImportRequest` — the raw OpenAPI 3.x document to
+ * import (plan 12 §5). Parsing happens server-side in Moira; the console never
+ * inspects `document` beyond forwarding it as JSON.
+ */
+export interface SkillImportRequest {
+  document: JsonValue;
+}
+
+export const SKILL_IMPORT_REQUEST_CONTRACT = {
+  schema: "SkillImportRequest",
+  required: ["document"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillImportRequest,
+    (typeof SKILL_IMPORT_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_IMPORT_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillImportResponse` — one row per imported operation
+ * (a draft `skills` row plus its `skill_http_executors` row), capped at 300
+ * operations server-side (plan 12 §5 decision 23).
+ */
+export interface SkillImportResponse {
+  imported_count: number;
+  skills: SkillRecord[];
+  executors: SkillHttpExecutorRecord[];
+}
+
+export const SKILL_IMPORT_RESPONSE_CONTRACT = {
+  schema: "SkillImportResponse",
+  required: ["imported_count", "skills", "executors"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillImportResponse,
+    (typeof SKILL_IMPORT_RESPONSE_CONTRACT)["required"][number],
+    (typeof SKILL_IMPORT_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillHttpExecutorRecord`.
+ *
+ * NO `version` FIELD. `skill_http_executors` has no `version`/`deleted_at`
+ * columns — optimistic concurrency on this surface is given only to the three
+ * named registries (`skills`, `eval_suites`, `agent_flows`); this row is a
+ * versionless 1:1 child of a `skills` row. `updated_at` is this resource's
+ * `If-Match` basis instead, and the header it round-trips through is a QUOTED
+ * RFC 3339 timestamp rather than an integer — see `skillExecutorIfMatchFor` in
+ * `lib/moira-client.ts`.
+ */
+export interface SkillHttpExecutorRecord {
+  skill_id: string;
+  method: SkillExecutorMethod;
+  url_template: string;
+  allowed_host: string;
+  header_template: JsonValue;
+  timeout_ms: number;
+  created_at: string;
+  updated_at: string;
+  credential_id?: string | null;
+  response_schema?: JsonValue;
+}
+
+export const SKILL_HTTP_EXECUTOR_RECORD_CONTRACT = {
+  schema: "SkillHttpExecutorRecord",
+  required: [
+    "skill_id",
+    "method",
+    "url_template",
+    "allowed_host",
+    "header_template",
+    "timeout_ms",
+    "created_at",
+    "updated_at",
+  ],
+  optional: ["credential_id", "response_schema"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillHttpExecutorRecord,
+    (typeof SKILL_HTTP_EXECUTOR_RECORD_CONTRACT)["required"][number],
+    (typeof SKILL_HTTP_EXECUTOR_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillHttpExecutorPatchRequest`. `additionalProperties: false`.
+ *
+ * `allowed_host` is absent — see `SkillHttpExecutorRecord.allowed_host`'s own
+ * note. Changing `url_template` re-derives and re-validates the allowed host
+ * server-side rather than taking a client-supplied value.
+ */
+export interface SkillHttpExecutorPatchRequest {
+  credential_id?: string | null;
+  header_template?: JsonValue;
+  method?: SkillExecutorMethod | null;
+  response_schema?: JsonValue;
+  timeout_ms?: number | null;
+  url_template?: string | null;
+}
+
+export const SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT = {
+  schema: "SkillHttpExecutorPatchRequest",
+  required: [],
+  optional: ["credential_id", "header_template", "method", "response_schema", "timeout_ms", "url_template"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillHttpExecutorPatchRequest,
+    (typeof SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Provider health (issue #83) — read-only rolling reachability window       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `#/components/schemas/ProviderHealthStatus`. `unknown` is a provider with no
+ * snapshot in the rolling window at all — never probed, or not probed recently
+ * enough to still be in window — and is distinct from `unhealthy`.
+ */
+export type ProviderHealthStatus = "healthy" | "degraded" | "unhealthy" | "unknown";
+
+/** `#/components/schemas/ProviderHealthEntry` — one provider's rolling health window. */
+export interface ProviderHealthEntry {
+  provider_id: string;
+  provider_type: ProviderType;
+  display_name: string;
+  status: ProviderHealthStatus;
+  probes_total: number;
+  probes_successful: number;
+  average_latency_ms?: number | null;
+  last_failure_at?: string | null;
+  last_probe_at?: string | null;
+  last_success_at?: string | null;
+}
+
+export const PROVIDER_HEALTH_ENTRY_CONTRACT = {
+  schema: "ProviderHealthEntry",
+  required: ["provider_id", "provider_type", "display_name", "status", "probes_total", "probes_successful"],
+  optional: ["average_latency_ms", "last_failure_at", "last_probe_at", "last_success_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderHealthEntry,
+    (typeof PROVIDER_HEALTH_ENTRY_CONTRACT)["required"][number],
+    (typeof PROVIDER_HEALTH_ENTRY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ProviderHealthResponse` — `GET /api/v1/admin/providers/health`'s whole body. */
+export interface ProviderHealthResponse {
+  providers: ProviderHealthEntry[];
+}
+
+export const PROVIDER_HEALTH_RESPONSE_CONTRACT = {
+  schema: "ProviderHealthResponse",
+  required: ["providers"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderHealthResponse,
+    (typeof PROVIDER_HEALTH_RESPONSE_CONTRACT)["required"][number],
+    (typeof PROVIDER_HEALTH_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Eval suites (plan 12 §3) — offline/online grading                         */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/GradingKind`. `llm_judge` is deliberately absent (decision 14). */
+export type GradingKind = "exact_match" | "contains" | "schema_valid";
+
+/** `#/components/schemas/EvalRunStatus`. */
+export type EvalRunStatus = "pending" | "running" | "completed" | "failed";
+
+/** `#/components/schemas/EvalTriggerKind`. */
+export type EvalTriggerKind = "offline_manual" | "offline_ci" | "online_sampled";
+
+/** `#/components/schemas/EvalSuiteRecord`. */
+export interface EvalSuiteRecord {
+  id: string;
+  suite_key: string;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const EVAL_SUITE_RECORD_CONTRACT = {
+  schema: "EvalSuiteRecord",
+  required: ["id", "suite_key", "display_name", "status", "metadata", "created_at", "updated_at", "version"],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuiteRecord,
+    (typeof EVAL_SUITE_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalSuiteCreateRequest`. `additionalProperties: false`. */
+export interface EvalSuiteCreateRequest {
+  suite_key: string;
+  display_name: string;
+  description?: string | null;
+  metadata?: JsonValue;
+}
+
+export const EVAL_SUITE_CREATE_REQUEST_CONTRACT = {
+  schema: "EvalSuiteCreateRequest",
+  required: ["suite_key", "display_name"],
+  optional: ["description", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuiteCreateRequest,
+    (typeof EVAL_SUITE_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalSuitePatchRequest`. `additionalProperties: false`. */
+export interface EvalSuitePatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+}
+
+export const EVAL_SUITE_PATCH_REQUEST_CONTRACT = {
+  schema: "EvalSuitePatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuitePatchRequest,
+    (typeof EVAL_SUITE_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalCaseRecord`. No `version` — cases have no PATCH surface (migration header). */
+export interface EvalCaseRecord {
+  id: string;
+  suite_id: string;
+  input: JsonValue;
+  expected: JsonValue;
+  grading_kind: GradingKind;
+  metadata: JsonValue;
+  created_at: string;
+}
+
+export const EVAL_CASE_RECORD_CONTRACT = {
+  schema: "EvalCaseRecord",
+  required: ["id", "suite_id", "input", "expected", "grading_kind", "metadata", "created_at"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalCaseRecord,
+    (typeof EVAL_CASE_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_CASE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalCaseCreateRequest`. `additionalProperties: false`. */
+export interface EvalCaseCreateRequest {
+  input: JsonValue;
+  expected: JsonValue;
+  grading_kind: GradingKind;
+  metadata?: JsonValue;
+}
+
+export const EVAL_CASE_CREATE_REQUEST_CONTRACT = {
+  schema: "EvalCaseCreateRequest",
+  required: ["input", "expected", "grading_kind"],
+  optional: ["metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalCaseCreateRequest,
+    (typeof EVAL_CASE_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_CASE_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalRunRecord`. Read-only — produced by the eval runner. */
+export interface EvalRunRecord {
+  id: string;
+  trigger_kind: EvalTriggerKind;
+  status: EvalRunStatus;
+  results: JsonValue;
+  metadata: JsonValue;
+  created_at: string;
+  agent_profile_id?: string | null;
+  completed_at?: string | null;
+  execution_id?: string | null;
+  score?: number | null;
+  suite_id?: string | null;
+}
+
+export const EVAL_RUN_RECORD_CONTRACT = {
+  schema: "EvalRunRecord",
+  required: ["id", "trigger_kind", "status", "results", "metadata", "created_at"],
+  optional: ["agent_profile_id", "completed_at", "execution_id", "score", "suite_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalRunRecord,
+    (typeof EVAL_RUN_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_RUN_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Agent flows (plan 12 §6) — ordered, sequential-only MVP                   */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/FlowRunStatus`. */
+export type FlowRunStatus = "running" | "completed" | "failed" | "cancelled";
+
+/** `#/components/schemas/FlowStepOnFailure`. */
+export type FlowStepOnFailure = "abort" | "continue";
+
+/** `#/components/schemas/AgentFlowStepRecord`. */
+export interface AgentFlowStepRecord {
+  id: string;
+  flow_id: string;
+  step_key: string;
+  step_order: number;
+  agent_profile_id: string;
+  on_failure: FlowStepOnFailure;
+  input_mapping: JsonValue;
+  metadata: JsonValue;
+  created_at: string;
+}
+
+export const AGENT_FLOW_STEP_RECORD_CONTRACT = {
+  schema: "AgentFlowStepRecord",
+  required: [
+    "id",
+    "flow_id",
+    "step_key",
+    "step_order",
+    "agent_profile_id",
+    "on_failure",
+    "input_mapping",
+    "metadata",
+    "created_at",
+  ],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowStepRecord,
+    (typeof AGENT_FLOW_STEP_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_STEP_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowStepCreateRequest`. `additionalProperties: false`. */
+export interface AgentFlowStepCreateRequest {
+  step_key: string;
+  step_order: number;
+  agent_profile_id: string;
+  input_mapping?: JsonValue;
+  metadata?: JsonValue;
+  on_failure?: FlowStepOnFailure;
+}
+
+export const AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT = {
+  schema: "AgentFlowStepCreateRequest",
+  required: ["step_key", "step_order", "agent_profile_id"],
+  optional: ["input_mapping", "metadata", "on_failure"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowStepCreateRequest,
+    (typeof AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentFlowRecord`.
+ *
+ * A flow's steps are managed as an ordered array INSIDE this record rather than
+ * through a separate sub-resource (decision 13: simplest contract, matches the
+ * sequential-only MVP) — `create`/`patch` accept the whole ordered list and this
+ * record echoes it back.
+ */
+export interface AgentFlowRecord {
+  id: string;
+  flow_key: string;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  steps: AgentFlowStepRecord[];
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const AGENT_FLOW_RECORD_CONTRACT = {
+  schema: "AgentFlowRecord",
+  required: [
+    "id",
+    "flow_key",
+    "display_name",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+    "steps",
+  ],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowRecord,
+    (typeof AGENT_FLOW_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowCreateRequest`. `additionalProperties: false`. */
+export interface AgentFlowCreateRequest {
+  flow_key: string;
+  display_name: string;
+  description?: string | null;
+  metadata?: JsonValue;
+  steps?: AgentFlowStepCreateRequest[];
+}
+
+export const AGENT_FLOW_CREATE_REQUEST_CONTRACT = {
+  schema: "AgentFlowCreateRequest",
+  required: ["flow_key", "display_name"],
+  optional: ["description", "metadata", "steps"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowCreateRequest,
+    (typeof AGENT_FLOW_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentFlowPatchRequest`. `additionalProperties: false`.
+ *
+ * `steps: Some(...)` atomically REPLACES the whole ordered list; omitted leaves
+ * the existing steps untouched — the same coalesce convention every other patch
+ * request in this file follows for its scalar fields.
+ */
+export interface AgentFlowPatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+  steps?: AgentFlowStepCreateRequest[] | null;
+}
+
+export const AGENT_FLOW_PATCH_REQUEST_CONTRACT = {
+  schema: "AgentFlowPatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata", "steps"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowPatchRequest,
+    (typeof AGENT_FLOW_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowRunRecord`. Read-only — produced by the flow orchestrator. */
+export interface AgentFlowRunRecord {
+  id: string;
+  flow_id: string;
+  status: FlowRunStatus;
+  metadata: JsonValue;
+  created_at: string;
+  completed_at?: string | null;
+}
+
+export const AGENT_FLOW_RUN_RECORD_CONTRACT = {
+  schema: "AgentFlowRunRecord",
+  required: ["id", "flow_id", "status", "metadata", "created_at"],
+  optional: ["completed_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowRunRecord,
+    (typeof AGENT_FLOW_RUN_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_RUN_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentProfileRecord` — MINIMAL, for the flow step
+ * builder's "which agent profile does this step run" picker. The console owns
+ * no create/edit surface for agent profiles; this is read-only.
+ */
+export interface AgentProfileRecord {
+  id: string;
+  profile_key: string;
+  display_name: string;
+  tool_policy: JsonValue;
+  context_policy: JsonValue;
+  memory_policy: JsonValue;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  preamble?: string | null;
+  temperature?: number | null;
+  max_tokens?: number | null;
+  deleted_at?: string | null;
+}
+
+export const AGENT_PROFILE_RECORD_CONTRACT = {
+  schema: "AgentProfileRecord",
+  required: [
+    "id",
+    "profile_key",
+    "display_name",
+    "tool_policy",
+    "context_policy",
+    "memory_policy",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["preamble", "temperature", "max_tokens", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentProfileRecord,
+    (typeof AGENT_PROFILE_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_PROFILE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Relationship graph (plan 12 §4, issue #234) — derived, read-only          */
 /* -------------------------------------------------------------------------- */
 
@@ -1756,6 +2496,30 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ROUTING_POLICY_RECORD_CONTRACT,
   APPLICATION_RECORD_CONTRACT,
   APPLICATION_CREATE_REQUEST_CONTRACT,
+  SKILL_RECORD_CONTRACT,
+  SKILL_CREATE_REQUEST_CONTRACT,
+  SKILL_PATCH_REQUEST_CONTRACT,
+  SKILL_BULK_ENABLE_REQUEST_CONTRACT,
+  SKILL_BULK_ENABLE_RESPONSE_CONTRACT,
+  SKILL_IMPORT_REQUEST_CONTRACT,
+  SKILL_IMPORT_RESPONSE_CONTRACT,
+  SKILL_HTTP_EXECUTOR_RECORD_CONTRACT,
+  SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT,
+  PROVIDER_HEALTH_ENTRY_CONTRACT,
+  PROVIDER_HEALTH_RESPONSE_CONTRACT,
+  EVAL_SUITE_RECORD_CONTRACT,
+  EVAL_SUITE_CREATE_REQUEST_CONTRACT,
+  EVAL_SUITE_PATCH_REQUEST_CONTRACT,
+  EVAL_CASE_RECORD_CONTRACT,
+  EVAL_CASE_CREATE_REQUEST_CONTRACT,
+  EVAL_RUN_RECORD_CONTRACT,
+  AGENT_FLOW_STEP_RECORD_CONTRACT,
+  AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT,
+  AGENT_FLOW_RECORD_CONTRACT,
+  AGENT_FLOW_CREATE_REQUEST_CONTRACT,
+  AGENT_FLOW_PATCH_REQUEST_CONTRACT,
+  AGENT_FLOW_RUN_RECORD_CONTRACT,
+  AGENT_PROFILE_RECORD_CONTRACT,
   GRAPH_NODE_CONTRACT,
   GRAPH_EDGE_CONTRACT,
   GRAPH_RESPONSE_CONTRACT,
