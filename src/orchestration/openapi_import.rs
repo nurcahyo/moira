@@ -376,6 +376,7 @@ fn serialized_len(value: &Value) -> usize {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_operation<'a>(
     root: &'a Value,
     path: &str,
