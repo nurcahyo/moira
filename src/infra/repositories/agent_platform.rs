@@ -328,6 +328,28 @@ impl PgAgentPlatformRepository {
             skills.push(skill_record_from_row(&skill_row)?);
 
             let url_template = format!("{base_url}{}", operation.path);
+            let parsed_url = url::Url::parse(&url_template).map_err(|e| {
+                AppError::unprocessable(
+                    "invalid_openapi_spec",
+                    format!("invalid url_template '{url_template}': {e}"),
+                )
+            })?;
+            if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+                return Err(AppError::unprocessable(
+                    "invalid_openapi_spec",
+                    format!("url_template '{url_template}' must not contain userinfo"),
+                ));
+            }
+            let host = parsed_url.host_str().unwrap_or("");
+            if !host.eq_ignore_ascii_case(allowed_host) {
+                return Err(AppError::unprocessable(
+                    "invalid_openapi_spec",
+                    format!(
+                        "url_template host '{host}' does not match allowed_host '{allowed_host}'"
+                    ),
+                ));
+            }
+
             let executor_row = sqlx::query(&format!(
                 "insert into skill_http_executors (skill_id, method, url_template, \
                  allowed_host, header_template) values ($1, $2, $3, $4, '{{}}') \
