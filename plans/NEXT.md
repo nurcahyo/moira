@@ -61,27 +61,7 @@ the commit from commit messages, so a closing keyword only in the PR body is los
 Take one area per branch. Do not batch across areas; the review found that mixed branches make the
 "which fix did this" question unanswerable at review time.
 
-### 3.2 `CONVENTIONS.md` §1A is wrong about its own escape hatch — #298
-
-Step 4a (fast-forward `develop` onto `main`) **cannot succeed in this repository**: `develop`
-carries a ruleset requiring pull requests, so the push is refused with `GH013` whether or not it is
-a genuine fast-forward. §1A reads that refusal as proof the branches diverged. It is proof of
-nothing of the kind — when it fired on 2026-08-16 the branches had *not* diverged.
-
-The action §1A produces is still correct (fall through to 4b), so this is a documentation fix, not
-a process failure. Three things to change:
-
-1. Mark 4a unavailable while `develop` requires pull requests, and say why.
-2. Replace the "if it is rejected, you were in case 4b" inference with the two checks that actually
-   distinguish the cases — both already documented one paragraph earlier.
-3. State the consequence plainly: **every promotion permanently costs one merge commit on `main`
-   and one on `develop`.** §1A currently describes a converging steady state this repository cannot
-   reach.
-
-**Do not** propose changing the ruleset. Requiring pull requests on `develop` is correct, and
-repository settings are out of scope for agents regardless.
-
-### 3.3 Docker layer caching in CI — approved, not started
+### 3.2 Docker layer caching in CI — approved, not started
 
 Approved as a separate PR from the docs-only path filtering, which has already shipped.
 
