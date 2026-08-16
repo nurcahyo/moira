@@ -1,0 +1,767 @@
+//! Issue #250 finding 1 — a CHECK or FOREIGN KEY added to a request-rate table must not be added
+//! in the validating form, and one that already shipped in it must be defused before the migrator
+//! can reach it.
+//!
+//! # The hazard, in one paragraph
+//!
+//! `ALTER TABLE … ADD CONSTRAINT` takes ACCESS EXCLUSIVE **and** runs the validating scan while
+//! holding it. The lock is on the table, not on the migrating replica, so on a table that grows
+//! with traffic every reader and writer in the fleet blocks for the length of that scan — during
+//! a rolling deploy, from a migration that looks like a one-liner.
+//! `migrations/0027_content_encryption_keyring.sql:12-36` states the alternative and why each
+//! half of it is load-bearing: `-- no-transaction` on the first line, `ADD CONSTRAINT … NOT VALID`
+//! (ACCESS EXCLUSIVE, no scan), a commit, then `VALIDATE CONSTRAINT` (SHARE UPDATE EXCLUSIVE,
+//! scans, blocks nobody). Inside one transaction the split is decoration, because locks are held
+//! to commit — which is why the `-- no-transaction` line is checked here and not assumed.
+//!
+//! # What the first version of this file got wrong, because it matters
+//!
+//! It judged only the **last** `add constraint` for each `(table, constraint)` pair. `0030` adds
+//! `execution_attempts_selection_reason_valid` in the validating form and `0034` re-adds it in the
+//! safe one, so under that rule `0030` was invisible: the test's verdict did not depend on `0030`'s
+//! text at all, and would have been identical had the hazard never existed. It asserted that a
+//! file had been added, not that a hazard had been removed.
+//!
+//! So the rule below judges **every** `add constraint` statement in the history. `0030` fails it,
+//! and it is not editable — `docs/project-structure.md:19`,
+//! `migrations/0018_admin_identity_granted_by_invite.sql:20-21`, `src/test_support.rs`'s
+//! `VersionMismatch` diagnosis: `sqlx` checksums migration files, so a database that applied the
+//! old bytes would refuse to boot. A shipped hazard therefore has exactly one honest disposition,
+//! and it is the one [`DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM`] encodes: something that runs
+//! **before** the migrator must make sure the statement never executes. That something is
+//! `src/infra/migration_preflight.rs`, and this file checks it is really there and really names
+//! the migration it claims to defuse. Delete the preflight and this test reds naming `0030` — not
+//! naming a missing follow-up migration.
+//!
+//! # Two deliberate exemptions
+//!
+//! * **Configuration tables.** `0018` and `0020` add validating CHECKs to `admin_identities` and
+//!   `auth_provider_settings`. Those hold single to double digits of rows and always will; the
+//!   scan is free and demanding the two-phase dance there would be ceremony. Only tables whose
+//!   row count grows with *traffic or content* are in [`HIGH_VOLUME_TABLES`].
+//! * **A table created by the same migration.** `0007` adds two FKs to tables it creates a few
+//!   hundred lines earlier. Those tables are empty at that instant, so there is nothing to scan
+//!   and nothing to block.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Tables whose row count grows with traffic or stored content rather than with configuration.
+///
+/// The test is only as good as this list, so the membership rule is stated rather than left to
+/// taste: a table belongs here if something other than an operator writes it — the execution
+/// path, the ingestion path, a worker, or an audit trail. A table an admin writes by hand does
+/// not, however important it is.
+///
+/// Erring towards inclusion is close to free: the cost of a false positive is that one future
+/// migration writes three statements instead of one, and the cost of a false negative is the
+/// outage this file exists to prevent.
+const HIGH_VOLUME_TABLES: &[&str] = &[
+    "agent_flow_runs",
+    "agent_flow_step_runs",
+    "audit_events",
+    "audit_logs",
+    "context_plans",
+    "conversation_messages",
+    "conversation_summaries",
+    "conversations",
+    "eval_runs",
+    "execution_attempts",
+    "idempotency_records",
+    "memory_embeddings",
+    "memory_extraction_runs",
+    "memory_records",
+    "provider_health_snapshots",
+    "rag_chunk_embeddings",
+    "rag_chunks",
+    "rag_document_versions",
+    "rag_documents",
+    "rag_ingestion_runs",
+    "responses",
+    "retrieval_runs",
+    "usage_records",
+    "worker_jobs",
+];
+
+/// A statement that shipped in the validating form and is neutralised by code that runs before
+/// the migrator does.
+struct ShippedHazard {
+    /// The migration file the statement lives in.
+    file: &'static str,
+    /// Its `sqlx` version number — the number the preflight has to key off.
+    version: i64,
+    table: &'static str,
+    constraint: &'static str,
+    /// The module that guarantees the statement never runs against a populated table.
+    defused_by: &'static str,
+}
+
+/// **Entries here are not exemptions. They are debts, and each one has to be paid by code.**
+///
+/// A validating `ADD CONSTRAINT` on a hot table that has already shipped cannot be edited away.
+/// The only remaining place to stand is before the migrator, so an entry is admitted only when
+/// [`every_shipped_hazard_is_really_defused`] can find the named module and see it naming this
+/// migration back. Nothing in this list is satisfied by prose, by a follow-up migration, or by a
+/// release note.
+///
+/// The list is one long and [`the_list_of_shipped_hazards_has_not_grown`] keeps it that way, so a
+/// second entry is a decision somebody makes on purpose rather than a line that slips in.
+const DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM: &[ShippedHazard] = &[ShippedHazard {
+    file: "0030_execution_attempt_candidate_observability.sql",
+    version: 30,
+    table: "execution_attempts",
+    constraint: "execution_attempts_selection_reason_valid",
+    defused_by: "src/infra/migration_preflight.rs",
+}];
+
+/// One `alter table … add constraint …`, with everything needed to judge it.
+#[derive(Debug, Clone)]
+struct AddConstraint {
+    file: String,
+    table: String,
+    constraint: String,
+    /// The statement ends in `not valid`, so it takes ACCESS EXCLUSIVE for a metadata write and
+    /// performs no scan.
+    not_valid: bool,
+    /// Position of the statement within its file, so a `validate` can be required to come after
+    /// the `add` rather than merely to exist.
+    statement_index: usize,
+    /// `-- no-transaction` on the first line of the file. Without it the two statements share one
+    /// transaction, the lock is held to commit, and the split buys nothing.
+    file_leaves_transaction: bool,
+    /// The same file creates the table, so it is empty when the constraint lands.
+    table_created_in_same_file: bool,
+    /// `(constraint name, statement index)` for every `validate constraint` in the same file.
+    validations_in_file: Vec<(String, usize)>,
+}
+
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn migrations_dir() -> PathBuf {
+    repository_root().join("migrations")
+}
+
+/// Comment lines are dropped before parsing.
+///
+/// This repository's migrations carry long prose headers that quote SQL — `0027`, `0034` and this
+/// file's own subject matter all contain the words "add constraint" in commentary. Parsing them
+/// as statements would make the test assert on paragraphs.
+fn strip_comments(sql: &str) -> String {
+    sql.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Lowercased, whitespace-collapsed statements, in file order.
+fn statements(sql: &str) -> Vec<String> {
+    strip_comments(sql)
+        .split(';')
+        .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(|statement| statement.to_lowercase())
+        .filter(|statement| !statement.is_empty())
+        .collect()
+}
+
+/// The token after `add constraint` / `validate constraint` / `create table if not exists`,
+/// stripped of anything that is not part of an identifier.
+fn name_after(tokens: &[&str], first: &str, second: &str) -> Option<String> {
+    tokens.windows(3).find_map(|window| {
+        (window[0] == first && window[1] == second).then(|| {
+            window[2]
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                .to_string()
+        })
+    })
+}
+
+fn read_migrations() -> Vec<(String, String)> {
+    let mut files: Vec<_> = fs::read_dir(migrations_dir())
+        .expect("read the migrations directory")
+        .map(|entry| entry.expect("read a migrations directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() > 25,
+        "the migrations directory resolved to {} files, which cannot be right — a parser that \
+         reads nothing passes every assertion below",
+        files.len()
+    );
+    files
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("a migration file name")
+                .to_string_lossy()
+                .to_string();
+            (name, fs::read_to_string(&path).expect("read a migration"))
+        })
+        .collect()
+}
+
+/// The table a `create table` statement creates, in either form this tree writes.
+///
+/// A table created by the same migration that constrains it is empty at that moment, which is the
+/// exemption this feeds.
+fn created_table_name(statement: &str, tokens: &[&str]) -> Option<String> {
+    if statement.starts_with("create table if not exists ") {
+        return name_after(tokens, "not", "exists");
+    }
+    if statement.starts_with("create table ") {
+        return tokens.get(2).map(|table| (*table).to_string());
+    }
+    None
+}
+
+/// **Every** `add constraint` in the history, in file order — not one per `(table, constraint)`.
+///
+/// Keeping every occurrence is the correction described in this file's header. A later migration
+/// that re-adds the same constraint safely repairs the definition a fresh install ends on; it does
+/// not repair the earlier statement, which still executes on every database that has not yet
+/// crossed it.
+fn every_add_constraint() -> Vec<AddConstraint> {
+    let mut found = Vec::new();
+
+    for (file, sql) in read_migrations() {
+        let file_leaves_transaction = sql.starts_with("-- no-transaction");
+        let statements = statements(&sql);
+
+        let mut created_here: BTreeSet<String> = BTreeSet::new();
+        let mut validations_in_file: Vec<(String, usize)> = Vec::new();
+        for (index, statement) in statements.iter().enumerate() {
+            let tokens: Vec<&str> = statement.split(' ').collect();
+            if let Some(table) = created_table_name(statement, &tokens) {
+                created_here.insert(table);
+            }
+            if let Some(name) = name_after(&tokens, "validate", "constraint") {
+                validations_in_file.push((name, index));
+            }
+        }
+
+        for (index, statement) in statements.iter().enumerate() {
+            if !statement.starts_with("alter table ") {
+                continue;
+            }
+            let tokens: Vec<&str> = statement.split(' ').collect();
+            let Some(constraint) = name_after(&tokens, "add", "constraint") else {
+                continue;
+            };
+            let Some(table) = tokens.get(2).map(|table| (*table).to_string()) else {
+                continue;
+            };
+            found.push(AddConstraint {
+                file: file.clone(),
+                table: table.clone(),
+                constraint,
+                not_valid: statement.ends_with(" not valid"),
+                statement_index: index,
+                file_leaves_transaction,
+                table_created_in_same_file: created_here.contains(&table),
+                validations_in_file: validations_in_file.clone(),
+            });
+        }
+    }
+
+    found
+}
+
+fn shipped_hazard(definition: &AddConstraint) -> Option<&'static ShippedHazard> {
+    DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM.iter().find(|hazard| {
+        hazard.file == definition.file
+            && hazard.table == definition.table
+            && hazard.constraint == definition.constraint
+    })
+}
+
+/// The rule, applied to every `add constraint` against a request-rate table, everywhere in the
+/// history.
+///
+/// Failure here is not stylistic. It means a deploy that runs the offending migration holds ACCESS
+/// EXCLUSIVE on a table the whole fleet reads and writes, for as long as a full scan of it takes.
+#[test]
+fn every_constraint_on_a_high_volume_table_is_added_not_valid_and_validated_separately() {
+    let mut judged = 0usize;
+    let mut hazards_seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+
+    for definition in every_add_constraint() {
+        if !HIGH_VOLUME_TABLES.contains(&definition.table.as_str()) {
+            continue;
+        }
+        if definition.table_created_in_same_file {
+            continue;
+        }
+        judged += 1;
+
+        let AddConstraint {
+            file,
+            table,
+            constraint,
+            not_valid,
+            statement_index,
+            file_leaves_transaction,
+            validations_in_file,
+            ..
+        } = &definition;
+
+        if !not_valid {
+            let hazard = shipped_hazard(&definition);
+            assert!(
+                hazard.is_some(),
+                "{file} adds {constraint} to {table} with a validating ADD CONSTRAINT. {table} \
+                 grows with traffic, so that scan runs under ACCESS EXCLUSIVE and blocks every \
+                 reader and writer of it, fleet-wide, for its duration. Add it `not valid` and \
+                 validate it in a separate statement — see \
+                 migrations/0027_content_encryption_keyring.sql:12-36.\n\nIf this migration has \
+                 already shipped it cannot be edited, and appending a migration that re-adds the \
+                 constraint safely does NOT help: the appended one runs after this one has \
+                 already taken the lock. The statement has to be stopped before the migrator \
+                 reaches it — see src/infra/migration_preflight.rs — and then declared in \
+                 DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM in this file."
+            );
+            hazards_seen.insert((file.clone(), table.clone(), constraint.clone()));
+            continue;
+        }
+
+        assert!(
+            *file_leaves_transaction,
+            "{file} adds {constraint} `not valid` but does not start with `-- no-transaction`, so \
+             the ADD and the VALIDATE share one transaction. Locks are held to commit, so ACCESS \
+             EXCLUSIVE is held across the scan anyway and the split is decoration — the exact \
+             trap migrations/0027_content_encryption_keyring.sql:26-30 warns about."
+        );
+        let validated_after = validations_in_file
+            .iter()
+            .any(|(name, index)| name == constraint && index > statement_index);
+        assert!(
+            validated_after,
+            "{file} adds {constraint} to {table} `not valid` and never validates it, so the \
+             constraint is enforced on new rows but never proven against the existing ones. Add \
+             `alter table {table} validate constraint {constraint};` after the commit boundary."
+        );
+    }
+
+    assert!(
+        judged >= 7,
+        "only {judged} add-constraint statements against high-volume tables were judged, which is \
+         fewer than the seven this tree is known to have (0027's five, 0030's and 0034's). The \
+         parser has stopped seeing statements it used to see, and a rule that matches nothing \
+         passes silently"
+    );
+    assert_eq!(
+        hazards_seen.len(),
+        DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM.len(),
+        "DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM lists {} shipped hazards but the parser found {} \
+         validating statements to match them against. An entry that matches nothing is an \
+         exemption for a statement that no longer exists, and it will silently cover the next one \
+         that takes its place",
+        DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM.len(),
+        hazards_seen.len()
+    );
+}
+
+/// The other half of the rule above: the debt is only cancelled if the code that cancels it is
+/// there.
+///
+/// This is what stops the list from becoming an allowlist. It reds if the preflight module is
+/// deleted, renamed, or stops naming the migration and the constraint it claims to defuse — and
+/// [`every_constraint_on_a_high_volume_table_is_added_not_valid_and_validated_separately`] then
+/// has nothing left to lean on either.
+#[test]
+fn every_shipped_hazard_is_really_defused() {
+    for hazard in DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM {
+        let path = repository_root().join(hazard.defused_by);
+        let source = read_defusing_module(&path, hazard);
+
+        assert!(
+            source.contains(&hazard.version.to_string()),
+            "{} claims to defuse {} but never mentions version {}. The preflight has to key off \
+             the version number the migrator uses, or it defuses nothing",
+            hazard.defused_by,
+            hazard.file,
+            hazard.version
+        );
+        assert!(
+            source.contains(hazard.constraint),
+            "{} claims to defuse {} but never mentions {}, the constraint whose validating ADD is \
+             the hazard",
+            hazard.defused_by,
+            hazard.file,
+            hazard.constraint
+        );
+        assert!(
+            source.contains("not valid") && source.contains("validate constraint"),
+            "{} must install {} with ADD CONSTRAINT … NOT VALID and a separate VALIDATE \
+             CONSTRAINT. Anything else re-creates the scan it exists to avoid",
+            hazard.defused_by,
+            hazard.constraint
+        );
+        assert!(
+            fs::read_to_string(repository_root().join("src/infra/db.rs"))
+                .expect("read src/infra/db.rs")
+                .contains("defuse_pending_hot_table_constraints"),
+            "src/infra/db.rs::migrate must call the preflight. A preflight nothing calls is the \
+             same as no preflight, and every migrating entry point in this tree goes through that \
+             one function"
+        );
+
+        let migration = migrations_dir().join(hazard.file);
+        assert!(
+            migration.is_file(),
+            "{} names {} but that migration does not exist. If it was renumbered, the preflight \
+             is keyed to a version that will never be applied",
+            hazard.defused_by,
+            hazard.file
+        );
+    }
+}
+
+fn read_defusing_module(path: &Path, hazard: &ShippedHazard) -> String {
+    fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "{} is declared as the code that stops {}'s validating ADD CONSTRAINT on {} from \
+             running, and it cannot be read: {error}.\n\nWithout it, every database that has not \
+             yet applied {} takes ACCESS EXCLUSIVE on {} and holds it across a full scan.",
+            hazard.defused_by, hazard.file, hazard.table, hazard.file, hazard.table
+        )
+    })
+}
+
+/// A ratchet, not an assertion about correctness.
+///
+/// Every entry costs a permanent piece of production code that has to keep working. One is a
+/// repair; a growing list is a habit.
+#[test]
+fn the_list_of_shipped_hazards_has_not_grown() {
+    assert_eq!(
+        DEFUSED_BEFORE_THE_MIGRATOR_RUNS_THEM.len(),
+        1,
+        "a second shipped validating constraint on a hot table has been admitted. That is a \
+         decision, not a formality: it means another migration went out in a shape this test \
+         exists to prevent, and another preflight now has to run before every migration forever. \
+         Raise this number deliberately, with the reason in the commit message"
+    );
+}
+
+/// The cases the rule depends on being visible, pinned so a parser regression cannot quietly turn
+/// it into a no-op.
+///
+/// `0030`'s statement must still be read as **unsafe** — if the parser ever reads it as `not
+/// valid`, the whole rule above is satisfied by a bug. `0027`'s is the known-good case, so
+/// "everything passes" cannot be achieved by a parser that recognises nothing.
+#[test]
+fn the_known_cases_are_the_ones_the_rule_is_reading() {
+    let all = every_add_constraint();
+    let by_key = |file: &str, constraint: &str| {
+        all.iter()
+            .find(|definition| {
+                definition.file.starts_with(file) && definition.constraint == constraint
+            })
+            .unwrap_or_else(|| panic!("{file} must contain an add-constraint for {constraint}"))
+    };
+
+    let shipped = by_key("0030_", "execution_attempts_selection_reason_valid");
+    assert!(
+        !shipped.not_valid,
+        "0030's ADD CONSTRAINT is being read as `not valid`. It is not — it is the validating \
+         form, and it is the reason src/infra/migration_preflight.rs exists. A parser that reads \
+         it as safe makes the rule above vacuous"
+    );
+    assert!(
+        !shipped.table_created_in_same_file,
+        "0030 does not create execution_attempts (0005 does), so the empty-table exemption must \
+         not apply to it"
+    );
+
+    let reference = by_key("0027_", "conversation_messages_content_single_form");
+    assert!(
+        reference.not_valid && reference.file_leaves_transaction,
+        "0027's constraint is the reference implementation of the safe shape; if the parser reads \
+         it as unsafe, the rule above is testing its own bugs"
+    );
+
+    let correction = by_key("0034_", "execution_attempts_selection_reason_valid");
+    assert!(
+        correction.not_valid && correction.file_leaves_transaction,
+        "0034 re-installs the constraint in the safe shape and must be read as safe"
+    );
+}
+
+/// The string literal bound by a `const NAME: &str = "…";`, read out of a source file.
+///
+/// Deliberately textual. The point of the two tests below is to pin a value that lives in Rust
+/// against a copy of it in a document, and a test that imported the constant could only ever
+/// compare the code to itself.
+fn string_constant(source: &str, name: &str) -> String {
+    let marker = format!("const {name}: &str =");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{name} must still be declared as `const {name}: &str = …`"));
+    let declaration = &source[start + marker.len()..];
+    let end = declaration
+        .find(';')
+        .unwrap_or_else(|| panic!("{name}'s declaration must end in `;`"));
+    let literal = &declaration[..end];
+    let open = literal
+        .find('"')
+        .unwrap_or_else(|| panic!("{name} must be a plain string literal"));
+    let close = literal
+        .rfind('"')
+        .expect("a literal with an opening quote has a closing one");
+    assert!(
+        close > open,
+        "{name} must be a single plain string literal, not a concatenation this parser would \
+         misread"
+    );
+    literal[open + 1..close].to_string()
+}
+
+/// The description `sqlx` derives from a migration's filename — everything after the first `_`,
+/// without `.sql`, with underscores as spaces (`sqlx-core-0.8.6/src/migrate/source.rs:113-117`).
+///
+/// This is what lands in `_sqlx_migrations.description` when the migrator runs the file itself,
+/// and therefore the one value that must mean *only* that.
+fn stock_description(file: &str) -> String {
+    file.trim_end_matches(".sql")
+        .split_once('_')
+        .expect("a migration filename is <version>_<description>.sql")
+        .1
+        .replace('_', " ")
+}
+
+fn release_notes() -> String {
+    fs::read_to_string(repository_root().join("docs/release-notes.md"))
+        .expect("read docs/release-notes.md")
+}
+
+/// The `description` the manual pre-step in the release notes tells an operator to write.
+fn manual_pre_step_description(notes: &str) -> String {
+    let insert = notes.find("insert into _sqlx_migrations").expect(
+        "the release notes must still carry the manual ledger INSERT for the sqlx-cli path",
+    );
+    let values = "values (30, '";
+    let start = notes[insert..]
+        .find(values)
+        .expect("the manual INSERT must still write version 30 with a literal description")
+        + insert
+        + values.len();
+    let end = notes[start..]
+        .find('\'')
+        .expect("the description literal in the manual INSERT must be closed");
+    notes[start..start + end].to_string()
+}
+
+/// Every ledger description an operator can read for `0030` means a different thing, so no two of
+/// them may be the same string — and the one the notes tell the operator to grep for has to be the
+/// one the code actually writes.
+///
+/// This is the smallest version of the rule the rest of this file enforces for SQL, applied to
+/// prose: an operator-facing claim is only worth the mechanism that keeps it true. The earlier
+/// draft of the release note quoted the preflight's description correctly *and* told the operator
+/// following the manual pre-step to insert the stock one, then told them the stock one means
+/// `0030` "ran as written" — so the reader who took the escape hatch was later misinformed by the
+/// same entry that sent them there.
+#[test]
+fn the_three_ledger_descriptions_for_0030_are_distinct_and_the_notes_quote_the_real_one() {
+    let notes = release_notes();
+    let preflight = fs::read_to_string(repository_root().join("src/infra/migration_preflight.rs"))
+        .expect("read src/infra/migration_preflight.rs");
+
+    let written_by_the_preflight = string_constant(&preflight, "PRE_APPLIED_DESCRIPTION");
+    let written_by_sqlx = stock_description("0030_execution_attempt_candidate_observability.sql");
+    let written_by_hand = manual_pre_step_description(&notes);
+
+    assert!(
+        notes.contains(&written_by_the_preflight),
+        "docs/release-notes.md tells an operator to read _sqlx_migrations to find out which path \
+         0030 took, but the description it shows is not the one \
+         src/infra/migration_preflight.rs writes:\n  code:  {written_by_the_preflight}\nUpdate the \
+         document, or PRE_APPLIED_DESCRIPTION, so the operator greps for a string that exists"
+    );
+    assert_ne!(
+        written_by_hand, written_by_sqlx,
+        "the manual pre-step tells an operator to record 0030 with the same description sqlx \
+         writes when it runs 0030 itself. Those are opposite outcomes — the manual path is taken \
+         precisely because the table is too big to scan under ACCESS EXCLUSIVE — and after this \
+         INSERT nothing can tell them apart"
+    );
+    assert_ne!(
+        written_by_hand, written_by_the_preflight,
+        "the manual pre-step must not claim to be the preflight: one is a procedure a human ran \
+         and may have run partially, the other is a transaction that either happened or did not"
+    );
+}
+
+/// Both halves that take ACCESS EXCLUSIVE on `execution_attempts` bound how long they wait for it,
+/// with the same value.
+///
+/// `NOT VALID` moves the *scan* out from under ACCESS EXCLUSIVE. It does not move the ACCESS
+/// EXCLUSIVE: the `add column` / `drop constraint` / `add … not valid` forms still take one, and
+/// a request for it that has to queue behind a
+/// long-running transaction parks every later reader of the table behind itself as well — so the
+/// safe shape still has an unbounded stall in it unless the wait is capped. Measured on PostgreSQL
+/// 16.14: a 12-second read on `execution_attempts` turned a `select count(*)` that arrived after
+/// the DDL into a 9.4-second block; with `lock_timeout = '3s'` the same `select` blocked 1.4 s and
+/// the DDL failed cleanly, recording nothing.
+///
+/// This is a tripwire, not the mechanism. That the preflight's bound actually *fires* is carried by
+/// `migration_preflight::tests::a_contended_pre_apply_gives_up_rather_than_queueing_and_is_retryable`,
+/// which holds a real lock against a real server. What this adds is the half no runtime test can
+/// reach — `0034` is SQL `sqlx` executes, with no place to assert from — and the agreement between
+/// the two values.
+#[test]
+fn the_access_exclusive_halves_bound_how_long_they_wait_for_the_lock() {
+    let preflight = fs::read_to_string(repository_root().join("src/infra/migration_preflight.rs"))
+        .expect("read src/infra/migration_preflight.rs");
+    let timeout = string_constant(&preflight, "ACCESS_EXCLUSIVE_LOCK_TIMEOUT");
+
+    // Everything before `#[cfg(test)]`, because the phrase "set local lock_timeout" appears in the
+    // test module's own prose and failure messages — a `contains` over the whole file would be
+    // satisfied by a comment about the thing rather than by the thing.
+    let production = preflight
+        .split_once("#[cfg(test)]")
+        .expect("src/infra/migration_preflight.rs must still have a test module")
+        .0;
+    assert!(
+        production.contains("set local lock_timeout = '{ACCESS_EXCLUSIVE_LOCK_TIMEOUT}'"),
+        "src/infra/migration_preflight.rs declares ACCESS_EXCLUSIVE_LOCK_TIMEOUT but its \
+         group-one transaction no longer applies it, so the wait for ACCESS EXCLUSIVE on \
+         execution_attempts is unbounded again"
+    );
+
+    let file = "0034_selection_reason_check_validates_without_blocking.sql";
+    let sql = fs::read_to_string(migrations_dir().join(file)).expect("read 0034");
+    let statements = statements(&sql);
+    let position = |predicate: &dyn Fn(&String) -> bool, what: &str| {
+        statements
+            .iter()
+            .position(predicate)
+            .unwrap_or_else(|| panic!("{file} must still contain {what}"))
+    };
+
+    let bound = position(
+        &|statement: &String| statement.starts_with("set local lock_timeout"),
+        "a `set local lock_timeout` in its first transaction",
+    );
+    let ddl = position(
+        &|statement: &String| {
+            statement.starts_with("alter table execution_attempts drop constraint")
+        },
+        "the drop-constraint that takes ACCESS EXCLUSIVE",
+    );
+    let commit = position(&|statement: &String| statement == "commit", "a commit");
+
+    assert!(
+        bound < ddl && ddl < commit,
+        "{file} sets lock_timeout at statement {bound}, drops the constraint at {ddl} and commits \
+         at {commit}. The bound has to be inside the transaction that takes ACCESS EXCLUSIVE and \
+         before the statement that takes it, or it applies to nothing"
+    );
+    assert!(
+        statements[bound].contains(&format!("'{timeout}'")),
+        "{file} waits `{}` for ACCESS EXCLUSIVE while src/infra/migration_preflight.rs waits \
+         `{timeout}` for the same lock on the same table. Two answers to one question is one \
+         answer too many",
+        statements[bound]
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|statement| statement.starts_with("set lock_timeout")),
+        "{file} sets lock_timeout without `local`, which outlives its transaction and silently \
+         applies to every migration sqlx runs afterwards on the same session — including the \
+         VALIDATE CONSTRAINT below it, which is allowed to wait"
+    );
+}
+
+/// Sanity on the exemption for configuration tables: it must be a decision about the *table*, not
+/// a hole big enough for the hot ones to fall through.
+#[test]
+fn the_high_volume_table_list_still_covers_the_tables_the_schema_has() {
+    let mut constrained: BTreeMap<String, usize> = BTreeMap::new();
+    for definition in every_add_constraint() {
+        *constrained.entry(definition.table).or_default() += 1;
+    }
+    assert!(
+        constrained.contains_key("execution_attempts"),
+        "execution_attempts must be visible to the parser as a constrained table"
+    );
+    assert!(
+        HIGH_VOLUME_TABLES.contains(&"execution_attempts"),
+        "execution_attempts is one row per upstream provider attempt and must stay on the \
+         high-volume list"
+    );
+}
+
+/// Two migrations must never share a version number, and nothing else in this repository notices
+/// when they do.
+///
+/// # Why git cannot catch this
+///
+/// The identity `sqlx` cares about is the integer prefix, not the filename. Two branches that each
+/// add a migration pick the next free number independently, and because their *filenames* differ
+/// the merge is textually clean — git reports no conflict and there is nothing to resolve. This
+/// happened: `develop` landed `0035_claude_runners.sql` while a branch in flight held
+/// `0035_deepseek_legacy_aliases_do_not_strand_routing_policies.sql`. It was caught by reading a
+/// directory listing, which is not a control.
+///
+/// # What it costs when it lands
+///
+/// `sqlx-core-0.8.6/src/migrate/migrator.rs:160` snapshots the applied set **before** the apply
+/// loop and never refreshes it, so the second file at a given version still looks unapplied after
+/// the first one commits. It therefore runs too, and its bookkeeping insert hits
+/// `version BIGINT PRIMARY KEY` (`sqlx-postgres-0.8.6/src/migrate.rs:120`). Because `apply` wraps
+/// the script and the insert in one transaction, that half rolls back cleanly — so the outcome is
+/// that **one of the two migrations silently never applies** and the deploy fails.
+///
+/// The second attempt is the dangerous one. By then the ledger holds the winner's checksum at that
+/// version, so the loser takes the `applied_migrations.get(&version) => Some` branch and fails as
+/// `VersionMismatch`, whose diagnosis is *"previously applied but has been modified"*. An operator
+/// reading that will go looking for someone who edited a shipped migration, and there is no such
+/// person. Which of the two wins is not fixed either: `source.rs:142` sorts by version alone, so
+/// ties fall back to directory read order.
+///
+/// # Why the comparison is on the parsed integer
+///
+/// `source.rs:97-104` is `file_name.splitn(2, '_')` then `parts[0].parse::<i64>()`. `0035_a.sql`
+/// and `35_b.sql` are both version 35 while sharing no string prefix, so comparing the prefix as
+/// text would pass them.
+#[test]
+fn no_two_migrations_share_a_version_number() {
+    let mut by_version: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+
+    for (name, _) in read_migrations() {
+        let parts = name.splitn(2, '_').collect::<Vec<_>>();
+        assert_eq!(
+            parts.len(),
+            2,
+            "{name} has no `_` separating version from description, so sqlx skips it entirely \
+             rather than failing — the migration would simply never run"
+        );
+        let version: i64 = parts[0].parse().unwrap_or_else(|_| {
+            panic!("{name} has a non-integer version prefix; sqlx refuses to resolve the directory")
+        });
+        by_version.entry(version).or_default().push(name);
+    }
+
+    let collisions: Vec<_> = by_version
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(version, files)| format!("{version}: {}", files.join(", ")))
+        .collect();
+
+    assert!(
+        collisions.is_empty(),
+        "these migrations share a version number, which git cannot see because their filenames \
+         differ:\n  {}\nRenumber the later one to the next free version and carry every reference \
+         with it — `include_str!` paths, constants, helper function names and test names all \
+         embed the number.",
+        collisions.join("\n  ")
+    );
+}
