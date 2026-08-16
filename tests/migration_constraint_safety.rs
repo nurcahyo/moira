@@ -698,3 +698,70 @@ fn the_high_volume_table_list_still_covers_the_tables_the_schema_has() {
          high-volume list"
     );
 }
+
+/// Two migrations must never share a version number, and nothing else in this repository notices
+/// when they do.
+///
+/// # Why git cannot catch this
+///
+/// The identity `sqlx` cares about is the integer prefix, not the filename. Two branches that each
+/// add a migration pick the next free number independently, and because their *filenames* differ
+/// the merge is textually clean — git reports no conflict and there is nothing to resolve. This
+/// happened: `develop` landed `0035_claude_runners.sql` while a branch in flight held
+/// `0035_deepseek_legacy_aliases_do_not_strand_routing_policies.sql`. It was caught by reading a
+/// directory listing, which is not a control.
+///
+/// # What it costs when it lands
+///
+/// `sqlx-core-0.8.6/src/migrate/migrator.rs:160` snapshots the applied set **before** the apply
+/// loop and never refreshes it, so the second file at a given version still looks unapplied after
+/// the first one commits. It therefore runs too, and its bookkeeping insert hits
+/// `version BIGINT PRIMARY KEY` (`sqlx-postgres-0.8.6/src/migrate.rs:120`). Because `apply` wraps
+/// the script and the insert in one transaction, that half rolls back cleanly — so the outcome is
+/// that **one of the two migrations silently never applies** and the deploy fails.
+///
+/// The second attempt is the dangerous one. By then the ledger holds the winner's checksum at that
+/// version, so the loser takes the `applied_migrations.get(&version) => Some` branch and fails as
+/// `VersionMismatch`, whose diagnosis is *"previously applied but has been modified"*. An operator
+/// reading that will go looking for someone who edited a shipped migration, and there is no such
+/// person. Which of the two wins is not fixed either: `source.rs:142` sorts by version alone, so
+/// ties fall back to directory read order.
+///
+/// # Why the comparison is on the parsed integer
+///
+/// `source.rs:97-104` is `file_name.splitn(2, '_')` then `parts[0].parse::<i64>()`. `0035_a.sql`
+/// and `35_b.sql` are both version 35 while sharing no string prefix, so comparing the prefix as
+/// text would pass them.
+#[test]
+fn no_two_migrations_share_a_version_number() {
+    let mut by_version: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+
+    for (name, _) in read_migrations() {
+        let parts = name.splitn(2, '_').collect::<Vec<_>>();
+        assert_eq!(
+            parts.len(),
+            2,
+            "{name} has no `_` separating version from description, so sqlx skips it entirely \
+             rather than failing — the migration would simply never run"
+        );
+        let version: i64 = parts[0].parse().unwrap_or_else(|_| {
+            panic!("{name} has a non-integer version prefix; sqlx refuses to resolve the directory")
+        });
+        by_version.entry(version).or_default().push(name);
+    }
+
+    let collisions: Vec<_> = by_version
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(version, files)| format!("{version}: {}", files.join(", ")))
+        .collect();
+
+    assert!(
+        collisions.is_empty(),
+        "these migrations share a version number, which git cannot see because their filenames \
+         differ:\n  {}\nRenumber the later one to the next free version and carry every reference \
+         with it — `include_str!` paths, constants, helper function names and test names all \
+         embed the number.",
+        collisions.join("\n  ")
+    );
+}
