@@ -89,11 +89,11 @@ Holding one invariant instead of two splits "out of sync" into three cases, and 
 
 | Observed | What it means | Action |
 |---|---|---|
-| `main ⊆ develop` fails, `git diff origin/main origin/develop` is **empty** | Almost always an artifact of the promotion merge commit: zero content difference. | Try to fast-forward it away — ritual step 4a. An empty diff does not *guarantee* a fast-forward is possible (`develop` may carry commits whose net effect is zero), so if the push is refused, fall through to 4b. |
-| `main ⊆ develop` fails, the diff is **non-empty** | The branches have diverged in content — either `main` holds something `develop` lacks (a hotfix), or `develop` simply moved on after the promotion, or both. Either way a fast-forward is impossible. | Reverse sync by **merge commit** — ritual step 4b. Never squash, never rebase. |
+| `main ⊆ develop` fails, `git diff origin/main origin/develop` is **empty** | Artifact of the promotion merge commit: zero content difference. | Reverse sync by **merge commit** via a PR — ritual step 4. (Direct ref push is refused by `develop`'s PR ruleset.) |
+| `main ⊆ develop` fails, the diff is **non-empty** | The branches have diverged in content — either `main` holds something `develop` lacks (a hotfix), or `develop` simply moved on after the promotion, or both. | Reverse sync by **merge commit** via a PR — ritual step 4. Never squash, never rebase. |
 | `develop ⊆ main` fails | Normal: `develop` is ahead of the release. | Nothing. |
 
-**Why the asymmetry regenerates without the fast-forward step.** A promotion by merge commit puts one commit on `main` — the merge commit itself — that `develop` does not have, so `main ⊆ develop` fails the instant the promotion lands. Answering that with a second merge commit into `develop` puts a commit on `develop` that `main` does not have, and the next promotion carries it across and produces another merge commit, and so on. Each merge answers the previous asymmetry by creating its mirror image; the cycle never converges. A fast-forward converges precisely because it creates no commit: it moves `develop`'s ref onto the promotion merge commit, leaving nothing new for a later merge to reconcile. That is the whole reason step 4a exists.
+**Why the asymmetry regenerates on every promotion.** A promotion by merge commit puts one commit on `main` — the merge commit itself — that `develop` does not have, so `main ⊆ develop` fails the instant the promotion lands. Answering that with a second merge commit into `develop` puts a commit on `develop` that `main` does not have, and the next promotion carries it across and produces another merge commit, and so on. In this repository, because `develop` requires pull requests, a direct fast-forward ref push is refused by GitHub ruleset `GH013`. Therefore, **every promotion permanently costs two merge commits** — one on `main` for the promotion, and one on `develop` for the reverse sync PR.
 
 ### Why the reverse sync exists at all — the hotfix case
 
@@ -139,13 +139,13 @@ Follow this in order. The only step requiring judgement is a conflict in 4b, fla
 
    If this prints `ok`, you are done. Otherwise continue.
 
-4. **Choose the repair by looking at the diff, not by preference:**
+4. **Choose the repair by looking at the diff to check for content divergence:**
 
    ```bash
    git diff --quiet origin/main origin/develop && echo EMPTY || echo NON-EMPTY
    ```
 
-   This test answers "which repair is possible", not "where the extra content lives" — a diff is also non-empty when `develop` merely moved on after the promotion, and 4b is still the right repair, because the branches have diverged either way. To answer the *separate* question of whether `main` is holding real content — the hotfix question, the one with production consequences — compare `main` against the merge base rather than against `develop`:
+   This test answers whether the branches carry content differences, not whether a fast-forward push is allowed — **direct push onto `develop` is always refused by repository ruleset enforcement (`GH013`)**, requiring all changes to arrive via pull requests. To answer the *separate* question of whether `main` is holding real content — the hotfix question, the one with production consequences — compare `main` against the merge base rather than against `develop`:
 
    ```bash
    git diff --quiet "$(git merge-base origin/main origin/develop)" origin/main \
@@ -155,15 +155,7 @@ Follow this in order. The only step requiring judgement is a conflict in 4b, fla
 
    That distinction matters: a non-empty `main`/`develop` diff is the ordinary state a few hours after any promotion and means nothing on its own.
 
-   4a. **EMPTY — fast-forward `develop` onto `main`:**
-
-   ```bash
-   git push origin origin/main:develop
-   ```
-
-   This creates no commit and changes no content; it only moves `develop`'s ref forward onto the promotion merge commit. Note that a plain `git push` refuses anything that is not a genuine fast-forward, and that refusal is a feature: if it is rejected, you were in case 4b. **Never add `--force` to make it go through.**
-
-   4b. **NON-EMPTY — reverse sync by merge commit, through a PR:**
+   **Reverse sync by merge commit through a PR:**
 
    ```bash
    git switch -c sync/main-into-develop origin/develop
@@ -177,7 +169,7 @@ Follow this in order. The only step requiring judgement is a conflict in 4b, fla
 
    `--merge` is not optional here. `develop` permits all three merge methods because feature PRs squash, so nothing in configuration will stop you from squashing this one — see PR #102 below for what that costs.
 
-   **This is the path that needs no privilege**, and the one to reach for if 4a is refused or if you are unsure which case you are in. It goes through a pull request like any other change, so it works for anyone with write access; running it when a fast-forward would also have worked costs one extra merge commit on `develop` and nothing else.
+   **This is the single authoritative repair path.** Because `develop` requires pull requests, direct `git push origin origin/main:develop` is refused by GitHub with `GH013` (whether or not the diff is empty). A rejection of a direct push is proof of repository rule enforcement, NOT evidence of divergence. Every promotion cycle permanently costs two merge commits: one on `main` (promotion) and one on `develop` (reverse sync PR).
 
    **Conflicts are the one place this procedure stops being mechanical.** A reverse sync conflicts when `main`'s content touches files `develop` has since rewritten — the realistic hotfix case. Resolve on the sync branch and commit; that is the intended place, and resolving here is exactly what stops the same conflict reappearing at every future promotion. Resolve toward *keeping both* changes: the hotfix's effect must survive, and so must `develop`'s newer work. If you cannot establish that both survived, stop and get the author of the hotfix to confirm — a mis-resolved reverse sync reverts the fix just as silently as skipping the sync entirely, and this section's whole purpose is to prevent that outcome.
 
@@ -187,20 +179,17 @@ Follow this in order. The only step requiring judgement is a conflict in 4b, fla
    git fetch origin && git merge-base --is-ancestor origin/main origin/develop && echo "ok: main ⊆ develop"
    ```
 
-**Honesty about step 4a: it worked, and the configuration says it should not have. Do not plan around it.** These are the observed facts, verified 2026-08-14, and they do not reconcile:
+**Honesty about fast-forward pushes: `develop` rulesets enforce PRs (`GH013`).** These are the observed facts, verified 2026-08-16 (issue #298):
 
-- `develop` carries ruleset `20430947` with a `pull_request` rule, which ordinarily means nothing reaches `develop` except through a PR.
-- That ruleset lists `"bypass_actors": []`, and the API reports `"current_user_can_bypass": "never"` **for the very account that performed the push**. Rulesets have no implicit admin escape hatch; `bypass_actors` is the only one, and it is empty.
-- `develop` also carries classic branch protection with 7 required checks, `allow_force_pushes: false`, and `enforce_admins: false`.
-- `git push origin 91d1319:develop` nevertheless succeeded.
+- `develop` carries ruleset `20430947` with a `pull_request` rule, requiring all changes to arrive via pull requests.
+- Attempting `git push origin origin/main:develop` is rejected with `GH013: Repository rule violations found for refs/heads/develop. - Changes must be made through a pull request.`.
+- Therefore, step 4a (direct fast-forward ref push) is unavailable in this repository. All reverse syncs must use the PR path (step 4b).
 
-An earlier revision of this paragraph explained that as an "administrative exemption because `enforce_admins` is disabled". **That explanation was wrong and has been removed.** `enforce_admins` is a classic-branch-protection field and has no bearing on whether a ruleset admits a push; `current_user_can_bypass: "never"` directly contradicts the story. The honest position is that the mechanism is unknown, so **no prediction should be derived from it** — not "an admin can do this", not "a non-admin cannot", not "turning `enforce_admins` on would stop it". Treat 4a as an operation that may simply be refused, discover which by trying it, and let the refusal route you to 4b. **4b is the path to rely on; 4a is an optimisation that avoids a pointless merge commit when it happens to be permitted.**
+**If a direct push is refused, do not force it and do not weaken the branch's protection.** Use the PR reverse-sync path, which requires no special privilege.
 
-**If the push is refused, do not force it and do not weaken the branch's protection to make it work.** Fall back to 4b, which needs no privilege at all.
+One thing the PR sync does not do is smuggle in unverified code: the commit being pushed is `main`'s head, which reached `main` through a PR. Note the seam, though — `main`'s required checks are `develop`'s minus `rotation-gate`, so the *required-check configuration* alone does not guarantee that everything arriving on `develop` this way has passed everything `develop` requires. In practice `.github/workflows/ci.yml` runs on pushes to both branches and `rotation-gate` was green on `91d1319`, so the gap is closed by the workflow's triggers rather than by branch protection. That is a weaker guarantee than it looks; if the two check lists are ever allowed to drift further apart, revisit this.
 
-One thing 4a does not do is smuggle in unverified code: the commit being pushed is `main`'s head, which reached `main` through a PR. Note the seam, though — `main`'s required checks are `develop`'s minus `rotation-gate`, so the *required-check configuration* alone does not guarantee that everything arriving on `develop` this way has passed everything `develop` requires. In practice `.github/workflows/ci.yml` runs on pushes to both branches and `rotation-gate` was green on `91d1319`, so the gap is closed by the workflow's triggers rather than by branch protection. That is a weaker guarantee than it looks; if the two check lists are ever allowed to drift further apart, revisit this.
-
-**Worked example — 2026-08-14.** PR #198 ("release: promote develop to main") landed as merge commit `91d1319`, with two parents: `b91dc9e` (the previous `main`) and `1740376` (the promoted `develop` head). Step 3 then failed, and step 4's diff was empty — the only thing `main` had that `develop` lacked was `91d1319` itself, whose tree is byte-identical to its `develop` parent `1740376` — so step 4a applied: `git push origin 91d1319:develop`.
+**Worked example — 2026-08-16 (PR #294 / #297).** PR #294 promoted `develop` to `main`. Following step 3, `main ⊆ develop` was checked and step 4's diff was empty. Attempting `git push origin origin/main:develop` was rejected by GitHub ruleset `GH013`. The reverse sync PR #297 was opened (`sync/main-into-develop-294`) and merged into `develop` with `--merge`, restoring `main ⊆ develop` cleanly.
 
 For a few hours both branches pointed at `91d1319`. **They no longer do, and that is the point of the example.** PR #215 landed on `develop` the same day, so `develop` is ahead again and `git diff origin/main origin/develop` is non-empty — row 3 of the table, the normal state, nothing to do. `main ⊆ develop` still holds, which is the only thing that was ever being maintained. Equality was a coincidence of nothing having landed in between; had it been the goal, this section would already be reporting a problem that does not exist.
 
