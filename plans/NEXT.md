@@ -6,7 +6,10 @@ questions in order: **what must I read**, **what is actually open**, and **what 
 Keep it current. An entry that has shipped is deleted, not ticked; a stale queue is worse than no
 queue because it is read as authoritative.
 
-Last reconciled against GitHub: **2026-08-16**, after #291, #294, #296 and #297.
+Last reconciled against GitHub: **2026-08-17**, after #300, #301 and #302, with #303 in flight.
+
+Two agents are active. **§3 records who holds what** — read it before claiming anything, and update
+it in the same commit as your claim.
 
 ---
 
@@ -40,19 +43,41 @@ not a verdict.
 
 ---
 
-## 3. Open work, highest value first
+## 3. Who is working on what — read before claiming anything
 
-### 3.1 Plan-12 review remainder — 15 medium + 15 low
+More than one agent works this repository at a time, and they are not always the same tool. This
+section is the only thing preventing two of them from editing the same file from different
+directions. **Update it when you claim or release work**, in the same commit as the claim.
+
+| Claimed by | State | Issue | Files it owns |
+|---|---|---|---|
+| Antigravity | in flight, PR #303 | #253 OpenAPI spec import | `src/orchestration/openapi_import.rs`, `src/infra/repositories/agent_platform.rs`, `.github/workflows/ci.yml` |
+| Antigravity | claimed, next | #252 Rig tool loop | branch `fix/rig-tool-loop-memory-252`; 16 files including `src/orchestration/skill_tool.rs`, `controls.rs`, `runtime_factory.rs`, `src/application/{context,execution,public}.rs`, `src/domain/{agent_platform,runtime}.rs`, `src/config/settings.rs`, `src/security/ssrf.rs`, `migrations/0031_agent_platform.sql` |
+
+**Antigravity works in the main tree** at the repository root, and has held unpushed commits there.
+Do not `git checkout`, `git switch`, `git stash` or `git add -A` in the main tree while that is
+true — that is exactly how a session here lost 932 lines of work once. Use a worktree. A docs-only
+change needs no `target/`, so its worktree is a source checkout and costs nothing.
+
+Only one agent builds or tests at a time (orchestration skill §2). Before running `make gates`,
+check whether another agent is mid-build: the volume has hit 100% twice, and each `target/` reaches
+12–26 GB.
+
+## 4. Open work, highest value first
+
+### 4.1 Plan-12 review remainder — 15 medium + 15 low
 
 All ten **high**-severity findings are closed. What is left is filed by area:
 
-| Issue | Area |
-|---|---|
-| #251 | Job dispatcher, provider health read surface |
-| #252 | Rig tool loop, `HttpSkillTool` |
-| #253 | OpenAPI spec import, `skill_http_executors` |
-| #255 | Native chatgpt provider behind the ToS opt-in |
-| #256 | Relationship graph, metrics, DeepSeek catalog, nextest |
+| Issue | Area | Overlap with Antigravity's #252 |
+|---|---|---|
+| #251 | Job dispatcher, provider health read surface | **1 file** — `src/config/settings.rs`. `skill_tool.rs` and `ssrf.rs` appear in the issue only as cited precedent, not as edit targets. |
+| #255 | Native chatgpt provider behind the ToS opt-in | **6 files** — `execution.rs`, `public.rs`, `settings.rs`, `domain/runtime.rs`, `controls.rs`, `runtime_factory.rs`. **Do not start while #252 is open.** |
+| #256 | Relationship graph, metrics, DeepSeek catalog, nextest | **5 files** — `execution.rs`, `repositories/public.rs`, `controls.rs`, `ssrf.rs`, `migrations/0031`. Wait for #252. |
+
+Those counts come from the file paths each issue names, which is an **upper bound** — an issue
+often cites a file as evidence without needing to modify it, which is exactly why #251's apparent
+three overlaps are really one. Read the citation's context before trusting the number.
 
 These are umbrella issues: each holds several findings, so an issue staying open after a fix is
 normal. Close individual findings by referencing them in the commit message — squash merges compose
@@ -61,29 +86,16 @@ the commit from commit messages, so a closing keyword only in the PR body is los
 Take one area per branch. Do not batch across areas; the review found that mixed branches make the
 "which fix did this" question unanswerable at review time.
 
-### 3.2 Docker layer caching in CI — approved, not started
-
-Approved as a separate PR from the docs-only path filtering, which has already shipped.
-
-Two constraints established before any work begins:
-
-- **Measure the current cache first.** The GitHub Actions cache is a 10 GB LRU pool *per
-  repository*, and this repo is already near it. A new cache that evicts the Rust build cache is a
-  net loss, and it will look like a win in the PR that adds it.
-- **Use a GHCR registry cache, not `type=gha`, and not `mode=min`.** Registry cache does not
-  consume the Actions pool. `mode=min` discards intermediate layers, which is most of the benefit
-  for a cargo-chef build.
-
-State the measured before/after with `n >= 3` interleaved runs. Benchmarks in this repository have
-been wrong by 10x from contention alone — see the orchestration skill §5.
-
-### 3.4 Flaky test — #236
+### 4.2 Flaky test — #236
 
 `a_hundred_concurrent_unknown_key_opens_cost_exactly_one_database_load` reds `rust-shard (2)` on
 unrelated commits. A flaky test in a required check trains everyone to re-run CI without reading
 it, which is how a real failure gets merged.
 
-### 3.5 Held on a human decision — do not start these
+Touches `src/domain/message.rs` and `src/security/data_keys.rs` — **no overlap with anything
+claimed above**, so it is the safest code task to pick up while #252 is in flight.
+
+### 4.3 Held on a human decision — do not start these
 
 - **#71** — the `/setup` wizard branch. The harness blocked autonomous merge three times. Surface
   it; do not retry.
@@ -91,7 +103,7 @@ it, which is how a real failure gets merged.
 
 ---
 
-## 4. Housekeeping state, so you do not rediscover it
+## 5. Housekeeping state, so you do not rediscover it
 
 **Branches.** 222 local branches were reduced to 27 on 2026-08-16. Of the 135 that appeared to have
 unique commits, **113 were already merged** — squash merges make ancestry lie. Establish merged-ness
@@ -115,7 +127,7 @@ is a floor — it goes up, never down to accommodate a deletion.
 
 ---
 
-## 5. Definition of done, for anything here
+## 6. Definition of done, for anything here
 
 1. A test that **fails without the fix.** Revert the change and watch it red. A test that passes
    both ways is the single most common finding in this repository's reviews.
