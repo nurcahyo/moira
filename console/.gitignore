@@ -16,6 +16,15 @@ coverage/
 # The setup-wizard e2e fixture's generated TLS material. Regenerated on demand
 # by e2e/support/setup-fixture.ts; a private key never belongs in the tree.
 .setup-e2e/
+# Next.js writes `certificates/localhost.pem` and `certificates/localhost-key.pem`
+# here the first time anyone runs `bun run dev --experimental-https`, which is the
+# HTTPS recipe `docs/local-testing.md:550` tells developers to use. Same reasoning
+# as `.setup-e2e/` above, but this one is reached by following the documented
+# happy path rather than by running the e2e suite, so it appears in more trees.
+# This repository is public: an unignored private key is one `git add -A` away
+# from being published, and `git add -A` in a stale worktree has already cost
+# this project real work once.
+certificates/
 
 # env
 .env
