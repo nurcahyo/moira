@@ -70,6 +70,7 @@ use crate::{
         (name = "admin-agent-profiles", description = "Agent profile administration"),
         (name = "admin-skills", description = "Skill (declarative tool/guard) administration"),
         (name = "admin-graph", description = "Derived relationship graph over the agent-platform and provider/model registries"),
+        (name = "admin-runners", description = "Containerised Claude runner lifecycle. Moira holds no Docker access: every operation here is a server-to-server call into moira-runner, which is the only component that talks to the Docker Engine API"),
         (name = "admin-runtime", description = "Runtime policy and diagnostics"),
         (name = "admin-rag", description = "RAG collection and document administration")
     )

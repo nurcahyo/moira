@@ -176,6 +176,12 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // like the rest of `(console)`, so the walker asserts the redirect and
   // audits nothing. No authenticated spec renders this screen yet.
   "/playground",
+  // Issue #275/#272 workstream R3. Gated like the rest of `(console)`, so the
+  // walker asserts the redirect and audits nothing. A real gap, like
+  // `/settings/keys` and `/settings/auth`: no authenticated spec renders
+  // either of these two yet.
+  "/runners",
+  "/runners/[id]",
 ];
 
 /** The pathname a route's fixture URL resolves to. */

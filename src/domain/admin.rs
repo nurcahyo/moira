@@ -332,7 +332,9 @@ pub struct ProviderModelPatchRequest {
     pub capabilities: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+// `PartialEq`/`Eq` added by issue #275 so a runner's stored scope can be compared against the one
+// its credential was written at. Additive only: the wire shape is untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CredentialScope {
     Global,

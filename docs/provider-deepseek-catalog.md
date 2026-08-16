@@ -33,7 +33,7 @@ to exist, but `list_model_candidates` joins `provider_models` on `pm.status = 'a
 policy contributes no candidate and, if it was the route's only one, the route stops producing
 candidates at all. `0028` alone would therefore have broken every deployment routing to DeepSeek
 at the moment it migrated. Migration
-`0035_deepseek_legacy_aliases_do_not_strand_routing_policies.sql` closes that: it repoints every
+`0036_deepseek_legacy_aliases_do_not_strand_routing_policies.sql` closes that: it repoints every
 live policy naming a retired alias onto the current-generation model on the same provider —
 `deepseek-chat` to `deepseek-v4-flash`, `deepseek-reasoner` to `deepseek-v4-pro` — and records
 what it moved off in `routing_policies.metadata -> 'deepseek_v4_repoint'`, so the substitution is

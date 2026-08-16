@@ -1731,6 +1731,171 @@
         ],
         "type": "object"
       },
+      "ClaudeRunnerAuthorizationCodeRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/runners/{id}/authorization-code`.",
+        "properties": {
+          "code": {
+            "description": "The code the operator pasted out of `platform.claude.com`'s hosted redirect.\n\nThis is a single-use OAuth authorization code, not a token, and it is forwarded to the\nrunner service and dropped. It is never stored, never logged and never echoed back.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "ClaudeRunnerFinalizeRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/runners/{id}/finalize`.\n\nThe provider this runner's token becomes a credential for. Required, and deliberately not\ndefaulted: a token minted for a subscription has to be bound to the provider row that will\nexecute against it, and guessing that binding is how a credential ends up on the wrong\nprovider with a correct-looking audit trail.\n\n**There is deliberately no `scope` field here**, and `deny_unknown_fields` means a client that\nsends one is refused loudly rather than having it silently ignored. The scope is fixed at\nprovisioning time and stored on the runner row: it is part of the credential AAD, so a scope\nsupplied here could contradict the one the console has been displaying, and a written\ncredential cannot be re-scoped without re-encrypting it.",
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "provider_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_id"
+        ],
+        "type": "object"
+      },
+      "ClaudeRunnerProvisionRequest": {
+        "additionalProperties": false,
+        "description": "`POST /api/v1/admin/runners`.",
+        "properties": {
+          "label": {
+            "description": "`[a-z0-9-]`, 1..=64 — the charset the runner service accepts, because the value ends up\nin a container name. Validated on this side too rather than relying on the remote\nrefusal, so a bad label is a `422` naming the rule instead of a relayed `400`.",
+            "type": "string"
+          },
+          "metadata": {},
+          "scope": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CredentialScope",
+                "description": "Whose Claude account this runner is for. Absent means [`CredentialScope::Global`] — the\nplatform-wide account, and the behaviour of every deployment that never sets this.\n\nA tenant connecting its own subscription sends\n`{\"type\": \"tenant\", \"external_tenant_id\": \"…\"}`, which is the existing\n[`CredentialScope`] wire shape verbatim rather than a second spelling of it.\n\n**It is fixed here and nowhere else.** The finalize request has no scope field: the\ncredential is sealed under this scope through `credential_aad`, so a scope chosen at\nfinalize time could disagree with the one the console has been displaying since\nprovisioning, and re-scoping a written credential means re-encrypting it."
+              }
+            ]
+          },
+          "ttl_seconds": {
+            "description": "How long the runner may live before the runner service's reaper force-removes it. Bounded\non this side as well: a runner is an interactive login window, and one that outlives the\noperator's attention is a container holding a half-finished OAuth flow.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "type": "object"
+      },
+      "ClaudeRunnerRecord": {
+        "description": "One runner, as the `/api/v1/admin/runners` surface serves it.",
+        "properties": {
+          "authorization_url": {
+            "description": "The public authorization URL the operator opens. `None` until the container's tty stream\nhas rendered it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "credential_id": {
+            "description": "The provider credential this runner's token became. `None` until finalize succeeds.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_code": {
+            "description": "The runner service's own error code, verbatim, so it correlates with that service's logs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "label": {
+            "description": "Operator-facing name, forwarded verbatim to the runner service.",
+            "type": "string"
+          },
+          "metadata": {},
+          "provider_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runner_reference": {
+            "description": "The identifier `moira-runner` minted for this runner. Opaque to Moira, and deliberately\n**not** a Docker container id: the runner service is the only component that knows those,\nand publishing one here would leak the shape of a surface Moira must not be able to\naddress.",
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/CredentialScope",
+            "description": "Whose Claude account this runner is for.\n\n`global` is the platform-wide account and is the default. A tenant that has subscribed its\nown account provisions at `{\"type\": \"tenant\", \"external_tenant_id\": \"…\"}`, and\n`PgRuntimeRepository::resolve_runtime_credential` then prefers that credential over the\nplatform one for that tenant automatically — tenant ranks 7, global ranks 8, and nothing in\nresolution had to change for this.\n\nPublished on every read because an operator has to be able to tell a tenant's runner from\nthe platform's at a glance, and because the value is **not** editable afterwards: it is\npart of the credential AAD, so re-scoping would mean re-encrypting."
+          },
+          "state": {
+            "$ref": "#/components/schemas/ClaudeRunnerState"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "runner_reference",
+          "state",
+          "scope",
+          "metadata",
+          "created_at",
+          "updated_at",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ClaudeRunnerState": {
+        "description": "Where a runner is in its lifecycle.\n\nThe first six are `moira-runner`'s own contract states, mirrored verbatim so an operator\nreading Moira's console and the runner service's logs sees one vocabulary. [`Self::Linked`]\nis Moira-only: it means the token was fetched and stored as a provider credential, which the\nrunner service has no way to know.\n\nThe `ready -> linked` edge is the one that matters for correctness. `GET /v1/runners/{id}/token`\nis **one-shot** — a second call answers `410 token_already_retrieved` — so a row still sitting\nat `Ready` after a finalize attempt is a row whose token was fetched and *not* persisted, and\nwhose runner can never yield it again. That is why finalize writes the row only after the\ncredential exists, and why a failed finalize is reported rather than retried silently.",
+        "enum": [
+          "provisioning",
+          "awaiting_authorization",
+          "exchanging",
+          "ready",
+          "linked",
+          "failed",
+          "expired"
+        ],
+        "type": "string"
+      },
       "ComplexityTier": {
         "description": "Ordinal complexity tier a caller may declare on a request (plans/12 §2 \"Complexity\").\n\nDeliberately a small ordinal rather than a continuous score — continuous complexity scoring\nagainst provider capability is a research problem the owner did not ask for. Inert in this\nMVP-static slice: nothing reads it yet (the deferred scoring consumer is the reader).",
         "enum": [
@@ -4517,6 +4682,106 @@
                 "redirect_uris",
                 "metadata",
                 "status",
+                "created_at",
+                "updated_at",
+                "version"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "data",
+          "pagination"
+        ],
+        "type": "object"
+      },
+      "ListResponse_ClaudeRunnerRecord": {
+        "properties": {
+          "data": {
+            "items": {
+              "description": "One runner, as the `/api/v1/admin/runners` surface serves it.",
+              "properties": {
+                "authorization_url": {
+                  "description": "The public authorization URL the operator opens. `None` until the container's tty stream\nhas rendered it.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "credential_id": {
+                  "description": "The provider credential this runner's token became. `None` until finalize succeeds.",
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "error_code": {
+                  "description": "The runner service's own error code, verbatim, so it correlates with that service's logs.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "expires_at": {
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "label": {
+                  "description": "Operator-facing name, forwarded verbatim to the runner service.",
+                  "type": "string"
+                },
+                "metadata": {},
+                "provider_id": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "runner_reference": {
+                  "description": "The identifier `moira-runner` minted for this runner. Opaque to Moira, and deliberately\n**not** a Docker container id: the runner service is the only component that knows those,\nand publishing one here would leak the shape of a surface Moira must not be able to\naddress.",
+                  "type": "string"
+                },
+                "scope": {
+                  "$ref": "#/components/schemas/CredentialScope",
+                  "description": "Whose Claude account this runner is for.\n\n`global` is the platform-wide account and is the default. A tenant that has subscribed its\nown account provisions at `{\"type\": \"tenant\", \"external_tenant_id\": \"…\"}`, and\n`PgRuntimeRepository::resolve_runtime_credential` then prefers that credential over the\nplatform one for that tenant automatically — tenant ranks 7, global ranks 8, and nothing in\nresolution had to change for this.\n\nPublished on every read because an operator has to be able to tell a tenant's runner from\nthe platform's at a glance, and because the value is **not** editable afterwards: it is\npart of the credential AAD, so re-scoping would mean re-encrypting."
+                },
+                "state": {
+                  "$ref": "#/components/schemas/ClaudeRunnerState"
+                },
+                "updated_at": {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                "version": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "runner_reference",
+                "state",
+                "scope",
+                "metadata",
                 "created_at",
                 "updated_at",
                 "version"
@@ -27968,6 +28233,988 @@
         ]
       }
     },
+    "/api/v1/admin/runners": {
+      "get": {
+        "operationId": "list_runners",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_application_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_slug",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "created_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "provider_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "credential_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/CredentialType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope_type",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ScopeType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "application_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_user_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "external_tenant_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expires_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "actor_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "delegated_subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "result",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/AuditResult"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "occurred_after",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse_ClaudeRunnerRecord"
+                }
+              }
+            },
+            "description": "Paginated runners, answered from Moira's mirror without contacting the runner service",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Query, authentication, or authorization error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      },
+      "post": {
+        "operationId": "provision_runner",
+        "parameters": [
+          {
+            "description": "Optional replay key",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaudeRunnerProvisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaudeRunnerRecord"
+                }
+              }
+            },
+            "description": "Runner provisioned. `scope` fixes whose Claude account this runner is for and cannot be changed afterwards — it is sealed into the resulting credential's AAD. Absent means the platform-wide (`global`) account; a tenant connecting its own subscription sends `{\"type\": \"tenant\", \"external_tenant_id\": \"…\"}`, and credential resolution then prefers that credential over the platform one for that tenant",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "idempotency_conflict, idempotency_in_progress, or duplicate_runner_label",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, or conflict error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_service_disabled, runner_service_unavailable, or runner_service_unauthorized",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      }
+    },
+    "/api/v1/admin/runners/{id}": {
+      "delete": {
+        "operationId": "delete_runner",
+        "parameters": [
+          {
+            "description": "Runner identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required current resource version",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Runner container removed and the mirror row soft-deleted. Any credential the runner produced is deliberately left in place",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_service_unavailable or runner_service_unauthorized",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      },
+      "get": {
+        "operationId": "get_runner",
+        "parameters": [
+          {
+            "description": "Runner identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaudeRunnerRecord"
+                }
+              }
+            },
+            "description": "Runner. A runner that is not yet in a terminal state is refreshed from the runner service first, which is what surfaces authorization_url; that refresh writes, so the ETag advances on a poll",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Authentication, authorization, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_service_unavailable or runner_service_unauthorized",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      }
+    },
+    "/api/v1/admin/runners/{id}/authorization-code": {
+      "post": {
+        "operationId": "submit_runner_authorization_code",
+        "parameters": [
+          {
+            "description": "Runner identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaudeRunnerAuthorizationCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaudeRunnerRecord"
+                }
+              }
+            },
+            "description": "Authorization code forwarded to the runner; the code itself is never stored, logged, or echoed back",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_wrong_state",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_service_disabled, runner_service_unavailable, or runner_service_unauthorized",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      }
+    },
+    "/api/v1/admin/runners/{id}/finalize": {
+      "post": {
+        "operationId": "finalize_runner",
+        "parameters": [
+          {
+            "description": "Runner identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided correlation identifier; generated when absent",
+            "in": "header",
+            "name": "X-Request-Id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClaudeRunnerFinalizeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaudeRunnerRecord"
+                }
+              }
+            },
+            "description": "Token stored as a provider credential at the runner's own stored scope, and the runner linked. The response carries credential_id only — the token itself never leaves the Moira process and is not returned, logged, or traced. The request body has no scope field and one is rejected: the scope is fixed at provisioning time because it is part of the credential's AAD",
+            "headers": {
+              "ETag": {
+                "description": "Current resource version",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_wrong_state or runner_token_unavailable",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request, authentication, authorization, conflict, or not-found error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "runner_service_disabled, runner_service_unavailable, or runner_service_unauthorized",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Infrastructure or internal error",
+            "headers": {
+              "X-Request-Id": {
+                "description": "Request correlation identifier",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "systemKeyAuth": []
+          },
+          {
+            "consumerKeyAuth": []
+          }
+        ],
+        "tags": [
+          "admin-runners"
+        ]
+      }
+    },
     "/api/v1/admin/runtime/diagnose": {
       "post": {
         "operationId": "diagnose_runtime",
@@ -36037,6 +37284,10 @@
     {
       "description": "Derived relationship graph over the agent-platform and provider/model registries",
       "name": "admin-graph"
+    },
+    {
+      "description": "Containerised Claude runner lifecycle. Moira holds no Docker access: every operation here is a server-to-server call into moira-runner, which is the only component that talks to the Docker Engine API",
+      "name": "admin-runners"
     },
     {
       "description": "Runtime policy and diagnostics",

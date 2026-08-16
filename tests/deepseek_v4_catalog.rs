@@ -22,12 +22,12 @@
 //! no Rust code path this migration changes — the migration's own SQL is the entire behavior
 //! under test.
 //!
-//! # `0035`, and why the second half of this file resolves candidates rather than reading rows
+//! # `0036`, and why the second half of this file resolves candidates rather than reading rows
 //!
 //! Issue #256: `0028` retires the legacy aliases and stops there, but `deprecated` is not a label
 //! — `list_model_candidates` joins `provider_models` on `pm.status = 'active'`, so a
 //! `routing_policies` row still naming a retired alias resolves to *nothing* the moment `0028`
-//! commits, and a route with no other policy stops answering. `0035` repoints those policies onto
+//! commits, and a route with no other policy stops answering. `0036` repoints those policies onto
 //! the successor on the same provider.
 //!
 //! The repoint tests therefore assert on what
@@ -45,8 +45,8 @@ use support::TestDatabase;
 use uuid::Uuid;
 
 const MIGRATION_0028: &str = include_str!("../migrations/0028_deepseek_v4_catalog.sql");
-const MIGRATION_0035: &str =
-    include_str!("../migrations/0035_deepseek_legacy_aliases_do_not_strand_routing_policies.sql");
+const MIGRATION_0036: &str =
+    include_str!("../migrations/0036_deepseek_legacy_aliases_do_not_strand_routing_policies.sql");
 
 /// Every `(model_key, status)` pair currently registered for one provider, ordered so the
 /// assertions below are exact rather than set-based.
@@ -107,11 +107,11 @@ async fn apply_migration_0028(db: &TestDatabase) {
         .expect("apply migration 0028 against the fixture database");
 }
 
-async fn apply_migration_0035(db: &TestDatabase) {
-    sqlx::raw_sql(MIGRATION_0035)
+async fn apply_migration_0036(db: &TestDatabase) {
+    sqlx::raw_sql(MIGRATION_0036)
         .execute(&db.pool)
         .await
-        .expect("apply migration 0035 against the fixture database");
+        .expect("apply migration 0036 against the fixture database");
 }
 
 /// A route of its own per case, so one test's policies can never resolve into another's.
@@ -297,7 +297,7 @@ async fn migration_0028_is_a_no_op_with_no_deepseek_provider_configured() {
 
 /// Issue #256 finding 1 — the whole of it, in the order a deployment lives it.
 ///
-/// The middle assertion is the finding: after `0028` and before `0035`, both routes resolve to
+/// The middle assertion is the finding: after `0028` and before `0036`, both routes resolve to
 /// **nothing**. Not to a deprecated model, not to a degraded one — the candidate list is empty
 /// and the route stops answering, from a migration, with the policy row still sitting there
 /// looking correct.
@@ -332,21 +332,21 @@ async fn a_route_pointed_at_a_legacy_alias_stops_resolving_under_0028_and_0035_r
             && resolvable_model_keys(&db, reasoner_route).await.is_empty(),
         "0028 alone leaves both routes resolving to nothing: every candidate query filters \
          pm.status = 'active', so deprecating the alias removes the only candidate the policy \
-         had. This is the break 0035 exists to prevent"
+         had. This is the break 0036 exists to prevent"
     );
 
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
 
     assert_eq!(
         resolvable_model_keys(&db, chat_route).await,
         vec!["deepseek-v4-flash".to_string()],
-        "0035 must repoint a deepseek-chat policy onto the general-chat successor on the same \
+        "0036 must repoint a deepseek-chat policy onto the general-chat successor on the same \
          provider"
     );
     assert_eq!(
         resolvable_model_keys(&db, reasoner_route).await,
         vec!["deepseek-v4-pro".to_string()],
-        "0035 must repoint a deepseek-reasoner policy onto the reasoning-tier successor"
+        "0036 must repoint a deepseek-reasoner policy onto the reasoning-tier successor"
     );
 
     let (repointed_model, version, metadata) = policy_row(&db, chat_policy).await;
@@ -364,7 +364,7 @@ async fn a_route_pointed_at_a_legacy_alias_stops_resolving_under_0028_and_0035_r
             .pointer("/deepseek_v4_repoint/from_model_key")
             .and_then(Value::as_str),
         Some("deepseek-chat"),
-        "the substitution must be recorded on the row it changed — 0035 picks which successor \
+        "the substitution must be recorded on the row it changed — 0036 picks which successor \
          replaces which alias, and an operator who disagrees can only reverse it if the migration \
          says what it moved off"
     );
@@ -412,7 +412,7 @@ async fn a_scope_that_already_names_the_successor_is_not_given_a_duplicate_candi
     )
     .await;
 
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
 
     assert_eq!(
         resolvable_model_keys(&db, route).await,
@@ -458,7 +458,7 @@ async fn a_soft_deleted_policy_is_left_alone_and_a_disabled_one_is_repointed() {
         .expect("soft-delete a routing policy");
 
     apply_migration_0028(&db).await;
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
 
     let (disabled_model, _, _) = policy_row(&db, disabled).await;
     assert_eq!(
@@ -478,7 +478,7 @@ async fn a_soft_deleted_policy_is_left_alone_and_a_disabled_one_is_repointed() {
 
 /// Idempotence, and the no-deepseek-provider case in the same run.
 ///
-/// The version column is the sharp end: `0035` is an UPDATE behind a NOTIFY and a version-bump
+/// The version column is the sharp end: `0036` is an UPDATE behind a NOTIFY and a version-bump
 /// trigger, so a second pass that matched even one row would show up as a bump and as a spurious
 /// cross-replica cache invalidation.
 #[tokio::test]
@@ -488,7 +488,7 @@ async fn reapplying_migration_0035_matches_nothing_the_second_time() {
     };
 
     // A provider that is not DeepSeek, with a model deliberately named after a retired alias.
-    // Every statement in 0035 is scoped to `providers.provider_type = 'deepseek'`, and the model
+    // Every statement in 0036 is scoped to `providers.provider_type = 'deepseek'`, and the model
     // key alone must not be enough to drag a row in.
     let other_provider = Uuid::now_v7();
     sqlx::query(
@@ -512,12 +512,12 @@ async fn reapplying_migration_0035_matches_nothing_the_second_time() {
     let other_route = seed_route(&db).await;
     let other_policy = seed_policy(&db, other_route, other_provider, other_model, "active").await;
 
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
 
     assert_eq!(
         policy_row(&db, other_policy).await,
         (other_model, 1, serde_json::json!({})),
-        "0035 is scoped to deepseek providers; a same-named model on another provider is not its \
+        "0036 is scoped to deepseek providers; a same-named model on another provider is not its \
          business, and a fresh install with no deepseek provider must see no writes at all"
     );
 
@@ -534,10 +534,10 @@ async fn reapplying_migration_0035_matches_nothing_the_second_time() {
     .await;
 
     apply_migration_0028(&db).await;
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
     let first_pass = policy_row(&db, policy).await;
 
-    apply_migration_0035(&db).await;
+    apply_migration_0036(&db).await;
     let second_pass = policy_row(&db, policy).await;
 
     assert_eq!(
