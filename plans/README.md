@@ -41,6 +41,7 @@ one by inferring approval from silence. Deferred hardening lives in [`../TODO.md
 | File | Purpose |
 |------|---------|
 | [`CONVENTIONS.md`](./CONVENTIONS.md) | **Binding cross-cutting rules — read first.** One-branch-one-PR per plan, mandatory unit **+** e2e tests, i18n key + English default, frontend toolchain pins (Next.js 16.2.11 / Node 24 LTS / Bun 1.3.14), Atomic Design layering, and the auth architecture (Better Auth BFF + Moira-owned authorization, config DB-backed). **Where a plan conflicts with this file, this file wins.** |
+| [`NEXT.md`](./NEXT.md) | **The current work queue.** What is open and in what order, what is deliberately blocked on a human decision, and the housekeeping state — branches, worktrees, the test floor — that is expensive to rediscover. Start here when you have no assigned task. Reconciled against GitHub rather than remembered; delete entries that ship rather than ticking them. |
 | [`00-audit-report.md`](./00-audit-report.md) | Severity-ranked findings (P0–P3) with file:line evidence, MVP boundary, `docs/todo.md` reconciliation, positive findings. |
 | [`01-roadmap-and-dependencies.md`](./01-roadmap-and-dependencies.md) | Ordering principles, Mermaid dependency graph, and the full Next.js / identity architecture decision. |
 | [`02a-mvp-boundary-honesty.md`](./02a-mvp-boundary-honesty.md) | **MVP gate (P0).** Make the API honest: relabel no-op RAG/memory endpoints, document the preview boundary. No migrations — ships first and fast. Closes P0-1, P0-3. |
