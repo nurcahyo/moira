@@ -367,6 +367,14 @@ the agent author". Resolution runs once per execution, before any provider is ch
    `skill_execution.maximum_tool_turns` model calls. Each turn's tool calls become one assistant
    message plus exactly one user message carrying every tool result, in call order — the shape
    providers require for parallel calls.
+4. **The last permitted turn never dispatches.** A tool result only means something if a further
+   model call reads it, and on turn `maximum_tool_turns` there is none — so a tool call there ends
+   the attempt as `deadline_exceeded` without issuing the request, rather than mutating an
+   operator's third-party API for a result that is discarded. With the default budget of `4`, a
+   model that only ever calls tools makes 4 completions and 3 dispatches.
+5. **The attempt's reported usage is the sum of every turn**, not the last one's, on success and
+   on failure alike. `usage_records` rows are per attempt, and a tool-bearing attempt is several
+   billed completions whose later turns are the expensive ones.
 
 ### What a call does
 

@@ -245,7 +245,27 @@ tl_count_skips() {
 # 31963437261 on that same base commit printed `tests passed: 1758 (source declares 1752)`, and
 # this branch measured 1761/1755 locally — the same +3 on both halves, so the local number and
 # the sharded union are still the same number and 1761 is the right floor for both.
-TL_TEST_COUNT_MINIMUM=1761
+#
+# Re-measured 2026-08-17 on `fix/rig-tool-loop-memory-252`, based on `develop` at 754ef83 (which
+# already carries the branch measured directly above): **1762** passed, source declaring 1756, by
+# `scripts/gates.sh` with Postgres and Redis up and zero skip lines. This branch adds exactly 1
+# test, `a_successful_loop_meters_every_turn_not_only_the_one_that_answered` in
+# `tests/skill_tool_loop.rs`, and both halves moved by 1 — so the base was carrying neither
+# surplus nor deficit this time, the first measurement in this file where that is true. The +6
+# doctest offset holds for the ninth consecutive measurement.
+#
+# The number is READ OFF THE RUN, not 1761+1. Those happen to agree here, and that agreement is
+# the check rather than the derivation: an arithmetic floor cannot notice a test that was
+# silently lost while another was added, which is precisely the accident the paragraph above
+# describes twice.
+#
+# The first run of that gate went red on
+# `security::api_keys::tests::an_unrelated_future_keeps_running_while_verifications_are_in_flight`
+# — a timing assertion (119 timer fires against a required 139) taken while the machine sat at
+# load average 24 under Spotlight indexing. It passes alone and passed in the re-run below load
+# 8; no count was read from the red run. Recorded here because a measurement taken under
+# contention is the documented way this repository has published wrong numbers before.
+TL_TEST_COUNT_MINIMUM=1762
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
