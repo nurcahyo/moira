@@ -302,7 +302,7 @@ async fn migration_0028_is_a_no_op_with_no_deepseek_provider_configured() {
 /// and the route stops answering, from a migration, with the policy row still sitting there
 /// looking correct.
 #[tokio::test]
-async fn a_route_pointed_at_a_legacy_alias_stops_resolving_under_0028_and_0035_repoints_it() {
+async fn a_route_pointed_at_a_legacy_alias_stops_resolving_under_0028_and_0036_repoints_it() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
@@ -482,7 +482,7 @@ async fn a_soft_deleted_policy_is_left_alone_and_a_disabled_one_is_repointed() {
 /// trigger, so a second pass that matched even one row would show up as a bump and as a spurious
 /// cross-replica cache invalidation.
 #[tokio::test]
-async fn reapplying_migration_0035_matches_nothing_the_second_time() {
+async fn reapplying_migration_0036_matches_nothing_the_second_time() {
     let Some(db) = TestDatabase::create().await else {
         return;
     };
