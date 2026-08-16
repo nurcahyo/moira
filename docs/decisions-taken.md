@@ -375,6 +375,7 @@ listed here so a reader who starts at this file can find them.
 |---|---|---|---|
 | Envelope encryption at rest for the five `*_encrypted` content columns — key custody behind a pluggable trait, environment-backed first (F33, issue [#86](https://github.com/nurcahyo/moira/issues/86)) | [`decision-encryption-at-rest.md`](./decision-encryption-at-rest.md) | Maintainer, 2026-08-06 | Decided; implementation issued as #134–#142 |
 | `moira-runner`'s `image` config accepts a bare local `sha256:<64 hex>` image ID as content-pinned, not only a `name@sha256:...` registry digest (issue [#272](https://github.com/nurcahyo/moira/issues/272), R4) | §8 below | Owner delegate, mid-session correction to R1, 2026-08-16 | Decided; contract relaxed before R4 raised it independently |
+| Subscription-backed Claude access is an explicit, default-off opt-in, and a subscription-backed credential is **refused** — not warned about — when it would serve traffic outside its declared scope (issue [#307](https://github.com/nurcahyo/moira/issues/307)) | §9 below, and [`claude-subscription-boundary.md`](./claude-subscription-boundary.md) | Owner, 2026-08-17 | Decided; documentation landed, implementation not yet built |
 
 The other established home for maintainer decisions is
 [`plans/CONVENTIONS.md` §0](../plans/CONVENTIONS.md) — "product-owner decisions (RESOLVED — do not
@@ -424,3 +425,65 @@ be pushed to a registry reachable from that host and referenced by its real `nam
 registry digest instead, and `moira-runner`'s validation would need to require that form specifically
 in that deployment mode. `docs/claude-runners.md` should be updated to say so explicitly if or when
 that topology is built.
+
+---
+
+## 9. Subscription-backed Claude access is an explicit opt-in, and never crosses a scope boundary
+
+**Question.** Moira can be pointed at a Claude **subscription** — through the containerised
+runners (issues [#272](https://github.com/nurcahyo/moira/issues/272)–#275, #285, #289) or the
+local sidecar shape — or at an ordinary Anthropic **API key**. Anthropic's published terms treat
+subscription OAuth authentication as being for *ordinary individual use* of Claude Code and the
+other native Claude apps, and direct developers *building products or services* to API-key
+authentication through the Console. Moira is a router other people deploy and point at other
+people's traffic. What should the software do about that: nothing, warn, or refuse?
+
+**Decided.** Warn almost everywhere, and refuse in exactly one place — when a subscription-backed
+credential would serve traffic outside the scope it was declared for. The full statement, written
+for operators rather than for this table, is
+[`claude-subscription-boundary.md`](./claude-subscription-boundary.md); the implementation is
+specified in issue [#307](https://github.com/nurcahyo/moira/issues/307) and is **not yet built**.
+
+The shape mirrors the ChatGPT gate this repository already ships (issue #216:
+`provider_security.allow_chatgpt_subscription`, `require_chatgpt_subscription_opt_in`,
+`chatgpt_subscription_opt_in_required`) rather than inventing a second mechanism — including the
+part where the flag is deliberately **not** rejected in production, because refusing it there
+would not make the underlying question go away, only hide who made the call.
+
+**Reasoning, and the one inference this closes.** The rule is about **who is using it and for
+what**, not about which process issues the HTTP call. Both subscription paths here wrap the
+*official* `claude` CLI, which is what keeps them honest about authentication — no impersonated
+client id, no forged fingerprint headers. It does not follow that subscription-backed serving is
+therefore fine: wrapping the official CLI changes the mechanism, not the purpose. A reader who
+sees "we route through the official CLI" and concludes "so multi-tenant subscription-backed
+serving is allowed" has drawn the wrong inference, and every artifact this decision produced
+closes that door explicitly.
+
+Net rule: **a subscription is never a safety net for anyone but its owner.**
+
+**Evidence — the current behaviour this is decided against.**
+
+- `PgRuntimeRepository::resolve_runtime_credential` (`src/infra/repositories/runtime.rs`, the
+  `order by case … end` block) admits `user`-, `application`-, `tenant`- and `global`-scoped rows
+  into one candidate set and ranks `tenant` at 7 above `global` at 8. Tenant outranks global, but
+  global is **not excluded** — it is the last resort and wins whenever no narrower row survives.
+- The same query filters on `status = 'active'`, `deleted_at is null` and
+  `(expires_at is null or expires_at > now())`, so a tenant credential that expired or was revoked
+  drops out of the candidate set and the platform's `global` row is selected in its place,
+  **silently**. That is the fallback the decision forbids.
+- `ClaudeRunnerRecord::scope` (`src/domain/runners.rs`) defaults a new runner to `global`, and
+  `ClaudeRunnerService`'s finalize (`src/application/runners.rs`) stores the minted subscription
+  token as an ordinary `oauth2` credential at that scope. Nothing in resolution distinguishes it
+  from an API key.
+
+**The policy ground is unsettled, and that is recorded rather than resolved.** On **2026-02-19**
+Anthropic's compliance documentation required API-key auth for the Agent SDK; on **2026-06-15**
+Anthropic **paused** that change, leaving `claude -p` and third-party app usage still drawing on
+subscription limits. Neither point is permission. "Paused" is not "reversed".
+
+**Reversal condition.** If Anthropic publishes a carve-out for third-party or multi-tenant use of
+subscription authentication — or a registration process for third-party OAuth clients — the
+refusal in the scope rule becomes re-litigable and the warnings become informational. Until then
+the default stays off and the scope refusal stays hard. A change in the *mechanism* (a new SDK, a
+different transport, a supported proxy) is **not** a reversal condition, because the mechanism was
+never what the rule turned on.

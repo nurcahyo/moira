@@ -22,6 +22,23 @@ sidecar proxy) and the policy-volatility risk that applies to both;
 `plans/12-feature-expansion-brainstorm.md` §1 is where the two were compared and
 decision 1 was recorded.
 
+## Before you provision anything: subscription is not the same as API key
+
+Anthropic's terms treat subscription OAuth authentication as being for **ordinary
+individual use** of Claude Code and the other native Claude apps, and direct developers
+**building products or services** to API-key authentication through the Console. The line
+is about *who is using it and for what*, not about *which process issues the HTTP call*.
+This document describes a container that runs the **official** `claude` CLI — and that
+changes the mechanism, not the purpose. If you read "it runs the real CLI" and concluded
+"so serving my customers from a subscription is fine", that is the wrong inference: a
+subscription is never a safety net for anyone but its owner. Running Moira against your
+own subscription for your own work is what these runners are for; serving other people's
+traffic from one needs an API key.
+
+Read [`claude-subscription-boundary.md`](claude-subscription-boundary.md) before turning
+this on. It is the canonical statement, including the two dated policy points that make
+the position genuinely unsettled rather than settled in either direction.
+
 ## What this is, and what it is not
 
 `moira-runner` is a small, separate service that talks to the Docker Engine API on
@@ -301,7 +318,19 @@ other credential surface:
 
 Anthropic's policy on subscription-token reuse by non-Claude-Code clients has
 reversed multiple times within a single year (see
-`plans/12-feature-expansion-brainstorm.md` §1, "R1 — policy volatility"). Nothing
-about this container mechanism changes that risk; it only solves the tty problem.
+`plans/12-feature-expansion-brainstorm.md` §1, "R1 — policy volatility", and the two
+dated points in [`claude-subscription-boundary.md`](claude-subscription-boundary.md)).
+Nothing about this container mechanism changes that risk; it only solves the tty problem.
 Treat any subscription-backed credential this produces as one candidate in a
 routing policy, never the only configured route to a model family.
+
+**A runner's scope is a declaration, and today nothing enforces it.** A runner provisioned
+at the default `global` scope mints a credential for the *platform-wide* account, and
+credential resolution will hand that credential to **any** tenant that has none of its own
+— it ranks `tenant` above `global`, but `global` is the last resort, not excluded. That is
+an operator's personal subscription answering someone else's customers, which is the one
+case [`claude-subscription-boundary.md`](claude-subscription-boundary.md) says should be a
+hard refusal rather than a warning. The refusal is specified in
+[#307](https://github.com/nurcahyo/moira/issues/307) and is **not implemented yet**. Until
+it is, provision a subscription-backed runner at `global` scope only for a deployment whose
+traffic is your own.
