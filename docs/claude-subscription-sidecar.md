@@ -13,6 +13,30 @@ Moira at it, and how to smoke-test the whole chain with a real subscription
 session on your own machine. It is deliberately **not** a claim that this ships
 a production integration — see "What this does and does not prove" below.
 
+## Before anything else: subscription is not the same as API key
+
+The sidecar is an **external tool**, not part of this repository, and this document is a
+runbook for pointing Moira at one — not an endorsement of every use you could put it to.
+
+Anthropic's terms treat subscription OAuth authentication as being for **ordinary
+individual use** of Claude Code and the other native Claude apps, and direct developers
+**building products or services** to API-key authentication through the Console. The line
+is about *who is using it and for what*, not about *which process issues the HTTP call*.
+The sidecar fronts the **official** CLI's own authenticated session — that changes the
+mechanism, not the purpose. Putting an OpenAI-compatible HTTP surface in front of a
+personal subscription does not turn it into a product entitlement, and a reader who sees
+"the real CLI is doing the talking" and concludes "so multi-tenant subscription-backed
+serving is fine" has drawn exactly the wrong inference.
+
+**A subscription is never a safety net for anyone but its owner.** Your own subscription,
+your own prompts, your own work — that is what this runbook is for. Serving other people's
+traffic needs an API key: metered, sold for this, and with no policy question attached.
+
+[`claude-subscription-boundary.md`](claude-subscription-boundary.md) is the canonical
+statement, including the two dated policy points that leave the position genuinely
+unsettled, and the scope refusal specified in
+[#307](https://github.com/nurcahyo/moira/issues/307) that is not implemented yet.
+
 ## Why a sidecar and not a raw token against the API
 
 Read `plans/12-feature-expansion-brainstorm.md` §1 in full before changing
@@ -310,6 +334,9 @@ readiness signal.
 
 ## Related reading
 
+- [`claude-subscription-boundary.md`](claude-subscription-boundary.md) — **read this
+  first.** Subscription versus API key, why wrapping the official CLI does not change the
+  answer, and the scope rule a subscription-backed credential must obey.
 - `plans/12-feature-expansion-brainstorm.md` §1 — the decision record this
   document implements.
 - [`claude-runners.md`](claude-runners.md) — the containerised-runner path

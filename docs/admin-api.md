@@ -110,6 +110,17 @@ Honest limit, repeated from issue #272: **N containers on ONE Claude account is 
 Rate limits attach to the account. Multi-instance is legitimate only when each instance is a
 distinct account or seat you actually hold.
 
+**What finalize stores is a subscription credential, not an API key.** Anthropic's terms treat
+subscription OAuth authentication as being for ordinary individual use of Claude Code and the
+other native Claude apps, and direct developers building products or services to API-key
+authentication. These endpoints drive the **official** `claude` CLI inside a container, which
+changes the mechanism, not the purpose — a subscription is never a safety net for anyone but its
+owner. Note in particular that a runner provisioned at the default `global` scope produces a
+credential that credential resolution will hand to any tenant with none of its own. Read
+[`claude-subscription-boundary.md`](claude-subscription-boundary.md); the refusal that closes
+that gap is specified in [#307](https://github.com/nurcahyo/moira/issues/307) and is not built
+yet.
+
 Setup readiness is a read-only structural check. It reports coarse component states and whether
 the default route has an executable application, provider, model, policy, and compatible global
 or application credential. It does not decrypt credentials, contact providers, or return resource

@@ -201,6 +201,15 @@ This spike does not change the ToS analysis in plan §1, and does not soften it:
   plan §1 already documents), personal/single-user. There is no ChatGPT-specific carve-out analogous
   to Anthropic's mid-2026 reinstatement of third-party agent usage "through the Agent SDK" (plan §1's
   Claude Option B). No equivalent sanctioned route has been identified for ChatGPT subscriptions.
+
+  **Correction, 2026-08-17:** the Anthropic side of that comparison was read too generously here,
+  and the comparison should not be taken as "Claude has a carve-out and ChatGPT does not". Anthropic
+  requires API-key authentication for developers *building products or services*; on **2026-02-19**
+  its compliance documentation required API-key auth for the Agent SDK, and on **2026-06-15** it
+  **paused** that change rather than reversing it. Neither point is permission for third-party
+  multi-tenant use, and routing through the Agent SDK or the official CLI changes the mechanism, not
+  the purpose. See [`claude-subscription-boundary.md`](claude-subscription-boundary.md); the two
+  subscription families are closer in posture than this bullet originally implied.
 - The existence of a first-party rig-core client does not change this. If anything, it sharpens the
   risk: a clean, well-tested `CompletionModel` impl makes it *easy* to wire a single operator's
   ChatGPT subscription behind `RuntimeFactory` and have it silently serve every application/tenant

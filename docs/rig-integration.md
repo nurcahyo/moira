@@ -20,7 +20,12 @@ Supported in Phase 3:
 - `openai`: Rig OpenAI chat completions client
 - `openai_compatible`: Rig OpenAI chat completions client with normalized `/v1` base URL
 - `local`: same as `openai_compatible`, intended for explicitly allowed local development providers
-- `anthropic`: Rig Anthropic completion model
+- `anthropic`: Rig Anthropic completion model. Accepts an `api_key` credential today. An
+  `oauth2` credential on this provider type — the shape the containerised runners
+  (`docs/claude-runners.md`) and the sidecar path mint — is **subscription-backed**, and
+  subscription access carries the individual-use boundary that API keys do not: see
+  `docs/claude-subscription-boundary.md`. There is no opt-in gate for it yet, unlike
+  `chatgpt_oauth` below ([#307](https://github.com/nurcahyo/moira/issues/307)).
 - `gemini`: Rig Gemini completion model
 - `deepseek`: Rig DeepSeek completion model
 - `azure_openai`: Rig Azure OpenAI completion model

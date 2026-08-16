@@ -6,7 +6,8 @@ questions in order: **what must I read**, **what is actually open**, and **what 
 Keep it current. An entry that has shipped is deleted, not ticked; a stale queue is worse than no
 queue because it is read as authoritative.
 
-Last reconciled against GitHub: **2026-08-17**, after #300, #301 and #302, with #303 in flight.
+Last reconciled against GitHub: **2026-08-17**, after #300, #301, #302 and #304, with #303 in
+flight and #307 newly filed (docs landed, code not started).
 
 Two agents are active. **§3 records who holds what** — read it before claiming anything, and update
 it in the same commit as your claim.
@@ -86,7 +87,26 @@ the commit from commit messages, so a closing keyword only in the PR body is los
 Take one area per branch. Do not batch across areas; the review found that mixed branches make the
 "which fix did this" question unanswerable at review time.
 
-### 4.2 Flaky test — #236
+### 4.2 Claude subscription boundary — #307
+
+The decision is recorded and the documentation has landed; **the code has not**. `docs/claude-
+subscription-boundary.md` is the canonical statement and `docs/decisions-taken.md` §9 is the
+decision record. Issue #307 specifies the implementation, which mirrors the existing ChatGPT
+opt-in gate rather than inventing a mechanism.
+
+The load-bearing part is not the flag, it is the **composition rule**: a `global`-scoped
+subscription-backed credential must be *refused* for a tenant-scoped request, not silently used.
+That is reachable today — `PgRuntimeRepository::resolve_runtime_credential` ranks `tenant` above
+`global` but does not exclude `global`, and a tenant credential that expired or was revoked drops
+out of the candidate set entirely, so the platform's row wins by default. Everything else in #307
+is a warning; that one is a refusal.
+
+Touches `src/config/settings.rs` (**overlaps Antigravity's #252 and #251**), plus
+`src/orchestration/runtime_factory.rs`, `src/infra/repositories/runtime.rs`,
+`src/application/{admin/providers,runners}.rs`, `src/domain/{admin,runners}.rs`,
+`src/i18n/catalog/errors.rs`. **Do not start while #252 is open.**
+
+### 4.3 Flaky test — #236
 
 `a_hundred_concurrent_unknown_key_opens_cost_exactly_one_database_load` reds `rust-shard (2)` on
 unrelated commits. A flaky test in a required check trains everyone to re-run CI without reading
@@ -95,7 +115,7 @@ it, which is how a real failure gets merged.
 Touches `src/domain/message.rs` and `src/security/data_keys.rs` — **no overlap with anything
 claimed above**, so it is the safest code task to pick up while #252 is in flight.
 
-### 4.3 Held on a human decision — do not start these
+### 4.4 Held on a human decision — do not start these
 
 - **#71** — the `/setup` wizard branch. The harness blocked autonomous merge three times. Surface
   it; do not retry.

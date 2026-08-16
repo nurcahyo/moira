@@ -2,6 +2,11 @@
 # Build the moira-claude-runner image (issue #272, R4) and print the image ID
 # moira-runner's config needs — see docs/claude-runners.md.
 #
+# Every container from this image mints a Claude SUBSCRIPTION credential, not an
+# API key. Read docs/claude-subscription-boundary.md before provisioning one for
+# anything but your own individual use — in particular the part about N
+# containers on one account not being N× capacity.
+#
 # **Why an image ID and not a tag.** moira-runner's control contract requires
 # the container it creates to come from a content-pinned reference, not a
 # mutable tag: a tag like `moira-claude-runner:latest` can point at a different

@@ -8,6 +8,12 @@
 # record ("Testing policy for this workstream") that authorizes running this
 # against a real subscription session on a human's own machine.
 #
+# A sidecar fronts a SUBSCRIPTION, not an API key. Anthropic's terms treat
+# subscription auth as being for ordinary individual use of Claude Code and the
+# other native Claude apps; building a product or service on it is directed to
+# API-key auth. Fronting the official CLI with an HTTP surface changes the
+# mechanism, not the purpose. See docs/claude-subscription-boundary.md.
+#
 # What this does, in two independent stages:
 #
 #   1. ALWAYS: smoke-test a running sidecar directly — GET /v1/models, then a

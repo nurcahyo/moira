@@ -75,6 +75,8 @@ about wherever the response points next.
 
 Creating a `chatgpt_oauth` provider (issue #216) additionally requires `provider_security.allow_chatgpt_subscription = true`. It is off by default in every environment, including production: ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms, and wiring one into a multi-tenant gateway is a deployment operator's own explicit ToS risk acceptance, never a silent default. Without the opt-in, `POST /api/v1/admin/providers` refuses the request with `403 chatgpt_subscription_opt_in_required`; the same gate is re-checked at execution time as defense in depth. See `docs/chatgpt-subscription-spike.md` and `docs/rig-integration.md`.
 
+**The same distinction applies to Claude, and there is no equivalent gate yet.** An `anthropic` provider carrying an `oauth2` credential — the shape the containerised runners and the sidecar path produce — is subscription-backed, and Anthropic's terms treat subscription OAuth authentication as being for ordinary individual use of Claude Code and the other native Claude apps, with developers building products or services directed to API-key authentication. Routing through the official `claude` CLI changes the mechanism, not the purpose. Today nothing in provider creation or in credential resolution knows the difference, so a `global`-scoped subscription credential will silently answer a tenant's request. `docs/claude-subscription-boundary.md` is the canonical statement; the opt-in gate and the scope refusal that would mirror the ChatGPT one are specified in [#307](https://github.com/nurcahyo/moira/issues/307) and are not built yet.
+
 Required scopes:
 
 - Providers read/write/delete: `moira:providers:*`
