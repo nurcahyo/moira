@@ -324,6 +324,13 @@ impl WorkerRegistry {
         ));
         maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // A second handle on the same channel, read as a plain predicate between
+        // jobs inside a poll. The `shutdown.changed()` arm below holds `shutdown`
+        // mutably for the life of the `select!`, and racing the poll against that
+        // arm would cancel a job mid-handler; this observes the same signal
+        // without cancelling anything. See `WorkerQueue::run_once_until`.
+        let stop_signal = shutdown.clone();
+
         info!(
             max_concurrent_jobs = self.settings.max_concurrent_jobs,
             retention_configured,
@@ -360,7 +367,7 @@ impl WorkerRegistry {
                 }
                 _ = queue_interval.tick(), if queue.is_some() => {
                     let Some(queue) = queue.as_ref() else { continue };
-                    Self::run_queue_poll(queue, &dispatcher, &state).await;
+                    Self::run_queue_poll(queue, &dispatcher, &state, &stop_signal).await;
                 }
                 _ = maintenance_interval.tick(), if queue.is_some() => {
                     let Some(queue) = queue.as_ref() else { continue };
@@ -382,18 +389,31 @@ impl WorkerRegistry {
     /// does not: a failing poll must not take the supervisor — and with it every
     /// other worker — down. The next tick retries, and a job left `running` by a
     /// failure here is reclaimed by the stale-claim sweep.
+    ///
+    /// `stop_signal` is read between jobs, so a shutdown asked for while the poll
+    /// is inside a handler is observed after that handler, rather than after the
+    /// whole batch. Without it the `shutdown.changed()` arm of the supervisor's
+    /// `select!` cannot fire at all while a poll is running — nor can the metrics
+    /// tick, the retention sweep or the maintenance enqueue — because the poll is
+    /// awaited inline inside one of the arms.
     async fn run_queue_poll(
         queue: &queue::WorkerQueue,
         dispatcher: &dyn queue::JobDispatcher,
         state: &AppState,
+        stop_signal: &watch::Receiver<bool>,
     ) {
-        match queue.run_once(dispatcher, &state.metrics).await {
+        let stop = || *stop_signal.borrow();
+        match queue
+            .run_once_until(dispatcher, &state.metrics, &stop)
+            .await
+        {
             Ok(outcome) if outcome.claimed > 0 || outcome.reclaimed > 0 => info!(
                 reclaimed = outcome.reclaimed,
                 claimed = outcome.claimed,
                 completed = outcome.completed,
                 rescheduled = outcome.rescheduled,
                 dead_lettered = outcome.dead_lettered,
+                undispatched = outcome.undispatched,
                 pruned = outcome.pruned,
                 "worker queue poll settled"
             ),

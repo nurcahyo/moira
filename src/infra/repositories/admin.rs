@@ -434,6 +434,11 @@ pub trait AdminRepository {
     /// edit) — a benign, expected race under `WorkerSettings::maintenance_enqueue_interval_seconds`'s
     /// non-leader-gated enqueue, not an error; the caller logs it and moves to the next due
     /// credential rather than retrying this one.
+    ///
+    /// `new_expires_at` is **assigned**, not merged: `None` means the token endpoint returned
+    /// no `expires_in` (permitted by RFC 6749 §5.1), and the honest record of that is a null
+    /// `expires_at` — the state `is_due_for_refresh` treats as never due — not the expiry of
+    /// the token this call is replacing. See the SQL for what keeping the old value cost.
     async fn apply_oauth_refresh(
         &self,
         id: Uuid,
@@ -2482,7 +2487,22 @@ impl AdminRepository for PgAdminRepository {
                 nonce = $7,
                 secret_fingerprint = $8,
                 masked_secret = $9,
-                expires_at = coalesce($10, expires_at),
+                -- Assigned, never `coalesce($10, expires_at)`. `$10` is the expiry of the
+                -- token this statement is storing, so keeping the old value when the new one
+                -- is null does not "leave it unchanged", it attributes the *replaced* token's
+                -- expiry to its replacement. RFC 6749 §5.1 makes `expires_in` optional, and a
+                -- provider that omits it left the row permanently matching
+                -- `list_oauth_credentials_due_for_refresh`'s `expires_at < threshold`: the
+                -- same credential came back every maintenance cycle, was re-exchanged every
+                -- 60s, and — against an IdP that rotates refresh tokens — had its chain
+                -- rotated every 60s until the IdP invalidated it, all while recording a
+                -- `moira_oauth_refresh_total` success each time. Null is the honest value for
+                -- "this provider did not say", and `is_due_for_refresh` already treats null as
+                -- never due. It also matches what the encrypted payload records for the same
+                -- token (`CredentialSecret::OAuth2 { expires_at, .. }` in
+                -- `src/infra/workers/oauth_refresh.rs`), which `coalesce` silently contradicted.
+                -- Issue #251 finding 6.
+                expires_at = $10,
                 last_validated_at = now(),
                 status = 'active',
                 updated_at = now()

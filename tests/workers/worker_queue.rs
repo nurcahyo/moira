@@ -4,7 +4,10 @@
 //! Postgres-backed by design — plan 10 §0.4b — so a deployment that never enables
 //! Redis gets all of this, and these tests are the proof.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -459,5 +462,279 @@ async fn enqueueing_an_undeclared_job_name_is_refused() {
             .enqueue("not-a-declared-job", json!({}), None, &metrics())
             .await
             .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The two bounds on the dispatch loop, and panic isolation — issue #251 findings 4 and 5.
+//
+// Before #244 none of this was reachable: `StubJobDispatcher` is a name check and a log
+// line, so it can neither hang nor panic. #247 put reqwest, sqlx and arbitrary handler
+// bodies inside that same unprotected, unbounded, sequential await.
+// ---------------------------------------------------------------------------------------
+
+/// A dispatcher that never returns, standing in for `oauth-token-refresh` walking its
+/// 100-credential batch against an identity provider that accepts connections and then
+/// says nothing.
+struct NeverReturns {
+    entered: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl JobDispatcher for NeverReturns {
+    async fn dispatch(&self, _job: &ClaimedJob) -> Result<(), String> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        // Far beyond any budget in this file, so a pass can only come from the timeout.
+        tokio::time::sleep(std::time::Duration::from_secs(3_600)).await;
+        Ok(())
+    }
+}
+
+/// Panics on the first job it is handed and succeeds on every one after, so a single test
+/// can assert both that the panic became a failed attempt and that the poll survived it.
+struct PanicsOnce {
+    seen: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl JobDispatcher for PanicsOnce {
+    async fn dispatch(&self, _job: &ClaimedJob) -> Result<(), String> {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("a deliberate handler panic");
+        }
+        Ok(())
+    }
+}
+
+/// Completes every job, and raises a flag once it has handled `stop_after` of them, so the
+/// caller's stop predicate flips part-way through a batch with no timing involved.
+struct StopsItselfAfter {
+    handled: Arc<AtomicUsize>,
+    stop_after: usize,
+    stop: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl JobDispatcher for StopsItselfAfter {
+    async fn dispatch(&self, _job: &ClaimedJob) -> Result<(), String> {
+        if self.handled.fetch_add(1, Ordering::SeqCst) + 1 >= self.stop_after {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+async fn last_error_of(pool: &PgPool, id: Uuid) -> Option<String> {
+    sqlx::query("select last_error from worker_jobs where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read the job row")
+        .get("last_error")
+}
+
+/// The per-job half of finding 4: a handler that hangs is recorded as a failed attempt and
+/// retried, instead of holding the claim until another replica reclaims the row and runs the
+/// same job a second time.
+#[tokio::test]
+async fn a_handler_that_hangs_is_failed_at_its_per_job_timeout_and_retried() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let job_id = insert_job(&pool, 5).await;
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let outcome = queue(
+        &pool,
+        WorkerSettings {
+            queue_job_timeout_seconds: 1,
+            // Far above the per-job timeout, so the *per-job* bound is what this test
+            // pins — the batch bound below has its own test.
+            queue_stale_claim_seconds: 3_600,
+            ..settings()
+        },
+    )
+    .run_once(
+        &NeverReturns {
+            entered: entered.clone(),
+        },
+        &metrics(),
+    )
+    .await
+    .expect("poll the queue");
+
+    assert_eq!(entered.load(Ordering::SeqCst), 1, "the handler never ran");
+    assert_eq!(outcome.claimed, 1);
+    assert_eq!(outcome.completed, 0, "a hung handler must not be completed");
+    assert_eq!(outcome.rescheduled, 1);
+    assert_eq!(outcome.undispatched, 0);
+
+    let (status, _attempts) = status_of(&pool, job_id).await;
+    assert_eq!(status, "pending", "the job must be retried, not abandoned");
+    let error = last_error_of(&pool, job_id)
+        .await
+        .expect("a recorded error");
+    assert!(
+        error.contains("exceeded its"),
+        "the row must say the budget ended it: {error}"
+    );
+}
+
+/// The batch half of finding 4, and the one that closes the concrete failure: eight jobs
+/// each inside their own per-job timeout can still keep one poll running past
+/// `queue_stale_claim_seconds`, at which point another replica's `requeue_stale` hands a
+/// row this replica is still executing to a second executor.
+///
+/// The per-job timeout here is set *above* the batch budget on purpose. That pair is
+/// exactly what `Settings::validate_coordination` now rejects, and running it anyway is the
+/// point: the batch bound has to hold on the values as given, because `WorkerSettings` is
+/// constructible without ever passing through validation.
+#[tokio::test]
+async fn a_batch_that_exhausts_its_dispatch_budget_leaves_the_rest_running_for_the_sweep() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let first = insert_job(&pool, 5).await;
+    let second = insert_job(&pool, 5).await;
+
+    let entered = Arc::new(AtomicUsize::new(0));
+    let outcome = queue(
+        &pool,
+        WorkerSettings {
+            max_concurrent_jobs: 2,
+            // 80% of 2s is a 1s budget for the whole batch. The first job's slice is
+            // `min(per-job timeout, time left on the batch budget)`, so with the per-job
+            // timeout an hour away the slice *is* the remaining budget — the first job
+            // times out precisely when the batch deadline passes, leaving nothing for the
+            // second. No sleep in the test, and no race to lose.
+            queue_stale_claim_seconds: 2,
+            queue_job_timeout_seconds: 3_600,
+            ..settings()
+        },
+    )
+    .run_once(
+        &NeverReturns {
+            entered: entered.clone(),
+        },
+        &metrics(),
+    )
+    .await
+    .expect("poll the queue");
+
+    assert_eq!(outcome.claimed, 2);
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "the second job must never have been handed to a handler"
+    );
+    assert_eq!(outcome.undispatched, 1);
+    assert_eq!(outcome.rescheduled, 1, "the first job timed out");
+
+    assert_eq!(status_of(&pool, first).await.0, "pending");
+    assert_eq!(
+        status_of(&pool, second).await.0,
+        "running",
+        "an undispatched job must be left for `requeue_stale`, not completed or failed by \
+         a replica that never ran it"
+    );
+}
+
+/// The shutdown half of finding 4. `run_supervisor` awaits the poll inline inside one arm
+/// of its `select!`, so before this the `shutdown.changed()` arm could not fire until the
+/// whole claimed batch had been dispatched. The stop predicate is read *between* jobs, so
+/// no handler is cancelled half-written.
+#[tokio::test]
+async fn a_stop_signal_part_way_through_a_batch_stops_dispatching_the_rest() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let first = insert_job(&pool, 5).await;
+    let second = insert_job(&pool, 5).await;
+    let third = insert_job(&pool, 5).await;
+
+    let handled = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let dispatcher = StopsItselfAfter {
+        handled: handled.clone(),
+        stop_after: 1,
+        stop: stop.clone(),
+    };
+    let stop_predicate = {
+        let stop = stop.clone();
+        move || stop.load(Ordering::SeqCst)
+    };
+
+    let outcome = queue(
+        &pool,
+        WorkerSettings {
+            max_concurrent_jobs: 3,
+            ..settings()
+        },
+    )
+    .run_once_until(&dispatcher, &metrics(), &stop_predicate)
+    .await
+    .expect("poll the queue");
+
+    assert_eq!(outcome.claimed, 3);
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        1,
+        "dispatching continued after the stop signal"
+    );
+    assert_eq!(outcome.completed, 1, "the in-flight job must still settle");
+    assert_eq!(outcome.undispatched, 2);
+    assert_eq!(status_of(&pool, first).await.0, "completed");
+    for id in [second, third] {
+        assert_eq!(status_of(&pool, id).await.0, "running");
+    }
+}
+
+/// Finding 5. `run_supervisor` is a bare `tokio::spawn` whose `JoinHandle` is awaited only
+/// by `WorkerSupervisor::shutdown`, which discards the `JoinError` — so an unwinding
+/// handler killed the supervisor task for the remaining life of the process (no polls, no
+/// retention sweep, no `moira_worker_tick`, no `leader.resign()`) while `/health/ready`,
+/// which does not consult the supervisor, kept the pod in service.
+#[tokio::test]
+async fn a_panicking_handler_fails_its_own_job_and_leaves_the_poll_running() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let panicking = insert_job(&pool, 5).await;
+    let survivor = insert_job(&pool, 5).await;
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let outcome = queue(
+        &pool,
+        WorkerSettings {
+            max_concurrent_jobs: 2,
+            ..settings()
+        },
+    )
+    .run_once(&PanicsOnce { seen: seen.clone() }, &metrics())
+    .await
+    .expect("the poll itself must return, not unwind");
+
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        2,
+        "the poll stopped at the panic"
+    );
+    assert_eq!(outcome.rescheduled, 1);
+    assert_eq!(outcome.completed, 1);
+    assert_eq!(status_of(&pool, panicking).await.0, "pending");
+    assert_eq!(status_of(&pool, survivor).await.0, "completed");
+
+    let error = last_error_of(&pool, panicking)
+        .await
+        .expect("a recorded error");
+    assert!(error.contains("panicked"), "{error}");
+    assert!(
+        !error.contains("a deliberate handler panic"),
+        "the panic payload is arbitrary handler text and `worker_jobs.last_error` is stored \
+         unredacted, so it must not be carried into the row: {error}"
     );
 }

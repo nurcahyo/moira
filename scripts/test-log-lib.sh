@@ -265,7 +265,18 @@ tl_count_skips() {
 # load average 24 under Spotlight indexing. It passes alone and passed in the re-run below load
 # 8; no count was read from the red run. Recorded here because a measurement taken under
 # contention is the documented way this repository has published wrong numbers before.
-TL_TEST_COUNT_MINIMUM=1762
+#
+# Re-measured 2026-08-17 on `fix/dispatcher-ssrf-251`, based on `develop` at c9cb440 (which
+# already carries the branch measured directly above): **1775** passed, source declaring 1769,
+# by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. The branch adds 13
+# tests — 5 in `src/infra/workers/queue.rs`, 2 in `src/config/settings.rs`, 4 in
+# `tests/workers/worker_queue.rs`, 2 in `tests/workers/latency_health_oauth.rs` — and both
+# halves moved by 13, so the base was again carrying neither surplus nor deficit. The +6
+# doctest offset holds for the tenth consecutive measurement.
+#
+# Read off the run, not 1762+13; see the paragraph above for why the agreement is the check
+# and not the derivation.
+TL_TEST_COUNT_MINIMUM=1775
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

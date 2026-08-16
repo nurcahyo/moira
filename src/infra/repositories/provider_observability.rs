@@ -329,6 +329,18 @@ const PRUNE_HEALTH_SNAPSHOTS_SQL: &str = r#"
 /// defeat the point of aggregating in the first place; two small lateral subqueries per
 /// provider is the standard shape for "an aggregate plus the single latest row" in Postgres.
 ///
+/// **Both** laterals bound on `$1`, and the one on `latest` is not decoration. Without it
+/// `current_status` is the newest snapshot *ever* recorded, which is a different question from
+/// the one every doc comment on this surface answers — see
+/// [`ProviderHealthSummaryRow::current_status`] and
+/// [`ProviderObservabilityRepository::provider_health_summaries`], both of which promise
+/// `unknown` for a provider with no snapshot inside the window. The two answers diverge
+/// exactly when the probe stops running: an operator disables the provider (so
+/// `ENABLED_PROVIDERS_SQL` no longer returns it) or turns workers off, `prune_health_snapshots`
+/// stops running too because it only ever runs from inside `provider-health-check` itself, and
+/// the surface then reports `{status: "healthy", probes_total: 0, last_probe_at: null}`
+/// indefinitely for a provider nobody has probed in days. Issue #251 finding 3.
+///
 /// `avg(latency_ms)` is cast to `double precision` **in SQL**, and that cast is load-bearing,
 /// not cosmetic. `provider_health_snapshots.latency_ms` is `integer`
 /// (`migrations/0005_provider_runtime.sql`), and Postgres `avg(integer)` returns `numeric`.
@@ -376,6 +388,7 @@ const PROVIDER_HEALTH_SUMMARIES_SQL: &str = r#"
         from provider_health_snapshots s2
         where s2.provider_id = p.id
           and s2.provider_model_id is null
+          and s2.observed_at > $1
         order by observed_at desc
         limit 1
     ) latest on true
