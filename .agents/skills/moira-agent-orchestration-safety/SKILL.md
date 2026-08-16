@@ -128,4 +128,42 @@ The same command has produced **81 s, 118 s and 472 s** in this repository, from
   compose the commit from commit messages, and `main` is the default branch.
 - Merged-ness comes from GitHub, not ancestry: feature PRs are squashed, so
   `git merge-base --is-ancestor` reports merged branches as unmerged. Use
-  `gh pr list --state merged --json headRefName`.
+  `gh pr list --state merged --json headRefName`. *Measured 2026-08-16:* of 135 local branches
+  that had commits `develop` lacked, **113 were already merged** — ancestry was wrong about 84% of
+  them.
+- **`gh pr merge` exits non-zero after a merge that succeeded.** It merges through the API first,
+  then does local cleanup; if any worktree has the base branch checked out, the second half dies
+  with `failed to run git: fatal: 'develop' is already used by worktree at …` and the exit code
+  covers both halves. The PR is `MERGED` and the remote branch already deleted. **Never retry on a
+  non-zero exit** — query `gh pr view <n> --json state,mergedAt,mergeCommit` first. (`merged` is
+  not a valid `--json` field; use `state`.) This fired twice in one session.
+- **A failed command does not stop the next one.** `git switch -c <b> <base>` failed because the
+  branch already existed, and the `git merge` on the following line ran anyway — landing a
+  `main`-into-`develop` merge on top of an unrelated feature branch. Caught before the push only
+  because the remote SHA was compared against local. Chain destructive git sequences with `&&`,
+  never as separate lines. Same family as the pipe-exit-status trap: `cmd | tail && echo ok`
+  reports `tail`'s status, so a rejected push prints `ok`.
+- **The test floor moves in the same commit as the test.** `TL_TEST_COUNT_MINIMUM` in
+  `scripts/test-log-lib.sh` is compared against *two* numbers — the written floor and
+  `tl_declared_tests`, which counts `#[test]` attributes **on disk at run time**. Adding a test
+  file after measuring raises `declared` while `passed` stays put, and the gate reds. It also
+  binds CI, through `scripts/ci-assert-union.sh`, where the count is a union over shards; before
+  changing it, confirm whether the shards run what you measured (`ci-shard-run.sh` does run
+  `cargo test --doc`, which is where the +6 offset comes from).
+- **Never derive a test count across a merge.** Two branches measured at 1605 and 1738 do not sum
+  to 3343 — they share every test either had before diverging. Gate the merged tree once and read
+  the number off that run.
+- **Two branches can conflict semantically while git reports a clean merge.** `develop` added
+  `migrations/0035_claude_runners.sql`; a branch in flight held
+  `0035_deepseek_legacy_aliases_….sql`. Different filenames, no conflict markers, nothing to
+  resolve — but `sqlx` keys migrations by the integer prefix, so both were version 35. A clean
+  merge is evidence about text, not about meaning. `tests/migration_constraint_safety.rs` now
+  guards this particular case; the general habit it stands for is to ask what *else* keys off the
+  thing you just changed.
+- **Worktrees are the main disk risk, and one can hold a branch hostage.** Each builds its own
+  `target/`; two reached 26 GB and 20 GB and the volume hit 100% twice in one session, killing a
+  gate mid-run with `No space left on device`. A worktree that has `develop` checked out blocks
+  `develop` repo-wide, including `gh`'s post-merge cleanup. Prefer the main tree when agents run
+  sequentially — the isolation rule in §1 exists for concurrent writers, and its cost is real.
+  Before deleting: `git worktree remove` without `--force` refuses anything with modified or
+  untracked files, which makes it the safety check rather than an obstacle.
