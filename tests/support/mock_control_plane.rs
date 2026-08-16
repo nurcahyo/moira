@@ -38,7 +38,10 @@ pub enum TokenScript {
     Success {
         access_token: String,
         refresh_token: Option<String>,
-        expires_in: i64,
+        /// `None` omits the member entirely, which RFC 6749 §5.1 permits and real identity
+        /// providers do. It is a distinct case from `Some(0)`: the response says nothing
+        /// about the new token's lifetime, rather than saying it has already expired.
+        expires_in: Option<i64>,
     },
     HttpError {
         status: StatusCode,
@@ -83,7 +86,7 @@ impl MockControlPlane {
             token_script: Mutex::new(TokenScript::Success {
                 access_token: "mock-access-token".to_string(),
                 refresh_token: Some("mock-refresh-token-2".to_string()),
-                expires_in: 3_600,
+                expires_in: Some(3_600),
             }),
             token_calls: AtomicUsize::new(0),
             token_bodies: Mutex::new(Vec::new()),
@@ -194,12 +197,17 @@ async fn handle_token(State(state): State<Arc<MockState>>, body: String) -> Resp
             refresh_token,
             expires_in,
         } => {
-            let body: Value = json!({
+            let mut body: Value = json!({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
-                "expires_in": expires_in,
             });
+            // Inserted rather than set to `null`: a provider that does not state a lifetime
+            // omits the member, and `serde` would happily read an explicit `null` into the
+            // same `Option`, so writing `null` would not exercise the real wire shape.
+            if let Some(expires_in) = expires_in {
+                body["expires_in"] = json!(expires_in);
+            }
             (StatusCode::OK, Json(body)).into_response()
         }
         TokenScript::HttpError { status } => (status, "mock token error").into_response(),

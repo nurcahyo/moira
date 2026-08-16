@@ -449,6 +449,91 @@ async fn provider_health_summary_reports_the_average_latency_over_http() {
     control_plane.shutdown().await;
 }
 
+/// Issue #251 finding 3. `current_status` came from the newest snapshot *ever* recorded,
+/// with no window bound — so once probing stopped (the operator disabled the provider, or
+/// turned workers off, which also stops `prune_health_snapshots`, since that only ever runs
+/// from inside `provider-health-check` itself) the surface reported the last status forever.
+///
+/// An operator reading "healthy, last probed: null" for a provider nobody has touched in
+/// days is worse than reading nothing, and three separate doc comments — on
+/// `ProviderHealthSummaryRow::current_status`, on the `provider_health_summaries` trait
+/// method, and on `ProviderHealthStatus` — all promised `unknown` here.
+#[tokio::test]
+async fn provider_health_summary_reports_unknown_once_its_last_probe_ages_out_of_the_window() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let state = test_state(&pool).await;
+    let control_plane = MockControlPlane::start().await;
+
+    let provider = AdminService::new(&state)
+        .expect("admin service")
+        .create_provider(
+            &admin_actor(),
+            &request_context(),
+            ProviderCreateRequest {
+                provider_type: ProviderType::OpenAiCompatible,
+                display_name: "Stale health provider".to_string(),
+                base_url: Some(control_plane.health_url()),
+                metadata: json!({}),
+            },
+        )
+        .await
+        .expect("create provider");
+
+    let settings = WorkerSettings::default();
+    queue(&pool, settings.clone())
+        .enqueue("provider-health-check", json!({}), None, &metrics())
+        .await
+        .expect("enqueue provider-health-check");
+    assert_eq!(dispatch_one(&state, settings.clone()).await.completed, 1);
+    assert_eq!(snapshot_row(&pool, provider.id).await.0, "healthy");
+
+    // Age the one snapshot past `provider_health_snapshot_retention_hours` rather than
+    // waiting a day for it — the same technique `a_job_orphaned_by_a_dead_replica_is_…`
+    // uses on `claimed_at`. The prune sweep would have deleted it, but the prune sweep
+    // only runs from inside the probe job, which in this scenario has stopped running.
+    let aged = sqlx::query(
+        "update provider_health_snapshots
+         set observed_at = now() - make_interval(hours => $2::int)
+         where provider_id = $1",
+    )
+    .bind(provider.id)
+    .bind(i32::try_from(settings.provider_health_snapshot_retention_hours + 1).unwrap_or(25))
+    .execute(&pool)
+    .await
+    .expect("age the snapshot out of the window");
+    assert_eq!(aged.rows_affected(), 1);
+
+    let server = MoiraHttpServer::start(state.clone()).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/v1/admin/providers/health", server.base_url))
+        .send()
+        .await
+        .expect("call GET /api/v1/admin/providers/health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("parse the health response");
+
+    let wanted = json!(provider.id);
+    let entry = body["providers"]
+        .as_array()
+        .expect("providers must be an array")
+        .iter()
+        .find(|entry| entry["provider_id"] == wanted)
+        .expect("a provider with no snapshot in the window must still appear");
+    assert_eq!(
+        entry["status"],
+        json!("unknown"),
+        "a status from outside the rolling window was reported as the current one: {entry}"
+    );
+    assert_eq!(entry["probes_total"], json!(0));
+    assert_eq!(entry["last_probe_at"], json!(null));
+
+    server.shutdown().await;
+    control_plane.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------------------
 // oauth-token-refresh
 // ---------------------------------------------------------------------------------------
@@ -558,6 +643,108 @@ async fn oauth_token_refresh_rotates_the_credential_end_to_end() {
     };
     assert_eq!(access_token, "mock-access-token");
     assert_eq!(refresh_token.as_deref(), Some("mock-refresh-token-2"));
+
+    control_plane.shutdown().await;
+}
+
+/// Issue #251 finding 6. `expires_in` is optional in RFC 6749 §5.1, and
+/// `apply_oauth_refresh` wrote `expires_at = coalesce($10, expires_at)` — so a provider that
+/// omitted it left the *old* token's expiry on the row. The credential therefore stayed
+/// permanently inside `list_oauth_credentials_due_for_refresh`'s `expires_at < threshold`,
+/// and was re-exchanged every `maintenance_enqueue_interval_seconds` (60s) forever, rotating
+/// the refresh-token chain each time against any provider that rotates it, while recording a
+/// `moira_oauth_refresh_total` success on every pass so the metric read as healthy.
+///
+/// Two polls, not one, because one poll cannot tell "the expiry did not move" from "the
+/// expiry moved and the second poll would not pick it up anyway".
+#[tokio::test]
+async fn a_refresh_with_no_expires_in_clears_the_expiry_instead_of_staying_permanently_due() {
+    let Some(database) = TestDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    let state = test_state(&pool).await;
+    let control_plane = MockControlPlane::start().await;
+    control_plane
+        .set_token_script(TokenScript::Success {
+            access_token: "mock-access-token".to_string(),
+            refresh_token: Some("mock-refresh-token-2".to_string()),
+            expires_in: None,
+        })
+        .await;
+    let actor = admin_actor();
+    let admin = AdminService::new(&state).expect("admin service");
+
+    let provider = admin
+        .create_provider(
+            &actor,
+            &request_context(),
+            ProviderCreateRequest {
+                provider_type: ProviderType::Anthropic,
+                display_name: "OAuth no-expiry provider".to_string(),
+                base_url: None,
+                metadata: json!({ "oauth_token_endpoint": control_plane.token_endpoint() }),
+            },
+        )
+        .await
+        .expect("create provider");
+
+    let expires_soon = Utc::now() + chrono::Duration::seconds(60);
+    let credential = admin
+        .create_credential(
+            &actor,
+            &request_context(),
+            CredentialCreateRequest {
+                provider_id: provider.id,
+                credential_type: CredentialType::Oauth2,
+                scope: CredentialScope::Global,
+                secret: CredentialSecret::OAuth2 {
+                    access_token: "old-access-token".to_string(),
+                    refresh_token: Some("old-refresh-token".to_string()),
+                    token_type: Some("Bearer".to_string()),
+                    expires_at: Some(expires_soon),
+                },
+                display_name: Some("OAuth no-expiry credential".to_string()),
+                priority: 100,
+                expires_at: Some(expires_soon),
+                metadata: json!({}),
+            },
+        )
+        .await
+        .expect("create oauth2 credential");
+
+    let settings = WorkerSettings::default();
+    let enqueue_and_run = || async {
+        queue(&pool, settings.clone())
+            .enqueue("oauth-token-refresh", json!({}), None, &metrics())
+            .await
+            .expect("enqueue oauth-token-refresh");
+        assert_eq!(dispatch_one(&state, settings.clone()).await.completed, 1);
+    };
+
+    enqueue_and_run().await;
+    assert_eq!(control_plane.token_call_count(), 1);
+
+    let admin_repo = PgAdminRepository::new(pool.clone());
+    let after_first = admin_repo
+        .load_credential_secret(credential.id)
+        .await
+        .expect("load the refreshed credential");
+    assert_eq!(
+        after_first.record.expires_at, None,
+        "a token endpoint that did not state a lifetime must leave no lifetime on the row — \
+         keeping the replaced token's expiry attributes it to its replacement, and keeps the \
+         credential permanently matching the due query"
+    );
+
+    // The behavioural consequence, not just the column: the next maintenance cycle must not
+    // exchange the same credential again.
+    enqueue_and_run().await;
+    assert_eq!(
+        control_plane.token_call_count(),
+        1,
+        "the credential was re-exchanged on the next cycle, so it is still permanently due"
+    );
 
     control_plane.shutdown().await;
 }
