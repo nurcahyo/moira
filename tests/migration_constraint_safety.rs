@@ -602,7 +602,8 @@ fn the_three_ledger_descriptions_for_0030_are_distinct_and_the_notes_quote_the_r
 /// with the same value.
 ///
 /// `NOT VALID` moves the *scan* out from under ACCESS EXCLUSIVE. It does not move the ACCESS
-/// EXCLUSIVE: every `ALTER TABLE` takes one, and a request for it that has to queue behind a
+/// EXCLUSIVE: the `add column` / `drop constraint` / `add … not valid` forms still take one, and
+/// a request for it that has to queue behind a
 /// long-running transaction parks every later reader of the table behind itself as well — so the
 /// safe shape still has an unbounded stall in it unless the wait is capped. Measured on PostgreSQL
 /// 16.14: a 12-second read on `execution_attempts` turned a `select count(*)` that arrived after

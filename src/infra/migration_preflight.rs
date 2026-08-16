@@ -17,7 +17,7 @@
 //! # What that shape removes, and what it does not
 //!
 //! It removes the *scan* from under `ACCESS EXCLUSIVE`. It does not remove the `ACCESS EXCLUSIVE`:
-//! every `ALTER TABLE` takes it, so the group-one transaction below takes it too. Lock modes read
+//! the group-one transaction below still takes it. Lock modes read
 //! from `pg_locks` inside the transaction, PostgreSQL 16.14, at 200,000 / 1,000,000 / 4,000,000
 //! rows: `add column if not exists ×3` → `AccessExclusiveLock`, 1.5 / 0.6 / 0.3 ms;
 //! `drop constraint if exists` → `AccessExclusiveLock`, 2.7 / 0.5 / 0.5 ms; `add … not valid` →

@@ -46,9 +46,9 @@ already exists, the preflight applies `0030`'s own three statements split across
 — `ADD COLUMN` and `ADD CONSTRAINT … NOT VALID`, a commit, then `VALIDATE CONSTRAINT` — and records
 `0030` as applied, so the migrator skips it.
 
-**What that removes is the scan from under ACCESS EXCLUSIVE, not the ACCESS EXCLUSIVE.** Every
-`ALTER TABLE` takes ACCESS EXCLUSIVE, and the first of the two transactions is no exception — but
-it holds it for three catalog writes instead of for a full scan. Lock modes read from `pg_locks`
+**What that removes is the scan from under ACCESS EXCLUSIVE, not the ACCESS EXCLUSIVE.** The
+first of the two transactions still takes it, but holds it for three catalog writes instead of for
+a full scan. Lock modes read from `pg_locks`
 inside the transaction, PostgreSQL 16.14, measured at 200,000, 1,000,000 and 4,000,000 rows:
 
 | statement | lock | time once granted |
@@ -71,11 +71,9 @@ other mode, so the preflight cannot start until every transaction already touchi
 the table queues behind it too, including plain `SELECT`s that conflict with nothing already
 running. Measured on the same server: a 12-second read transaction on `execution_attempts` starting
 at t=0, the DDL arriving at t=1s and queueing, and an ordinary `select count(*)` arriving at t=3s —
-the `select` blocked for **9.4 seconds**, behind a statement that runs in 3 ms. One of the samples
-above shows the same thing by accident: an `add column if not exists` that took 0.3 ms in two
-samples took 1,003 ms in a third, because something else had the table at that moment.
+the `select` blocked for **9.4 seconds**, behind a statement that runs in 3 ms.
 
-**So the ACCESS EXCLUSIVE half gives up rather than queueing.** It runs under
+**So the ACCESS EXCLUSIVE half stops waiting after three seconds.** It runs under
 `lock_timeout = '3s'`. If the lock is not granted in that window the statement is cancelled, the
 transaction rolls back, nothing is written to `_sqlx_migrations`, and **the process fails to start
 with an error naming the table** rather than stalling the fleet. Re-running it is the retry: the
@@ -155,7 +153,8 @@ VALID` and re-scans — and your ledger `INSERT` below then fails on the primary
 ```sql
 -- The first three take ACCESS EXCLUSIVE. Bound the wait: while one of them sits in the lock
 -- queue, every later reader of execution_attempts queues behind it. If a statement is cancelled
--- with SQLSTATE 55P03, nothing was applied — find the long transaction and run it again.
+-- with SQLSTATE 55P03, the statements before it have already committed — these run outside a
+-- transaction. Find the long transaction and run the block again; every statement is idempotent.
 set lock_timeout = '3s';
 alter table execution_attempts
     add column if not exists candidate_rank integer,

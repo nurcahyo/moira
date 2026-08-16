@@ -64,8 +64,7 @@
 -- ===================================================================================
 --
 -- What the split removes is the *scan* from under ACCESS EXCLUSIVE. It does not remove the ACCESS
--- EXCLUSIVE: every `ALTER TABLE` takes it, and the `drop constraint` / `add … not valid` pair
--- below is no exception. Lock modes read from `pg_locks` inside the transaction, PostgreSQL 16.14,
+-- EXCLUSIVE: the `drop constraint` / `add … not valid` pair below still takes it. Lock modes read from `pg_locks` inside the transaction, PostgreSQL 16.14,
 -- at 200,000 / 1,000,000 / 4,000,000 rows: `drop constraint if exists` → AccessExclusiveLock,
 -- 2.7 / 0.5 / 0.5 ms; `add … not valid` → AccessExclusiveLock, 2.4 / 0.5 / 0.5 ms;
 -- `validate constraint` → ShareUpdateExclusiveLock, 76 / 77 / 346 ms. The first two are catalog
