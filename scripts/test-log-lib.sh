@@ -216,7 +216,23 @@ tl_count_skips() {
 # R2's own suite — it added tests without moving this line, which is the drift this file keeps
 # warning about and keeps accumulating — and 1 is the `ATTACH_HOLD` guard this branch added
 # after R2 landed. The +6 doctest offset holds for the sixth consecutive measurement.
-TL_TEST_COUNT_MINIMUM=1738
+#
+# Re-measured 2026-08-16 on `fix/plan12-3-migrations` at 8408d45, after merging `develop` at
+# f79bc8e into it: **1756** passed, source declaring 1750, by `scripts/gates.sh` with Postgres
+# and Redis up and zero skip lines. The +6 doctest offset holds for the seventh consecutive
+# measurement.
+#
+# This one is NOT derived. The branch and `develop` were measured separately at 1605 and 1738,
+# and 1605 + 1738 is meaningless — they share every test either had before they diverged. The
+# merged tree was gated once and the number read off that run, which is the only way a floor
+# over a merge can be honest.
+#
+# The floor also applies in CI, through `scripts/ci-assert-union.sh:111`, and CI shards the
+# suite. Checked rather than assumed: `scripts/ci-shard-run.sh:85-87` runs
+# `cargo test --all-features --doc` on whichever shard draws the `__doc__` unit, so the union
+# includes the same 6 doctests this local run does and 1756 is the right floor for both. Had it
+# not, this constant would have turned CI red while every local gate stayed green.
+TL_TEST_COUNT_MINIMUM=1756
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
