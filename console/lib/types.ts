@@ -1571,6 +1571,1030 @@ assertKeyContract<
 >();
 
 /* -------------------------------------------------------------------------- */
+/* Skills (plan 12 §5) — tool/guard registry, HTTP executors, OpenAPI import  */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/SkillKind`. */
+export type SkillKind = "tool" | "guard";
+
+/** `#/components/schemas/SkillStatus`. `draft` -> `enabled`/`disabled`. */
+export type SkillStatus = "draft" | "enabled" | "disabled";
+
+/**
+ * `#/components/schemas/HttpMethod` as it applies to `skill_http_executors`.
+ *
+ * Named `SkillExecutorMethod` here rather than `HttpMethod` — `lib/moira-client.ts`
+ * already exports a `HttpMethod` for the four verbs `MoiraOperation.method` uses
+ * (`GET | POST | PATCH | DELETE`, no `PUT`), and reusing the name for a
+ * differently-membered wire enum is exactly the kind of drift this file's own
+ * contract machinery exists to catch elsewhere.
+ */
+export type SkillExecutorMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+/** `#/components/schemas/SkillRecord`. */
+export interface SkillRecord {
+  id: string;
+  skill_key: string;
+  display_name: string;
+  kind: SkillKind;
+  params_schema: JsonValue;
+  tags: string[];
+  status: SkillStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const SKILL_RECORD_CONTRACT = {
+  schema: "SkillRecord",
+  required: [
+    "id",
+    "skill_key",
+    "display_name",
+    "kind",
+    "params_schema",
+    "tags",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillRecord,
+    (typeof SKILL_RECORD_CONTRACT)["required"][number],
+    (typeof SKILL_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillCreateRequest`. `additionalProperties: false`. */
+export interface SkillCreateRequest {
+  skill_key: string;
+  display_name: string;
+  kind: SkillKind;
+  description?: string | null;
+  metadata?: JsonValue;
+  params_schema?: JsonValue;
+  tags?: string[];
+}
+
+export const SKILL_CREATE_REQUEST_CONTRACT = {
+  schema: "SkillCreateRequest",
+  required: ["skill_key", "display_name", "kind"],
+  optional: ["description", "metadata", "params_schema", "tags"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillCreateRequest,
+    (typeof SKILL_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillPatchRequest`. `additionalProperties: false`.
+ *
+ * `kind` and `status` are absent — `kind` is immutable after creation and
+ * `status` moves only through enable/disable, mirroring `ProviderPatchRequest`'s
+ * treatment of `provider_type`.
+ */
+export interface SkillPatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+  params_schema?: JsonValue;
+  tags?: string[] | null;
+}
+
+export const SKILL_PATCH_REQUEST_CONTRACT = {
+  schema: "SkillPatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata", "params_schema", "tags"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillPatchRequest,
+    (typeof SKILL_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillBulkEnableRequest`. No `If-Match` — a multi-row operation with no single row version. */
+export interface SkillBulkEnableRequest {
+  skill_ids: string[];
+}
+
+export const SKILL_BULK_ENABLE_REQUEST_CONTRACT = {
+  schema: "SkillBulkEnableRequest",
+  required: ["skill_ids"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillBulkEnableRequest,
+    (typeof SKILL_BULK_ENABLE_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_BULK_ENABLE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/SkillBulkEnableResponse`. */
+export interface SkillBulkEnableResponse {
+  data: SkillRecord[];
+}
+
+export const SKILL_BULK_ENABLE_RESPONSE_CONTRACT = {
+  schema: "SkillBulkEnableResponse",
+  required: ["data"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillBulkEnableResponse,
+    (typeof SKILL_BULK_ENABLE_RESPONSE_CONTRACT)["required"][number],
+    (typeof SKILL_BULK_ENABLE_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillImportRequest` — the raw OpenAPI 3.x document to
+ * import (plan 12 §5). Parsing happens server-side in Moira; the console never
+ * inspects `document` beyond forwarding it as JSON.
+ */
+export interface SkillImportRequest {
+  document: JsonValue;
+}
+
+export const SKILL_IMPORT_REQUEST_CONTRACT = {
+  schema: "SkillImportRequest",
+  required: ["document"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillImportRequest,
+    (typeof SKILL_IMPORT_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_IMPORT_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillImportResponse` — one row per imported operation
+ * (a draft `skills` row plus its `skill_http_executors` row), capped at 300
+ * operations server-side (plan 12 §5 decision 23).
+ */
+export interface SkillImportResponse {
+  imported_count: number;
+  skills: SkillRecord[];
+  executors: SkillHttpExecutorRecord[];
+}
+
+export const SKILL_IMPORT_RESPONSE_CONTRACT = {
+  schema: "SkillImportResponse",
+  required: ["imported_count", "skills", "executors"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillImportResponse,
+    (typeof SKILL_IMPORT_RESPONSE_CONTRACT)["required"][number],
+    (typeof SKILL_IMPORT_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillHttpExecutorRecord`.
+ *
+ * NO `version` FIELD. `skill_http_executors` has no `version`/`deleted_at`
+ * columns — optimistic concurrency on this surface is given only to the three
+ * named registries (`skills`, `eval_suites`, `agent_flows`); this row is a
+ * versionless 1:1 child of a `skills` row. `updated_at` is this resource's
+ * `If-Match` basis instead, and the header it round-trips through is a QUOTED
+ * RFC 3339 timestamp rather than an integer — see `skillExecutorIfMatchFor` in
+ * `lib/moira-client.ts`.
+ */
+export interface SkillHttpExecutorRecord {
+  skill_id: string;
+  method: SkillExecutorMethod;
+  url_template: string;
+  allowed_host: string;
+  header_template: JsonValue;
+  timeout_ms: number;
+  created_at: string;
+  updated_at: string;
+  credential_id?: string | null;
+  response_schema?: JsonValue;
+}
+
+export const SKILL_HTTP_EXECUTOR_RECORD_CONTRACT = {
+  schema: "SkillHttpExecutorRecord",
+  required: [
+    "skill_id",
+    "method",
+    "url_template",
+    "allowed_host",
+    "header_template",
+    "timeout_ms",
+    "created_at",
+    "updated_at",
+  ],
+  optional: ["credential_id", "response_schema"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillHttpExecutorRecord,
+    (typeof SKILL_HTTP_EXECUTOR_RECORD_CONTRACT)["required"][number],
+    (typeof SKILL_HTTP_EXECUTOR_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/SkillHttpExecutorPatchRequest`. `additionalProperties: false`.
+ *
+ * `allowed_host` is absent — see `SkillHttpExecutorRecord.allowed_host`'s own
+ * note. Changing `url_template` re-derives and re-validates the allowed host
+ * server-side rather than taking a client-supplied value.
+ */
+export interface SkillHttpExecutorPatchRequest {
+  credential_id?: string | null;
+  header_template?: JsonValue;
+  method?: SkillExecutorMethod | null;
+  response_schema?: JsonValue;
+  timeout_ms?: number | null;
+  url_template?: string | null;
+}
+
+export const SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT = {
+  schema: "SkillHttpExecutorPatchRequest",
+  required: [],
+  optional: ["credential_id", "header_template", "method", "response_schema", "timeout_ms", "url_template"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    SkillHttpExecutorPatchRequest,
+    (typeof SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Provider health (issue #83) — read-only rolling reachability window       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `#/components/schemas/ProviderHealthStatus`. `unknown` is a provider with no
+ * snapshot in the rolling window at all — never probed, or not probed recently
+ * enough to still be in window — and is distinct from `unhealthy`.
+ */
+export type ProviderHealthStatus = "healthy" | "degraded" | "unhealthy" | "unknown";
+
+/** `#/components/schemas/ProviderHealthEntry` — one provider's rolling health window. */
+export interface ProviderHealthEntry {
+  provider_id: string;
+  provider_type: ProviderType;
+  display_name: string;
+  status: ProviderHealthStatus;
+  probes_total: number;
+  probes_successful: number;
+  average_latency_ms?: number | null;
+  last_failure_at?: string | null;
+  last_probe_at?: string | null;
+  last_success_at?: string | null;
+}
+
+export const PROVIDER_HEALTH_ENTRY_CONTRACT = {
+  schema: "ProviderHealthEntry",
+  required: ["provider_id", "provider_type", "display_name", "status", "probes_total", "probes_successful"],
+  optional: ["average_latency_ms", "last_failure_at", "last_probe_at", "last_success_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderHealthEntry,
+    (typeof PROVIDER_HEALTH_ENTRY_CONTRACT)["required"][number],
+    (typeof PROVIDER_HEALTH_ENTRY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ProviderHealthResponse` — `GET /api/v1/admin/providers/health`'s whole body. */
+export interface ProviderHealthResponse {
+  providers: ProviderHealthEntry[];
+}
+
+export const PROVIDER_HEALTH_RESPONSE_CONTRACT = {
+  schema: "ProviderHealthResponse",
+  required: ["providers"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderHealthResponse,
+    (typeof PROVIDER_HEALTH_RESPONSE_CONTRACT)["required"][number],
+    (typeof PROVIDER_HEALTH_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Eval suites (plan 12 §3) — offline/online grading                         */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/GradingKind`. `llm_judge` is deliberately absent (decision 14). */
+export type GradingKind = "exact_match" | "contains" | "schema_valid";
+
+/** `#/components/schemas/EvalRunStatus`. */
+export type EvalRunStatus = "pending" | "running" | "completed" | "failed";
+
+/** `#/components/schemas/EvalTriggerKind`. */
+export type EvalTriggerKind = "offline_manual" | "offline_ci" | "online_sampled";
+
+/** `#/components/schemas/EvalSuiteRecord`. */
+export interface EvalSuiteRecord {
+  id: string;
+  suite_key: string;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const EVAL_SUITE_RECORD_CONTRACT = {
+  schema: "EvalSuiteRecord",
+  required: ["id", "suite_key", "display_name", "status", "metadata", "created_at", "updated_at", "version"],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuiteRecord,
+    (typeof EVAL_SUITE_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalSuiteCreateRequest`. `additionalProperties: false`. */
+export interface EvalSuiteCreateRequest {
+  suite_key: string;
+  display_name: string;
+  description?: string | null;
+  metadata?: JsonValue;
+}
+
+export const EVAL_SUITE_CREATE_REQUEST_CONTRACT = {
+  schema: "EvalSuiteCreateRequest",
+  required: ["suite_key", "display_name"],
+  optional: ["description", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuiteCreateRequest,
+    (typeof EVAL_SUITE_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalSuitePatchRequest`. `additionalProperties: false`. */
+export interface EvalSuitePatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+}
+
+export const EVAL_SUITE_PATCH_REQUEST_CONTRACT = {
+  schema: "EvalSuitePatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalSuitePatchRequest,
+    (typeof EVAL_SUITE_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_SUITE_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalCaseRecord`. No `version` — cases have no PATCH surface (migration header). */
+export interface EvalCaseRecord {
+  id: string;
+  suite_id: string;
+  input: JsonValue;
+  expected: JsonValue;
+  grading_kind: GradingKind;
+  metadata: JsonValue;
+  created_at: string;
+}
+
+export const EVAL_CASE_RECORD_CONTRACT = {
+  schema: "EvalCaseRecord",
+  required: ["id", "suite_id", "input", "expected", "grading_kind", "metadata", "created_at"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalCaseRecord,
+    (typeof EVAL_CASE_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_CASE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalCaseCreateRequest`. `additionalProperties: false`. */
+export interface EvalCaseCreateRequest {
+  input: JsonValue;
+  expected: JsonValue;
+  grading_kind: GradingKind;
+  metadata?: JsonValue;
+}
+
+export const EVAL_CASE_CREATE_REQUEST_CONTRACT = {
+  schema: "EvalCaseCreateRequest",
+  required: ["input", "expected", "grading_kind"],
+  optional: ["metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalCaseCreateRequest,
+    (typeof EVAL_CASE_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof EVAL_CASE_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/EvalRunRecord`. Read-only — produced by the eval runner. */
+export interface EvalRunRecord {
+  id: string;
+  trigger_kind: EvalTriggerKind;
+  status: EvalRunStatus;
+  results: JsonValue;
+  metadata: JsonValue;
+  created_at: string;
+  agent_profile_id?: string | null;
+  completed_at?: string | null;
+  execution_id?: string | null;
+  score?: number | null;
+  suite_id?: string | null;
+}
+
+export const EVAL_RUN_RECORD_CONTRACT = {
+  schema: "EvalRunRecord",
+  required: ["id", "trigger_kind", "status", "results", "metadata", "created_at"],
+  optional: ["agent_profile_id", "completed_at", "execution_id", "score", "suite_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    EvalRunRecord,
+    (typeof EVAL_RUN_RECORD_CONTRACT)["required"][number],
+    (typeof EVAL_RUN_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Agent flows (plan 12 §6) — ordered, sequential-only MVP                   */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/FlowRunStatus`. */
+export type FlowRunStatus = "running" | "completed" | "failed" | "cancelled";
+
+/** `#/components/schemas/FlowStepOnFailure`. */
+export type FlowStepOnFailure = "abort" | "continue";
+
+/** `#/components/schemas/AgentFlowStepRecord`. */
+export interface AgentFlowStepRecord {
+  id: string;
+  flow_id: string;
+  step_key: string;
+  step_order: number;
+  agent_profile_id: string;
+  on_failure: FlowStepOnFailure;
+  input_mapping: JsonValue;
+  metadata: JsonValue;
+  created_at: string;
+}
+
+export const AGENT_FLOW_STEP_RECORD_CONTRACT = {
+  schema: "AgentFlowStepRecord",
+  required: [
+    "id",
+    "flow_id",
+    "step_key",
+    "step_order",
+    "agent_profile_id",
+    "on_failure",
+    "input_mapping",
+    "metadata",
+    "created_at",
+  ],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowStepRecord,
+    (typeof AGENT_FLOW_STEP_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_STEP_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowStepCreateRequest`. `additionalProperties: false`. */
+export interface AgentFlowStepCreateRequest {
+  step_key: string;
+  step_order: number;
+  agent_profile_id: string;
+  input_mapping?: JsonValue;
+  metadata?: JsonValue;
+  on_failure?: FlowStepOnFailure;
+}
+
+export const AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT = {
+  schema: "AgentFlowStepCreateRequest",
+  required: ["step_key", "step_order", "agent_profile_id"],
+  optional: ["input_mapping", "metadata", "on_failure"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowStepCreateRequest,
+    (typeof AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentFlowRecord`.
+ *
+ * A flow's steps are managed as an ordered array INSIDE this record rather than
+ * through a separate sub-resource (decision 13: simplest contract, matches the
+ * sequential-only MVP) — `create`/`patch` accept the whole ordered list and this
+ * record echoes it back.
+ */
+export interface AgentFlowRecord {
+  id: string;
+  flow_key: string;
+  display_name: string;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  steps: AgentFlowStepRecord[];
+  description?: string | null;
+  deleted_at?: string | null;
+}
+
+export const AGENT_FLOW_RECORD_CONTRACT = {
+  schema: "AgentFlowRecord",
+  required: [
+    "id",
+    "flow_key",
+    "display_name",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+    "steps",
+  ],
+  optional: ["description", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowRecord,
+    (typeof AGENT_FLOW_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowCreateRequest`. `additionalProperties: false`. */
+export interface AgentFlowCreateRequest {
+  flow_key: string;
+  display_name: string;
+  description?: string | null;
+  metadata?: JsonValue;
+  steps?: AgentFlowStepCreateRequest[];
+}
+
+export const AGENT_FLOW_CREATE_REQUEST_CONTRACT = {
+  schema: "AgentFlowCreateRequest",
+  required: ["flow_key", "display_name"],
+  optional: ["description", "metadata", "steps"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowCreateRequest,
+    (typeof AGENT_FLOW_CREATE_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_CREATE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentFlowPatchRequest`. `additionalProperties: false`.
+ *
+ * `steps: Some(...)` atomically REPLACES the whole ordered list; omitted leaves
+ * the existing steps untouched — the same coalesce convention every other patch
+ * request in this file follows for its scalar fields.
+ */
+export interface AgentFlowPatchRequest {
+  description?: string | null;
+  display_name?: string | null;
+  metadata?: JsonValue;
+  steps?: AgentFlowStepCreateRequest[] | null;
+}
+
+export const AGENT_FLOW_PATCH_REQUEST_CONTRACT = {
+  schema: "AgentFlowPatchRequest",
+  required: [],
+  optional: ["description", "display_name", "metadata", "steps"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowPatchRequest,
+    (typeof AGENT_FLOW_PATCH_REQUEST_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_PATCH_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AgentFlowRunRecord`. Read-only — produced by the flow orchestrator. */
+export interface AgentFlowRunRecord {
+  id: string;
+  flow_id: string;
+  status: FlowRunStatus;
+  metadata: JsonValue;
+  created_at: string;
+  completed_at?: string | null;
+}
+
+export const AGENT_FLOW_RUN_RECORD_CONTRACT = {
+  schema: "AgentFlowRunRecord",
+  required: ["id", "flow_id", "status", "metadata", "created_at"],
+  optional: ["completed_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentFlowRunRecord,
+    (typeof AGENT_FLOW_RUN_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_FLOW_RUN_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/AgentProfileRecord` — MINIMAL, for the flow step
+ * builder's "which agent profile does this step run" picker. The console owns
+ * no create/edit surface for agent profiles; this is read-only.
+ */
+export interface AgentProfileRecord {
+  id: string;
+  profile_key: string;
+  display_name: string;
+  tool_policy: JsonValue;
+  context_policy: JsonValue;
+  memory_policy: JsonValue;
+  status: ResourceStatus;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  preamble?: string | null;
+  temperature?: number | null;
+  max_tokens?: number | null;
+  deleted_at?: string | null;
+}
+
+export const AGENT_PROFILE_RECORD_CONTRACT = {
+  schema: "AgentProfileRecord",
+  required: [
+    "id",
+    "profile_key",
+    "display_name",
+    "tool_policy",
+    "context_policy",
+    "memory_policy",
+    "status",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["preamble", "temperature", "max_tokens", "deleted_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    AgentProfileRecord,
+    (typeof AGENT_PROFILE_RECORD_CONTRACT)["required"][number],
+    (typeof AGENT_PROFILE_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Relationship graph (plan 12 §4, issue #234) — derived, read-only          */
+/* -------------------------------------------------------------------------- */
+
+/** `#/components/schemas/GraphNodeType` */
+export type GraphNodeType =
+  "agent" | "skill" | "eval_suite" | "flow" | "provider" | "model" | "memory_scope";
+
+/** `#/components/schemas/GraphEdgeKind` */
+export type GraphEdgeKind =
+  | "agent_uses_skill"
+  | "agent_uses_eval_suite"
+  | "agent_reads_memory_scope"
+  | "flow_contains_agent"
+  | "agent_routes_to_model";
+
+/**
+ * `#/components/schemas/GraphNode`. `id` is `"<type>:<key>"` (e.g. `"agent:0199…"`), composite
+ * so an edge's `from`/`to` never collides across node types. `status` is `null` for the
+ * synthetic `memory_scope` node type, which has no row of its own to carry one.
+ */
+export interface GraphNode {
+  id: string;
+  type: GraphNodeType;
+  label: string;
+  status?: string | null;
+}
+
+/** `#/components/schemas/GraphEdge`. `from`/`to` are `GraphNode.id` values. */
+export interface GraphEdge {
+  from: string;
+  to: string;
+  kind: GraphEdgeKind;
+}
+
+export const GRAPH_NODE_CONTRACT = {
+  schema: "GraphNode",
+  required: ["id", "type", "label"],
+  optional: ["status"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphNode,
+    (typeof GRAPH_NODE_CONTRACT)["required"][number],
+    (typeof GRAPH_NODE_CONTRACT)["optional"][number]
+  >
+>();
+
+export const GRAPH_EDGE_CONTRACT = {
+  schema: "GraphEdge",
+  required: ["from", "to", "kind"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphEdge,
+    (typeof GRAPH_EDGE_CONTRACT)["required"][number],
+    (typeof GRAPH_EDGE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/GraphResponse` — `GET /api/v1/admin/graph`'s whole body. */
+export interface GraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  generated_at: string;
+}
+
+export const GRAPH_RESPONSE_CONTRACT = {
+  schema: "GraphResponse",
+  required: ["nodes", "edges", "generated_at"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    GraphResponse,
+    (typeof GRAPH_RESPONSE_CONTRACT)["required"][number],
+    (typeof GRAPH_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* Containerised Claude runners (issue #275/#272 workstream R3)               */
+/* -------------------------------------------------------------------------- */
+//
+// `/api/v1/admin/runners*` — PR #282's frozen contract. The console never sees
+// a token: `ClaudeRunnerRecord` has no token-shaped field, matching the
+// invariant `src/domain/runners.rs` pins with its own generated-schema test.
+//
+// `credential_id` is the one field here that trips
+// `SECRET_DTO_FIELD_PATTERN` (it contains `credential`) without being a secret
+// — it is a bare UUID *reference* to the credential row the runner's token
+// became, never the token or anything derived from it. It is exempted BY NAME
+// in `tests/unit/architecture/server-only-guards.test.ts`'s `EXEMPT_DTO_FIELDS`,
+// the same mechanism `token_url` and `setup_token` already use for the same
+// reason: the field name matches a pattern built to catch secrets, and this
+// field is not one.
+
+/** `#/components/schemas/ClaudeRunnerState`. */
+export type ClaudeRunnerState =
+  | "provisioning"
+  | "awaiting_authorization"
+  | "exchanging"
+  | "ready"
+  | "linked"
+  | "failed"
+  | "expired";
+
+/**
+ * `ClaudeRunnerState`s a live poll (`GET /runners/{id}`) could still move on
+ * from. Mirrors `ClaudeRunnerState::is_terminal` in `src/domain/runners.rs` —
+ * `linked`, `failed` and `expired` are the only settled states; `ready` is
+ * deliberately NOT terminal, because finalize acts on it.
+ */
+export const CLAUDE_RUNNER_TERMINAL_STATES: ReadonlySet<ClaudeRunnerState> = new Set([
+  "linked",
+  "failed",
+  "expired",
+]);
+
+/**
+ * `#/components/schemas/CredentialScope`, restricted to what THIS console may
+ * render for a runner.
+ *
+ * ============================================================================
+ * WHY THIS IS NOT AN IMPORT OF `CredentialScope`
+ * ============================================================================
+ *
+ * `lib/moira-credential-types.ts` already declares the real `CredentialScope`
+ * union — but that module is server-only and CONTAINED (see its header), and
+ * `ClaudeRunnerRecord.scope` has to reach a CLIENT component: CONVENTIONS' own
+ * requirement here is "the UI must make it obvious which one a runner belongs
+ * to — in the list and on the detail view", which is a rendering job, not a
+ * server-only one. Importing the contained module from here would drag it (and
+ * every module server-only-derivation considers reachable from it) into a
+ * browser bundle, and `server-only-guards.test.ts` refuses exactly that.
+ *
+ * So this is a structural mirror, not a spread: the same four variants, kept in
+ * step by hand because `CredentialScope` itself carries no `*_CONTRACT` (its
+ * spec node is a bare `oneOf` with no `properties`/`required` — see that type's
+ * own header) and therefore nothing here can weld the two together at compile
+ * time either.
+ */
+export type ClaudeRunnerScope =
+  | { readonly type: "global" }
+  | { readonly type: "tenant"; readonly external_tenant_id: string }
+  | {
+      readonly type: "application";
+      readonly application_id: string;
+      readonly external_tenant_id?: string | null;
+    }
+  | {
+      readonly type: "user";
+      readonly external_user_id: string;
+      readonly application_id?: string | null;
+      readonly external_tenant_id?: string | null;
+    };
+
+/** The runner service's charset for `label` — it becomes a container name. */
+export const CLAUDE_RUNNER_LABEL_PATTERN = /^[a-z0-9-]{1,64}$/;
+
+export const CLAUDE_RUNNER_TTL_SECONDS_MIN = 60;
+export const CLAUDE_RUNNER_TTL_SECONDS_MAX = 3600;
+/** The contract's own default (`default_ttl_seconds` in `src/domain/runners.rs`). */
+export const CLAUDE_RUNNER_TTL_SECONDS_DEFAULT = 900;
+
+/** `#/components/schemas/ClaudeRunnerProvisionRequest`. `additionalProperties: false`. */
+export interface ClaudeRunnerProvisionRequest {
+  label: string;
+  metadata?: JsonValue;
+  scope?: ClaudeRunnerScope | null;
+  ttl_seconds?: number;
+}
+
+export const CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerProvisionRequest",
+  required: ["label"],
+  optional: ["metadata", "scope", "ttl_seconds"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerProvisionRequest,
+    (typeof CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ClaudeRunnerAuthorizationCodeRequest`. */
+export interface ClaudeRunnerAuthorizationCodeRequest {
+  code: string;
+}
+
+export const CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerAuthorizationCodeRequest",
+  required: ["code"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerAuthorizationCodeRequest,
+    (typeof CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ClaudeRunnerFinalizeRequest`.
+ *
+ * NO `scope` FIELD, DELIBERATELY. The scope is fixed at provisioning time and
+ * sealed into the credential's AAD; `deny_unknown_fields` on the Moira side
+ * refuses one sent here, and this type cannot even express sending it —
+ * `assertRunnerFinalizeRequestIsSafe` in `lib/moira-client.ts` re-checks that
+ * for callers that reached the wire through an `any`.
+ */
+export interface ClaudeRunnerFinalizeRequest {
+  provider_id: string;
+  display_name?: string | null;
+  metadata?: JsonValue;
+}
+
+export const CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT = {
+  schema: "ClaudeRunnerFinalizeRequest",
+  required: ["provider_id"],
+  optional: ["display_name", "metadata"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerFinalizeRequest,
+    (typeof CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/ClaudeRunnerRecord`. NO TOKEN-SHAPED FIELD — see this
+ * section's header. `credential_id` is a reference only.
+ */
+export interface ClaudeRunnerRecord {
+  id: string;
+  label: string;
+  runner_reference: string;
+  state: ClaudeRunnerState;
+  scope: ClaudeRunnerScope;
+  metadata: JsonValue;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  authorization_url?: string | null;
+  error_code?: string | null;
+  expires_at?: string | null;
+  credential_id?: string | null;
+  provider_id?: string | null;
+}
+
+export const CLAUDE_RUNNER_RECORD_CONTRACT = {
+  schema: "ClaudeRunnerRecord",
+  required: [
+    "id",
+    "label",
+    "runner_reference",
+    "state",
+    "scope",
+    "metadata",
+    "created_at",
+    "updated_at",
+    "version",
+  ],
+  optional: ["authorization_url", "error_code", "expires_at", "credential_id", "provider_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ClaudeRunnerRecord,
+    (typeof CLAUDE_RUNNER_RECORD_CONTRACT)["required"][number],
+    (typeof CLAUDE_RUNNER_RECORD_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
 /* Error envelope (server-side shape — never crosses to the browser)          */
 /* -------------------------------------------------------------------------- */
 
@@ -1619,6 +2643,731 @@ assertKeyContract<
     MoiraErrorResponse,
     (typeof ERROR_RESPONSE_CONTRACT)["required"][number],
     (typeof ERROR_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* The playground (issue #261) — public execution DTOs                        */
+/* -------------------------------------------------------------------------- */
+//
+// Everything below models `POST /api/v1/responses`, `POST /api/v1/responses/stream`,
+// `GET /api/v1/executions/{execution_id}` and `POST /api/v1/admin/runtime/diagnose` —
+// the real execution path the playground drives, plus the admin-only diagnostic
+// surface it falls back to for routing transparency and tool-call visibility.
+// See `modules/playground/` and `app/api/playground/**` for the callers.
+//
+// A `oneOf` schema (a discriminated union with no top-level `properties`/`required`
+// of its own — `PublicContentPart`, `PublicOutputItem`, `PublicOutputContentPart`)
+// gets a plain TypeScript union and deliberately NO `*_CONTRACT`: the contract
+// test reads `schema.properties`/`schema.required` directly, and a `oneOf` schema
+// has neither at its own top level, so welding `ExactKeys` to one would either
+// fail to compile or silently assert an empty required/optional set. The same
+// applies to every bare string enum (`PublicMessageRole`, `RuntimeEventType`,
+// …) — enums are not run through this machinery anywhere else in this file
+// either (see `ProviderType`, `ResourceStatus`).
+
+/** `#/components/schemas/PublicMessageRole`. */
+export type PublicMessageRole = "system" | "developer" | "user" | "assistant" | "tool";
+
+/**
+ * `#/components/schemas/PublicContentPart` — a `oneOf`, not a flat object. The
+ * playground only ever constructs the `input_text` arm; `input_image` is
+ * modelled for completeness of the read side, not because this console sends one.
+ */
+export type PublicContentPart =
+  | { readonly type: "input_text"; readonly text: string }
+  | { readonly type: "input_image"; readonly image_url: string };
+
+/** `#/components/schemas/PublicInputMessage`. `additionalProperties: false`. */
+export interface PublicInputMessage {
+  role: PublicMessageRole;
+  content: PublicContentPart[];
+}
+
+export const PUBLIC_INPUT_MESSAGE_CONTRACT = {
+  schema: "PublicInputMessage",
+  required: ["role", "content"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicInputMessage,
+    (typeof PUBLIC_INPUT_MESSAGE_CONTRACT)["required"][number],
+    (typeof PUBLIC_INPUT_MESSAGE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicResponseRequest`. `additionalProperties: false` —
+ * a field this console does not use must still be declared here so the
+ * contract test's key-set comparison passes; `response_format`, `tools`,
+ * `tool_choice` and `conversation` are typed loosely (`unknown`) because the
+ * playground never constructs one (see `modules/playground/PlaygroundScreen.tsx`
+ * — non-goals: prompt libraries, conversation persistence, client-declared
+ * tools). `credential_id` and `seed` are likewise declared but unused.
+ */
+export interface PublicResponseRequest {
+  input: PublicInputMessage[];
+  conversation?: unknown;
+  credential_id?: string | null;
+  max_output_tokens?: number | null;
+  metadata?: JsonValue;
+  model?: string | null;
+  /** A provider UUID, despite the field's name — not a string hint. */
+  provider?: string | null;
+  response_format?: unknown;
+  route?: string | null;
+  seed?: number | null;
+  temperature?: number | null;
+  timeout_ms?: number | null;
+  tool_choice?: unknown;
+  tools?: unknown[];
+  top_p?: number | null;
+}
+
+export const PUBLIC_RESPONSE_REQUEST_CONTRACT = {
+  schema: "PublicResponseRequest",
+  required: ["input"],
+  optional: [
+    "conversation",
+    "credential_id",
+    "max_output_tokens",
+    "metadata",
+    "model",
+    "provider",
+    "response_format",
+    "route",
+    "seed",
+    "temperature",
+    "timeout_ms",
+    "tool_choice",
+    "tools",
+    "top_p",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicResponseRequest,
+    (typeof PUBLIC_RESPONSE_REQUEST_CONTRACT)["required"][number],
+    (typeof PUBLIC_RESPONSE_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicOutputContentPart` — a `oneOf`. See the section header. */
+export type PublicOutputContentPart =
+  | { readonly type: "output_text"; readonly text: string }
+  | { readonly type: "output_unavailable"; readonly reason: string };
+
+/**
+ * `#/components/schemas/PublicOutputItem` — a single-arm `oneOf`. Still gets no
+ * `*_CONTRACT`, for the reason stated at the top of this section: the schema
+ * itself carries no top-level `properties`/`required`, only its one arm does.
+ */
+export interface PublicOutputItem {
+  readonly type: "message";
+  readonly role: string;
+  readonly content: PublicOutputContentPart[];
+}
+
+/** `#/components/schemas/PublicCitation`. */
+export interface PublicCitation {
+  id: string;
+  type: string;
+  document_id?: string | null;
+  memory_id?: string | null;
+  section?: string | null;
+  title?: string | null;
+}
+
+export const PUBLIC_CITATION_CONTRACT = {
+  schema: "PublicCitation",
+  required: ["id", "type"],
+  optional: ["document_id", "memory_id", "section", "title"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicCitation,
+    (typeof PUBLIC_CITATION_CONTRACT)["required"][number],
+    (typeof PUBLIC_CITATION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicConversationRef`. */
+export interface PublicConversationRef {
+  id: string;
+}
+
+export const PUBLIC_CONVERSATION_REF_CONTRACT = {
+  schema: "PublicConversationRef",
+  required: ["id"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicConversationRef,
+    (typeof PUBLIC_CONVERSATION_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_CONVERSATION_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicRouteRef` — which route actually served. */
+export interface PublicRouteRef {
+  id: string;
+  key: string;
+}
+
+export const PUBLIC_ROUTE_REF_CONTRACT = {
+  schema: "PublicRouteRef",
+  required: ["id", "key"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicRouteRef,
+    (typeof PUBLIC_ROUTE_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_ROUTE_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicModelRef` — which provider/model actually served. */
+export interface PublicModelRef {
+  id: string;
+  provider: ProviderType;
+  key: string;
+}
+
+export const PUBLIC_MODEL_REF_CONTRACT = {
+  schema: "PublicModelRef",
+  required: ["id", "provider", "key"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicModelRef,
+    (typeof PUBLIC_MODEL_REF_CONTRACT)["required"][number],
+    (typeof PUBLIC_MODEL_REF_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicUsageSummary`. Every field nullable — a provider may report none of them. */
+export interface PublicUsageSummary {
+  cached_input_tokens?: number | null;
+  currency?: string | null;
+  estimated_cost?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export const PUBLIC_USAGE_SUMMARY_CONTRACT = {
+  schema: "PublicUsageSummary",
+  required: [],
+  optional: [
+    "cached_input_tokens",
+    "currency",
+    "estimated_cost",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "total_tokens",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicUsageSummary,
+    (typeof PUBLIC_USAGE_SUMMARY_CONTRACT)["required"][number],
+    (typeof PUBLIC_USAGE_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/PublicResponseStatus`. */
+export type PublicResponseStatus = "queued" | "in_progress" | "completed" | "failed" | "cancelled";
+
+/** `#/components/schemas/PublicResponse` — the non-streaming (and post-stream `GET`) shape. */
+export interface PublicResponse {
+  id: string;
+  object: string;
+  created_at: string;
+  status: PublicResponseStatus;
+  execution_id: string;
+  request_id: string;
+  output: PublicOutputItem[];
+  citations: PublicCitation[];
+  usage: PublicUsageSummary;
+  metadata: JsonValue;
+  output_persisted: boolean;
+  conversation?: PublicConversationRef | null;
+  model?: PublicModelRef | null;
+  route?: PublicRouteRef | null;
+}
+
+export const PUBLIC_RESPONSE_CONTRACT = {
+  schema: "PublicResponse",
+  required: [
+    "id",
+    "object",
+    "created_at",
+    "status",
+    "execution_id",
+    "request_id",
+    "output",
+    "citations",
+    "usage",
+    "metadata",
+    "output_persisted",
+  ],
+  optional: ["conversation", "model", "route"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicResponse,
+    (typeof PUBLIC_RESPONSE_CONTRACT)["required"][number],
+    (typeof PUBLIC_RESPONSE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicSseEnvelope` — one frame of `POST
+ * /api/v1/responses/stream`. `type` names the event (`response.created`,
+ * mapped runtime events like `response.routing.completed`, and exactly one
+ * terminal event per stream); `payload` is that event's own shape, which this
+ * console reads defensively field-by-field rather than typing exhaustively —
+ * see `lib/sse.ts` and `modules/playground/PlaygroundScreen.tsx`.
+ */
+export interface PublicSseEnvelope {
+  response_id: string;
+  execution_id: string;
+  request_id: string;
+  sequence: number;
+  timestamp: string;
+  type: string;
+  payload: JsonValue;
+}
+
+export const PUBLIC_SSE_ENVELOPE_CONTRACT = {
+  schema: "PublicSseEnvelope",
+  required: ["response_id", "execution_id", "request_id", "sequence", "timestamp", "type", "payload"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicSseEnvelope,
+    (typeof PUBLIC_SSE_ENVELOPE_CONTRACT)["required"][number],
+    (typeof PUBLIC_SSE_ENVELOPE_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/PublicExecutionSummary` — `GET
+ * /api/v1/executions/{execution_id}`. The baseline routing-transparency source
+ * reachable with NO extra scope beyond the execution itself: `attempt_count`
+ * and `latency_ms` are real, but there is no per-attempt array here and no
+ * `candidate_rank`/`candidate_score`/`selection_reason` — those exist only in
+ * `RuntimeEventEnvelope` payloads behind `POST /api/v1/admin/runtime/diagnose`.
+ * See that endpoint's doc comment on `DiagnosticExecutionResponse` below.
+ */
+export interface PublicExecutionSummary {
+  execution_id: string;
+  response_id: string;
+  request_id: string;
+  status: PublicResponseStatus;
+  attempt_count: number;
+  usage: PublicUsageSummary;
+  completed_at?: string | null;
+  failure_class?: string | null;
+  latency_ms?: number | null;
+  model?: PublicModelRef | null;
+  route?: PublicRouteRef | null;
+  started_at?: string | null;
+}
+
+export const PUBLIC_EXECUTION_SUMMARY_CONTRACT = {
+  schema: "PublicExecutionSummary",
+  required: ["execution_id", "response_id", "request_id", "status", "attempt_count", "usage"],
+  optional: ["completed_at", "failure_class", "latency_ms", "model", "route", "started_at"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    PublicExecutionSummary,
+    (typeof PUBLIC_EXECUTION_SUMMARY_CONTRACT)["required"][number],
+    (typeof PUBLIC_EXECUTION_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/* -------------------------------------------------------------------------- */
+/* The runtime diagnostic surface — `POST /api/v1/admin/runtime/diagnose`     */
+/* -------------------------------------------------------------------------- */
+//
+// Disabled by default (`runtime.diagnostic_endpoint_enabled = false`, a 404
+// when off) and gated on `moira:runtime:diagnose` — see
+// `app/api/playground/diagnose/route.ts`. It is the ONLY committed HTTP
+// surface that returns `candidate_ranked`/`fallback_selected` with
+// rank/score/selection-reason, and the only one that returns
+// `tool_call_started`/`tool_call_delta`/`tool_result` at all:
+// `map_runtime_event` (`src/application/public.rs`) deliberately drops all
+// four tool-call event types and `candidate_ranked` from the public SSE
+// stream, so the playground's tool-call and per-candidate views exist only
+// behind this endpoint. See the PR description for the shape of that gap.
+
+/** `#/components/schemas/ComplexityTier`. Inert in this MVP-static slice — see `ExecutionOptions.complexity_hint`. */
+export type ComplexityTier = "trivial" | "standard" | "heavy";
+
+/**
+ * `#/components/schemas/ExecutionOptions`. Every field optional on the wire.
+ * `priority`/`complexity_hint` are reachable ONLY through
+ * `DiagnosticExecutionRequest.options` — `POST /api/v1/responses` hardcodes
+ * both to `None` regardless of what the caller sends (`src/application/public.rs`),
+ * which is why the playground's priority/complexity controls are wired to the
+ * diagnose call, not the chat call.
+ */
+export interface ExecutionOptions {
+  allow_fallback?: boolean;
+  complexity_hint?: ComplexityTier | null;
+  max_fallbacks?: number | null;
+  max_retries?: number | null;
+  max_tokens?: number | null;
+  output_schema?: JsonValue;
+  priority?: number | null;
+  required_capabilities?: string[];
+  stream?: boolean;
+  temperature?: number | null;
+  timeout_ms?: number | null;
+}
+
+export const EXECUTION_OPTIONS_CONTRACT = {
+  schema: "ExecutionOptions",
+  required: [],
+  optional: [
+    "allow_fallback",
+    "complexity_hint",
+    "max_fallbacks",
+    "max_retries",
+    "max_tokens",
+    "output_schema",
+    "priority",
+    "required_capabilities",
+    "stream",
+    "temperature",
+    "timeout_ms",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionOptions,
+    (typeof EXECUTION_OPTIONS_CONTRACT)["required"][number],
+    (typeof EXECUTION_OPTIONS_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/DiagnosticExecutionRequest`. `additionalProperties: false`. */
+export interface DiagnosticExecutionRequest {
+  prompt: string;
+  application_id?: string | null;
+  credential_id?: string | null;
+  external_tenant_id?: string | null;
+  external_user_id?: string | null;
+  metadata?: JsonValue;
+  options?: ExecutionOptions;
+  provider_id?: string | null;
+  provider_model_id?: string | null;
+  route?: string | null;
+  stream?: boolean;
+}
+
+export const DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT = {
+  schema: "DiagnosticExecutionRequest",
+  required: ["prompt"],
+  optional: [
+    "application_id",
+    "credential_id",
+    "external_tenant_id",
+    "external_user_id",
+    "metadata",
+    "options",
+    "provider_id",
+    "provider_model_id",
+    "route",
+    "stream",
+  ],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    DiagnosticExecutionRequest,
+    (typeof DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT)["required"][number],
+    (typeof DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RuntimeEventType`. `snake_case` on the wire, matching `event_type` below verbatim. */
+export type RuntimeEventType =
+  | "execution_started"
+  | "routing_started"
+  | "route_selected"
+  | "agent_profile_unavailable"
+  | "model_selected"
+  | "candidate_ranked"
+  | "provider_attempt_started"
+  | "output_text_delta"
+  | "tool_call_started"
+  | "tool_call_delta"
+  | "tool_call_completed"
+  | "tool_result"
+  | "usage_updated"
+  | "provider_attempt_failed"
+  | "fallback_selected"
+  | "execution_completed"
+  | "execution_failed";
+
+/**
+ * `#/components/schemas/RuntimeEventEnvelope` — one entry of
+ * `DiagnosticExecutionResponse.events`, returned VERBATIM and unfiltered
+ * (unlike the public SSE stream's `map_runtime_event`). `payload`'s shape
+ * depends on `event_type`; see `modules/playground/PlaygroundToolCalls.tsx`
+ * and `PlaygroundRoutingSummary.tsx` for the field names each event carries,
+ * transcribed from `src/application/execution.rs`.
+ */
+export interface RuntimeEventEnvelope {
+  request_id: string;
+  execution_id: string;
+  sequence: number;
+  timestamp: string;
+  event_type: RuntimeEventType;
+  payload: JsonValue;
+}
+
+export const RUNTIME_EVENT_ENVELOPE_CONTRACT = {
+  schema: "RuntimeEventEnvelope",
+  required: ["request_id", "execution_id", "sequence", "timestamp", "event_type", "payload"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RuntimeEventEnvelope,
+    (typeof RUNTIME_EVENT_ENVELOPE_CONTRACT)["required"][number],
+    (typeof RUNTIME_EVENT_ENVELOPE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/AttemptStatus`. */
+export type AttemptStatus = "started" | "succeeded" | "failed" | "cancelled";
+
+/**
+ * `#/components/schemas/UsageSummary` — a schema DISTINCT from
+ * `PublicUsageSummary` above (no `currency`/`estimated_cost`), even though the
+ * two are field-for-field identical apart from that. Two separate schema names
+ * in `docs/openapi.json`, so two separate contracts here — see "the descriptor
+ * arrays do not overlap" in the contract test.
+ */
+export interface UsageSummary {
+  cached_input_tokens?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export const USAGE_SUMMARY_CONTRACT = {
+  schema: "UsageSummary",
+  required: [],
+  optional: ["cached_input_tokens", "input_tokens", "output_tokens", "reasoning_tokens", "total_tokens"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    UsageSummary,
+    (typeof USAGE_SUMMARY_CONTRACT)["required"][number],
+    (typeof USAGE_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ProviderAttemptSummary` — one row of `ExecutionOutcome.attempts`. */
+export interface ProviderAttemptSummary {
+  attempt_id: string;
+  attempt_number: number;
+  provider_id: string;
+  provider_model_id: string;
+  credential_id: string;
+  status: AttemptStatus;
+  usage: UsageSummary;
+  failure_class?: string | null;
+  latency_ms?: number | null;
+}
+
+export const PROVIDER_ATTEMPT_SUMMARY_CONTRACT = {
+  schema: "ProviderAttemptSummary",
+  required: [
+    "attempt_id",
+    "attempt_number",
+    "provider_id",
+    "provider_model_id",
+    "credential_id",
+    "status",
+    "usage",
+  ],
+  optional: ["failure_class", "latency_ms"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ProviderAttemptSummary,
+    (typeof PROVIDER_ATTEMPT_SUMMARY_CONTRACT)["required"][number],
+    (typeof PROVIDER_ATTEMPT_SUMMARY_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ModelSelectionReason` — why the FINAL model won, on `ExecutionOutcome.model`. */
+export type ModelSelectionReason = "explicit_hint" | "priority" | "weighted";
+
+/** `#/components/schemas/RouteSelectionReason`. */
+export type RouteSelectionReason =
+  | "explicit_hint"
+  | "rule_match"
+  | "application_default"
+  | "global_default";
+
+/**
+ * `#/components/schemas/AttemptSelectionReason` — why THIS candidate was tried,
+ * on the `candidate_ranked` event payload. Distinct from `ModelSelectionReason`
+ * — see that type's Rust doc comment, transcribed on `RuntimeEventType.candidate_ranked` above.
+ */
+export type AttemptSelectionReason = "priority" | "explicit_hint" | "scored" | "fallback_after_failure";
+
+/** `#/components/schemas/ModelDecision` — `ExecutionOutcome.model`. */
+export interface ModelDecision {
+  policy_id: string;
+  provider_id: string;
+  provider_model_id: string;
+  model_key: string;
+  provider_type: ProviderType;
+  reason: ModelSelectionReason;
+}
+
+export const MODEL_DECISION_CONTRACT = {
+  schema: "ModelDecision",
+  required: ["policy_id", "provider_id", "provider_model_id", "model_key", "provider_type", "reason"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ModelDecision,
+    (typeof MODEL_DECISION_CONTRACT)["required"][number],
+    (typeof MODEL_DECISION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/RouteDecision` — `ExecutionOutcome.route`. */
+export interface RouteDecision {
+  route_id: string;
+  route_key: string;
+  reason: RouteSelectionReason;
+  agent_profile_id?: string | null;
+}
+
+export const ROUTE_DECISION_CONTRACT = {
+  schema: "RouteDecision",
+  required: ["route_id", "route_key", "reason"],
+  optional: ["agent_profile_id"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    RouteDecision,
+    (typeof ROUTE_DECISION_CONTRACT)["required"][number],
+    (typeof ROUTE_DECISION_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ExecutionFailure`. `class` is typed loosely (`string`) rather than as the 34-variant `ExecutionFailureClass` enum — this console only displays it. */
+export interface ExecutionFailure {
+  class: string;
+  message: string;
+  retryable: boolean;
+  fallback_eligible: boolean;
+}
+
+export const EXECUTION_FAILURE_CONTRACT = {
+  schema: "ExecutionFailure",
+  required: ["class", "message", "retryable", "fallback_eligible"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionFailure,
+    (typeof EXECUTION_FAILURE_CONTRACT)["required"][number],
+    (typeof EXECUTION_FAILURE_CONTRACT)["optional"][number]
+  >
+>();
+
+/** `#/components/schemas/ExecutionStatus`. */
+export type ExecutionStatus = "succeeded" | "failed" | "cancelled";
+
+/** `#/components/schemas/ExecutionOutcome` — the typed half of `DiagnosticExecutionResponse`. */
+export interface ExecutionOutcome {
+  request_id: string;
+  execution_id: string;
+  status: ExecutionStatus;
+  usage: UsageSummary;
+  attempts: ProviderAttemptSummary[];
+  failure?: ExecutionFailure | null;
+  model?: ModelDecision | null;
+  output_text?: string | null;
+  route?: RouteDecision | null;
+  structured_output?: JsonValue;
+}
+
+export const EXECUTION_OUTCOME_CONTRACT = {
+  schema: "ExecutionOutcome",
+  required: ["request_id", "execution_id", "status", "usage", "attempts"],
+  optional: ["failure", "model", "output_text", "route", "structured_output"],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    ExecutionOutcome,
+    (typeof EXECUTION_OUTCOME_CONTRACT)["required"][number],
+    (typeof EXECUTION_OUTCOME_CONTRACT)["optional"][number]
+  >
+>();
+
+/**
+ * `#/components/schemas/DiagnosticExecutionResponse` — `outcome` is the typed,
+ * structured result; `events` is EVERY `RuntimeEventEnvelope` this execution
+ * emitted, unfiltered. `candidate_ranked`'s `candidates[]` (rank/score/reason)
+ * and every `tool_call_*`/`tool_result` event exist ONLY in `events` — neither
+ * appears in `outcome`.
+ */
+export interface DiagnosticExecutionResponse {
+  outcome: ExecutionOutcome;
+  events: RuntimeEventEnvelope[];
+}
+
+export const DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT = {
+  schema: "DiagnosticExecutionResponse",
+  required: ["outcome", "events"],
+  optional: [],
+} as const satisfies SchemaContract;
+
+assertKeyContract<
+  ExactKeys<
+    DiagnosticExecutionResponse,
+    (typeof DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT)["required"][number],
+    (typeof DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT)["optional"][number]
   >
 >();
 
@@ -1672,6 +3421,58 @@ export const SCHEMA_CONTRACTS: readonly SchemaContract[] = [
   ROUTING_POLICY_RECORD_CONTRACT,
   APPLICATION_RECORD_CONTRACT,
   APPLICATION_CREATE_REQUEST_CONTRACT,
+  SKILL_RECORD_CONTRACT,
+  SKILL_CREATE_REQUEST_CONTRACT,
+  SKILL_PATCH_REQUEST_CONTRACT,
+  SKILL_BULK_ENABLE_REQUEST_CONTRACT,
+  SKILL_BULK_ENABLE_RESPONSE_CONTRACT,
+  SKILL_IMPORT_REQUEST_CONTRACT,
+  SKILL_IMPORT_RESPONSE_CONTRACT,
+  SKILL_HTTP_EXECUTOR_RECORD_CONTRACT,
+  SKILL_HTTP_EXECUTOR_PATCH_REQUEST_CONTRACT,
+  PROVIDER_HEALTH_ENTRY_CONTRACT,
+  PROVIDER_HEALTH_RESPONSE_CONTRACT,
+  EVAL_SUITE_RECORD_CONTRACT,
+  EVAL_SUITE_CREATE_REQUEST_CONTRACT,
+  EVAL_SUITE_PATCH_REQUEST_CONTRACT,
+  EVAL_CASE_RECORD_CONTRACT,
+  EVAL_CASE_CREATE_REQUEST_CONTRACT,
+  EVAL_RUN_RECORD_CONTRACT,
+  AGENT_FLOW_STEP_RECORD_CONTRACT,
+  AGENT_FLOW_STEP_CREATE_REQUEST_CONTRACT,
+  AGENT_FLOW_RECORD_CONTRACT,
+  AGENT_FLOW_CREATE_REQUEST_CONTRACT,
+  AGENT_FLOW_PATCH_REQUEST_CONTRACT,
+  AGENT_FLOW_RUN_RECORD_CONTRACT,
+  AGENT_PROFILE_RECORD_CONTRACT,
+  GRAPH_NODE_CONTRACT,
+  GRAPH_EDGE_CONTRACT,
+  GRAPH_RESPONSE_CONTRACT,
+  CLAUDE_RUNNER_PROVISION_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_AUTHORIZATION_CODE_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_FINALIZE_REQUEST_CONTRACT,
+  CLAUDE_RUNNER_RECORD_CONTRACT,
   ERROR_DETAIL_CONTRACT,
   ERROR_RESPONSE_CONTRACT,
+  // --- the playground (issue #261) ---------------------------------------
+  PUBLIC_INPUT_MESSAGE_CONTRACT,
+  PUBLIC_RESPONSE_REQUEST_CONTRACT,
+  PUBLIC_CITATION_CONTRACT,
+  PUBLIC_CONVERSATION_REF_CONTRACT,
+  PUBLIC_ROUTE_REF_CONTRACT,
+  PUBLIC_MODEL_REF_CONTRACT,
+  PUBLIC_USAGE_SUMMARY_CONTRACT,
+  PUBLIC_RESPONSE_CONTRACT,
+  PUBLIC_SSE_ENVELOPE_CONTRACT,
+  PUBLIC_EXECUTION_SUMMARY_CONTRACT,
+  EXECUTION_OPTIONS_CONTRACT,
+  DIAGNOSTIC_EXECUTION_REQUEST_CONTRACT,
+  RUNTIME_EVENT_ENVELOPE_CONTRACT,
+  USAGE_SUMMARY_CONTRACT,
+  PROVIDER_ATTEMPT_SUMMARY_CONTRACT,
+  MODEL_DECISION_CONTRACT,
+  ROUTE_DECISION_CONTRACT,
+  EXECUTION_FAILURE_CONTRACT,
+  EXECUTION_OUTCOME_CONTRACT,
+  DIAGNOSTIC_EXECUTION_RESPONSE_CONTRACT,
 ];

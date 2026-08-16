@@ -51,6 +51,15 @@ describe("navigation", () => {
     expect(link.getAttribute("href")).toBe("/settings/auth");
   });
 
+  test("/runners is reachable without typing the URL", () => {
+    // Issue #275/#272 workstream R3's screen: the same failure mode as
+    // `/settings/llm` and `/settings/keys` above — a screen nothing links to is
+    // a screen nobody finds.
+    render(<ConsoleHeader />);
+    const link = screen.getByRole("link", { name: copy(CONSOLE_MESSAGE_KEYS.chrome_nav_runners) });
+    expect(link.getAttribute("href")).toBe("/runners");
+  });
+
   test("/settings/keys is reachable without typing the URL", () => {
     // Issue #180's screen, and the same failure mode as the one above: it is the
     // last step of a first run — the credential the operator's own software

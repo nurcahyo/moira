@@ -76,6 +76,41 @@ pub const ADMIN_SCOPES: &[&str] = &[
     "moira:skills:read",
     "moira:skills:write",
     "moira:skills:delete",
+    // Issue #214 (plan 12 §3) F2 — the deferred remainder of workstream F: eval suites
+    // (+ their nested cases and read-only runs) and flows (+ their embedded steps and
+    // read-only runs). Named against the `moira:skills:{read,write,delete}` precedent
+    // immediately above: one scope triple per registry, `write` covers create and patch,
+    // `delete` the soft delete. `read`/`write`/`delete` each also gate the nested child
+    // surface (cases under an eval suite; a flow's steps travel inside its own body) rather
+    // than minting a second scope triple per child table.
+    "moira:evals:read",
+    "moira:evals:write",
+    "moira:evals:delete",
+    "moira:flows:read",
+    "moira:flows:write",
+    "moira:flows:delete",
+    // Issue #234 (plan 12 §4) — the derived, read-only relationship graph. One scope, no
+    // `:write`/`:delete` siblings: the endpoint has no write side to gate. Implied by
+    // `moira:admin` like every scope in this list.
+    "moira:graph:read",
+    // Issue #275 (workstream R2 of #272) — containerised Claude runners. Named against the
+    // `moira:providers:{read,write,delete}` precedent, and for the same reason those three exist
+    // rather than one: `write` covers provisioning, submitting the authorization code and
+    // finalizing, while tearing a runner down destroys a container and is worth its own scope.
+    //
+    // `AuthorizationService::require` rejects an unknown scope with a 500, so these are not
+    // decoration: without them the whole `/api/v1/admin/runners…` surface would be unreachable
+    // rather than unprotected. Implied by `moira:admin` like every scope in this list.
+    //
+    // Note what `moira:runners:write` deliberately does NOT imply: finalizing a runner mints a
+    // provider credential, and that write goes through `AdminService::create_credential`, which
+    // asks for `moira:credentials:write` on its own. A caller holding only the runner scopes can
+    // drive a runner to `ready` and cannot turn its token into a stored credential. That is the
+    // intended shape — the credential chain's authorization is not something this surface may
+    // borrow past.
+    "moira:runners:read",
+    "moira:runners:write",
+    "moira:runners:delete",
     "moira:runtime-policies:read",
     "moira:runtime-policies:write",
     // Issue #213 — context router MVP-static slice. `application_routing_defaults` admin

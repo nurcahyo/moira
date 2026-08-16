@@ -82,9 +82,32 @@ allow_insecure_dev_pepper = true
 # than clamping it; see `src/security/api_keys.rs`.
 prefix_length = 20
 
+# Concurrent Argon2id operations (verify on every authenticated request, hash on every key mint).
+# This is a MEMORY budget as much as a concurrency one: one operation holds a 19 MiB arena
+# resident, so the peak is this number x 19 MiB against `resources.limits.memory` in
+# `charts/moira/values.yaml` — 2Gi as shipped. Commented out, which means "derive it": one permit
+# per core, clamped to [1, 8]. Rust reads the cgroup CPU quota, so the chart's `limits.cpu: "2"`
+# derives 2 permits and a 38 MiB peak, 1.9% of the limit.
+#
+# Argon2id at p=1 is single-threaded per call, so raising this above the core count buys ZERO
+# throughput and costs 19 MiB and queueing latency per extra permit. Raise `resources.limits.cpu`
+# and this together, or leave it derived. `Settings::validate` refuses 0 and anything above 64.
+# verification_concurrency = 2
+
+# How long a request waits for one of those permits before being refused with a
+# `503 auth_verification_overloaded`. Not zero: instant shedding at a bound of 2 would refuse a
+# well-behaved caller's two-request burst. Not the route timeout either, which is never below
+# 30 s — a thirty-second wait for a credential check is a different outage, not a fix. 250 ms is
+# roughly five service times at a bound of 2, so a burst absorbs and a real overload is refused
+# in a quarter of a second. See `src/security/api_keys.rs`.
+verification_queue_timeout_ms = 250
+
 [provider_security]
 allow_private_provider_urls = false
 allow_http_provider_urls = false
+# ToS risk-acceptance opt-in for the chatgpt_oauth provider (issue #216). Off by default in
+# every environment, including production; see ProviderSecuritySettings::allow_chatgpt_subscription.
+allow_chatgpt_subscription = false
 
 [cors]
 allowed_origins = ["*"]
@@ -165,3 +188,38 @@ prometheus_enabled = false
 metrics_path = "/metrics"
 otel_enabled = false
 otel_endpoint = ""
+
+# How an agent profile's enabled `skill_refs` are executed as rig tools (issue #84,
+# plan 12 §5). A skill target is a third-party HTTP endpoint an operator imported, so
+# every value here bounds a call into someone else's infrastructure.
+[skill_execution]
+# Total model calls one tool-bearing execution may make. A tool call plus a final answer
+# needs at least 2.
+maximum_tool_turns = 4
+maximum_advertised_tools = 32
+maximum_response_bytes = 65536
+dns_timeout_ms = 5000
+# Dev only. Production start-up refuses to come up while this is true. Import never
+# honours it — only the execution-time SSRF re-check.
+allow_insecure_dev_urls = false
+
+# The moira-runner control endpoint (issue #275, workstream R2 of #272).
+#
+# moira-runner is the ONLY component that talks to the Docker Engine API, which is
+# root-equivalent on its host. Moira never holds Docker access; it calls this endpoint
+# server-to-server instead. Deployment topology, not runtime configuration — which is why it
+# lives here rather than in a table the admin API can rewrite.
+[claude_runner]
+# Off by default: a deployment with no runner service is the normal case. While false the whole
+# /api/v1/admin/runners surface answers 503 runner_service_disabled before any network call.
+enabled = false
+# Scheme, host and port only; the client appends /v1/runners…. The contract's default bind is
+# loopback, and production start-up refuses a non-loopback http:// address.
+base_url = "http://127.0.0.1:8090"
+# Bearer token presented on every runner call. Never logged, never returned, never in an error.
+# Empty here and supplied by MOIRA_CLAUDE_RUNNER__AUTH_TOKEN; token material never lives in a
+# committed file. Start-up refuses an enabled runner with no token.
+auth_token = ""
+# Total budget for one runner call — applied as both request and connect timeout on the
+# purpose-built client, so a call site that forgets its own timeout still cannot hang.
+request_timeout_ms = 10000

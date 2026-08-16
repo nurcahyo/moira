@@ -1046,15 +1046,19 @@ impl ConversationService {
         .await
         .map_err(|_| FAILURE_RETRIEVAL_BACKEND)?
         .ok_or(FAILURE_EMBEDDING_NOT_CONFIGURED)?;
-        let handle = RigEmbeddingFactory::new()
-            .build_embedding_model(
-                &provider,
-                &model_key,
-                &credential,
-                SUPPORTED_EMBEDDING_DIMENSION,
-            )
-            .await
-            .map_err(|_| FAILURE_EMBEDDING_NOT_CONFIGURED)?;
+        let handle = RigEmbeddingFactory::new(
+            crate::security::ProviderEndpointPolicy::from_provider_security(
+                &self.state.settings.provider_security,
+            ),
+        )
+        .build_embedding_model(
+            &provider,
+            &model_key,
+            &credential,
+            SUPPORTED_EMBEDDING_DIMENSION,
+        )
+        .await
+        .map_err(|_| FAILURE_EMBEDDING_NOT_CONFIGURED)?;
         let started = std::time::Instant::now();
         let vectors = embed_texts(
             &handle,
@@ -1414,6 +1418,7 @@ impl ConversationService {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions {
                 // Zero temperature: the same transcript must produce the same candidates, or
                 // the dedupe below is testing a moving target.
@@ -1999,6 +2004,7 @@ impl ConversationService {
             provider_hint: None,
             model_hint: None,
             credential_hint: None,
+            agent_profile_hint: None,
             options: ExecutionOptions {
                 // Zero temperature: two runs over the same backlog must produce the same
                 // summary, or `summary_hash` stops being a content address of anything.
@@ -3075,14 +3081,18 @@ impl ConversationService {
             ));
         };
 
-        let handle = match RigEmbeddingFactory::new()
-            .build_embedding_model(
-                &provider,
-                &model_key,
-                &credential,
-                SUPPORTED_EMBEDDING_DIMENSION,
-            )
-            .await
+        let handle = match RigEmbeddingFactory::new(
+            crate::security::ProviderEndpointPolicy::from_provider_security(
+                &self.state.settings.provider_security,
+            ),
+        )
+        .build_embedding_model(
+            &provider,
+            &model_key,
+            &credential,
+            SUPPORTED_EMBEDDING_DIMENSION,
+        )
+        .await
         {
             Ok(handle) => handle,
             // A provider that cannot embed, or a client that will not build, is a

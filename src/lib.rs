@@ -9,6 +9,11 @@ pub mod http;
 pub mod i18n;
 pub mod infra;
 pub mod orchestration;
+/// `moira-runner`'s implementation. Compiled into the library so that both the second binary
+/// (`src/bin/moira-runner.rs`) and the integration suite can reach it; nothing in the `moira`
+/// binary's own path refers to it, and the Docker capability it holds is confined to
+/// `src/runner/docker_engine.rs` by a test in `src/runner/mod.rs`.
+pub mod runner;
 pub mod security;
 /// Database scaffolding for this crate's own `#[cfg(test)]` modules.
 ///

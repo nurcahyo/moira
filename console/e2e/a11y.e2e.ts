@@ -133,6 +133,12 @@ const SIGN_IN_PATH = "/login";
 const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   "/",
   "/admins",
+  // Plan 12 workstream G (relationship graph). Gated inside `(console)`, so the
+  // walker asserts the redirect to `/login` and audits nothing — a real gap
+  // pending an authenticated a11y spec, the same shape as `/settings/keys` and
+  // `/settings/auth` below. The react-flow canvas will want its own audit when
+  // that authenticated stack can render it.
+  "/graph",
   // Issue #74. Inside `(console)`, so the walker below asserts it redirects to
   // `/login` and does NOT audit it. Listed rather than silently uncovered: the
   // bidirectional assertion means adding a gated screen without touching this
@@ -156,6 +162,26 @@ const ROUTES_NOT_AUDITED_PENDING_AUTHENTICATED_E2E: readonly string[] = [
   // authenticated spec renders it, and the surface it hides is the one that
   // decides whether anybody can sign in at all.
   "/settings/auth",
+  // Plan 12 §5, issue #237 — the skill registry and OpenAPI import screen.
+  // Gated like the rest of `(console)`, so the walker asserts the redirect and
+  // audits nothing. A real gap: no authenticated spec renders this screen yet.
+  "/skills",
+  // Issue #83 — the provider health dashboard. Same gap shape as `/skills`.
+  "/providers/health",
+  // Plan 12 §3 — eval suites, cases and runs. Same gap shape as `/skills`.
+  "/evals",
+  // Plan 12 §6 — multi-agent flow authoring. Same gap shape as `/skills`.
+  "/flows",
+  // Issue #261 — the test-chat playground. Same gap shape as `/skills`: gated
+  // like the rest of `(console)`, so the walker asserts the redirect and
+  // audits nothing. No authenticated spec renders this screen yet.
+  "/playground",
+  // Issue #275/#272 workstream R3. Gated like the rest of `(console)`, so the
+  // walker asserts the redirect and audits nothing. A real gap, like
+  // `/settings/keys` and `/settings/auth`: no authenticated spec renders
+  // either of these two yet.
+  "/runners",
+  "/runners/[id]",
 ];
 
 /** The pathname a route's fixture URL resolves to. */

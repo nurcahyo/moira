@@ -199,6 +199,70 @@ const ADMIN_IDENTITY_GRANT_EVENTS_TOTAL: &str = "moira_admin_identity_grant_even
 const CONTENT_KEYRING_REFRESH_FAILED_TOTAL: &str = "moira_content_keyring_refresh_failed_total";
 const CONTENT_KEYRING_AGE_SECONDS: &str = "moira_content_keyring_age_seconds";
 
+// The API-key verification gate (#176), `src/security/api_keys.rs`.
+//
+// Two families for one control, and the pair is the point. The counter says whether the process
+// is refusing credential checks; the histogram says how close it is to doing so before the first
+// refusal appears. Neither alone answers the operator's question, which is "is my
+// `api_keys.verification_concurrency` too small for this traffic, and how long have I got".
+//
+// Written at all because the gate is otherwise invisible in the good case and indistinguishable
+// from a client bug in the bad one: an `auth_verification_overloaded` reaches the caller as a
+// `503`, and without `outcome="shed"` climbing on a dashboard the natural reading of a burst of
+// `503`s from an authenticated client is "the database is down".
+//
+// `outcome` is the existing closed key, taking exactly two values here. There is deliberately no
+// `route`, no `application_id` and no key id: the gate is process-wide, so a per-caller
+// breakdown would be unbounded cardinality answering a question this control cannot ask.
+const API_KEY_VERIFICATION_TOTAL: &str = "moira_api_key_verification_total";
+const API_KEY_VERIFICATION_QUEUE_SECONDS: &str = "moira_api_key_verification_queue_seconds";
+
+/// The closed `outcome` domain for `moira_api_key_verification_total`. Both are seeded at zero,
+/// so "the auth gate started shedding" alerts on a rate rather than on a series appearing.
+const API_KEY_VERIFICATION_OUTCOMES: &[&str] = &["admitted", "shed"];
+
+/// Which Argon2id operation took — or was refused — a gate permit.
+///
+/// Verification and minting share one gate because they are the same class of work against the
+/// same memory budget, and that sharing is deliberate. Without this label it is also invisible:
+/// three concurrent admin key mints can shed authenticated traffic for a queue timeout, and the
+/// operator watching `outcome="shed"` rise would have no way to tell that from a genuine auth
+/// overload. The two have completely different responses — one is "someone is rotating keys",
+/// the other is "raise the bound and the CPU limit together".
+///
+/// An enum rather than a `&str` parameter, for the reason #173 was about: the label domain has
+/// to be closed at the type level, not by the discipline of every future caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyHashOperation {
+    /// Checking a presented credential against a stored hash — the request path.
+    Verify,
+    /// Minting a new stored hash — admin key issuance and invite creation.
+    Mint,
+}
+
+impl ApiKeyHashOperation {
+    /// The closed `operation` domain, seeded at zero across both outcomes.
+    pub const ALL: [Self; 2] = [Self::Verify, Self::Mint];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Verify => "verify",
+            Self::Mint => "mint",
+        }
+    }
+}
+
+/// Queue wait for one Argon2 permit, in seconds.
+///
+/// Resolution is concentrated far below the 250 ms default shed timeout, because the interesting
+/// region is "waits have started to exist at all" — an uncontended acquire is sub-microsecond, and
+/// by the time the p99 reaches the timeout the counter above is already telling the story. The
+/// tail stops just past the largest timeout an operator would plausibly configure.
+const API_KEY_VERIFICATION_QUEUE_BUCKETS_SECONDS: &[f64] = &[
+    0.000_1, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+];
+
 // How many data keys this replica holds, per lifecycle state. Written by the keyring on every
 // successful load, which is the only moment the answer can change for this process.
 //
@@ -360,6 +424,20 @@ const OAUTH_CREDENTIAL_STATUS: &str = "moira_oauth_credential_status";
 const OAUTH_REFRESH_TOTAL: &str = "moira_oauth_refresh_total";
 const FLOW_STEP_TOTAL: &str = "moira_flow_step_total";
 const FLOW_DURATION_SECONDS: &str = "moira_flow_duration_seconds";
+
+// Issue #83 — provider health, wired immediately (not "declare ahead of the caller" like the
+// block above): `src/infra/workers/provider_health_check.rs` is this family's first and only
+// caller today, landing in the same change that declares it.
+const PROVIDER_HEALTH_PROBE_TOTAL: &str = "moira_provider_health_probe_total";
+const PROVIDER_HEALTH_STATUS: &str = "moira_provider_health_status";
+
+/// The closed `status` domain both provider-health families share — exactly
+/// `classify_probe`'s three possible outputs (`src/infra/workers/provider_health_check.rs`).
+/// `unknown` (the fourth value `provider_health_snapshots.status` allows) is deliberately
+/// absent: no probe this worker runs ever classifies as `unknown`, that value only ever
+/// appears as the *absence* of a recent snapshot, which is a fact about the read side
+/// (`GET /api/v1/admin/providers/health`), not a value either metric family emits.
+const PROVIDER_HEALTH_STATUSES: &[&str] = &["healthy", "degraded", "unhealthy"];
 
 /// The closed `status` domain for `moira_oauth_credential_status`. The four states
 /// `docs/grafana.md`'s gap table names for the OAuth credential health row this family backs.
@@ -762,6 +840,27 @@ impl MetricsRegistry {
             );
 
             describe_counter!(
+                API_KEY_VERIFICATION_TOTAL,
+                "Argon2id credential-hashing admissions, by operation and outcome. admitted is one \
+                 operation that took a permit from the api_keys.verification_concurrency gate; \
+                 shed is one refused with a 503 auth_verification_overloaded after waiting \
+                 api_keys.verification_queue_timeout_ms for one. operation=verify is the request \
+                 path, operation=mint is key issuance; both draw on the same gate, so read the \
+                 two together before concluding anything — a shed spike alongside mint traffic is \
+                 a key rotation, not an auth overload. A sustained shed rate on verify alone means \
+                 the gate is smaller than the authenticated traffic needs: raise \
+                 resources.limits.cpu and the bound together, because the bound is sized from \
+                 cores."
+            );
+            describe_histogram!(
+                API_KEY_VERIFICATION_QUEUE_SECONDS,
+                "Time an Argon2id credential operation spent waiting for a gate permit, in \
+                 seconds. Admitted operations only: a shed one waited exactly the configured \
+                 timeout by construction, so recording it would pile a constant onto the \
+                 distribution and hide the rise that precedes it. This is the leading indicator; \
+                 moira_api_key_verification_total{outcome=\"shed\"} is the lagging one."
+            );
+            describe_counter!(
                 PROVIDER_TOKENS_TOTAL,
                 "Token usage by provider type and direction (in = prompt/input tokens, out = \
                  completion/output tokens). No emit site calls this yet — token usage today is \
@@ -806,6 +905,18 @@ impl MetricsRegistry {
                 "Wall-clock time for one complete agent-flow run, by flow key, in seconds. Not \
                  seeded, like every other histogram in this module: its label values are dynamic."
             );
+            describe_counter!(
+                PROVIDER_HEALTH_PROBE_TOTAL,
+                "Provider reachability probes performed by the provider-health-check worker, \
+                 by provider type and the bounded status the probe classified as."
+            );
+            describe_gauge!(
+                PROVIDER_HEALTH_STATUS,
+                "How many enabled providers of each type are currently in each health status, \
+                 as of the most recent provider-health-check run. A provider not yet probed \
+                 (worker disabled, or newly created) counts toward none of the three buckets, \
+                 which is why the three need not sum to the provider count."
+            );
 
             gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(0.0);
             gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(0.0);
@@ -848,6 +959,16 @@ impl MetricsRegistry {
             }
             for event in ADMIN_IDENTITY_GRANT_EVENTS {
                 counter!(ADMIN_IDENTITY_GRANT_EVENTS_TOTAL, "event" => *event).increment(0);
+            }
+            for operation in ApiKeyHashOperation::ALL {
+                for outcome in API_KEY_VERIFICATION_OUTCOMES {
+                    counter!(
+                        API_KEY_VERIFICATION_TOTAL,
+                        "operation" => operation.label(),
+                        "outcome" => *outcome
+                    )
+                    .increment(0);
+                }
             }
             // Both envelope families that *can* be seeded are, across their full closed domains:
             // five profiles for seals, and five profiles times sixteen reasons for refusals. The
@@ -899,6 +1020,20 @@ impl MetricsRegistry {
                         "outcome" => *outcome
                     )
                     .increment(0);
+                }
+                for status in PROVIDER_HEALTH_STATUSES {
+                    counter!(
+                        PROVIDER_HEALTH_PROBE_TOTAL,
+                        "provider_type" => provider,
+                        "status" => *status
+                    )
+                    .increment(0);
+                    gauge!(
+                        PROVIDER_HEALTH_STATUS,
+                        "provider_type" => provider,
+                        "status" => *status
+                    )
+                    .set(0.0);
                 }
             }
         });
@@ -1155,6 +1290,40 @@ impl MetricsRegistry {
                 "outcome" => outcome
             )
             .increment(1);
+        });
+    }
+
+    /// Records one attempt to take a permit from the Argon2id credential-hashing gate (#176).
+    ///
+    /// `queue_wait` is `Some` exactly when `admitted` is true. That is not a convenience: a shed
+    /// waited the configured timeout by construction, so histogramming it would add a spike at a
+    /// constant and bury the rising p99 that is the only early warning this control has. The
+    /// `Option` makes "there is nothing meaningful to record here" a shape the caller has to
+    /// state, rather than a value it could plausibly pass by accident.
+    ///
+    /// `operation` separates the request path from key minting, which share the gate. Four series
+    /// total, and the counter carries the label while the histogram does not: queue wait is a
+    /// property of the *gate*, and splitting its buckets would double the series to answer a
+    /// question — "do mints wait longer than verifies?" — nobody is asking of a shared FIFO.
+    pub fn record_api_key_verification(
+        &self,
+        operation: ApiKeyHashOperation,
+        admitted: bool,
+        queue_wait: Option<Duration>,
+    ) {
+        let outcome = if admitted { "admitted" } else { "shed" };
+        let operation = operation.label();
+        let seconds = queue_wait.map(|wait| wait.as_secs_f64());
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                API_KEY_VERIFICATION_TOTAL,
+                "operation" => operation,
+                "outcome" => outcome
+            )
+            .increment(1);
+            if let Some(seconds) = seconds {
+                histogram!(API_KEY_VERIFICATION_QUEUE_SECONDS).record(seconds);
+            }
         });
     }
 
@@ -1536,6 +1705,59 @@ impl MetricsRegistry {
         });
     }
 
+    /// Counts one provider-health-check reachability probe.
+    ///
+    /// `status` outside [`PROVIDER_HEALTH_STATUSES`] is folded to `unhealthy` — the same
+    /// fail-closed convention `record_routing_decision`'s `other` bucket follows for an
+    /// unrecognised reason, applied to the family whose whole point is signalling trouble
+    /// rather than hiding an unrecognised value in a silently-dropped series.
+    pub fn record_provider_health_probe(&self, provider_type: ProviderType, status: &str) {
+        let provider = provider_type_label(provider_type);
+        let status = PROVIDER_HEALTH_STATUSES
+            .iter()
+            .find(|candidate| **candidate == status)
+            .copied()
+            .unwrap_or("unhealthy");
+        with_local_recorder(&self.inner.recorder, || {
+            counter!(
+                PROVIDER_HEALTH_PROBE_TOTAL,
+                "provider_type" => provider,
+                "status" => status
+            )
+            .increment(1);
+        });
+    }
+
+    /// Sets `moira_provider_health_status{provider_type,status}` from a freshly counted
+    /// distribution for one provider type — the same whole-distribution-at-once shape as
+    /// [`Self::set_oauth_credential_status`], for the same reason: a bucket that dropped to
+    /// zero (every provider of this type moved out of `degraded`, say) has to be *written* as
+    /// zero or the gauge keeps its last value forever.
+    pub fn set_provider_health_status(
+        &self,
+        provider_type: ProviderType,
+        healthy: usize,
+        degraded: usize,
+        unhealthy: usize,
+    ) {
+        let provider = provider_type_label(provider_type);
+        with_local_recorder(&self.inner.recorder, || {
+            for (status, count) in [
+                ("healthy", healthy),
+                ("degraded", degraded),
+                ("unhealthy", unhealthy),
+            ] {
+                #[allow(clippy::cast_precision_loss)]
+                gauge!(
+                    PROVIDER_HEALTH_STATUS,
+                    "provider_type" => provider,
+                    "status" => status
+                )
+                .set(count as f64);
+            }
+        });
+    }
+
     /// Counts one agent-flow step reaching a terminal status.
     ///
     /// `flow_key` and `agent_key` are admin-configured identifiers — `agent_flows.flow_key` and
@@ -1685,7 +1907,7 @@ impl TokenDirection {
 /// enum without a matching addition here would silently under-seed rather than fail to compile,
 /// which is why a test below pins this list's length against the number of arms
 /// `provider_type_label` has to stay exhaustive over.
-const ALL_PROVIDER_TYPES: [ProviderType; 8] = [
+const ALL_PROVIDER_TYPES: [ProviderType; 9] = [
     ProviderType::OpenAiCompatible,
     ProviderType::OpenAi,
     ProviderType::Anthropic,
@@ -1694,6 +1916,7 @@ const ALL_PROVIDER_TYPES: [ProviderType; 8] = [
     ProviderType::AzureOpenAi,
     ProviderType::Local,
     ProviderType::Custom,
+    ProviderType::ChatgptOauth,
 ];
 
 /// `job_name` as a label value, or `None` if Moira has never declared that job.
@@ -1733,6 +1956,10 @@ fn build_recorder(service_name: &str) -> PrometheusRecorder {
         ),
         (RETRIEVAL_LATENCY_SECONDS, RETRIEVAL_LATENCY_BUCKETS_SECONDS),
         (FLOW_DURATION_SECONDS, FLOW_DURATION_BUCKETS_SECONDS),
+        (
+            API_KEY_VERIFICATION_QUEUE_SECONDS,
+            API_KEY_VERIFICATION_QUEUE_BUCKETS_SECONDS,
+        ),
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), buckets)
@@ -1785,6 +2012,7 @@ pub(crate) fn provider_type_label(provider_type: ProviderType) -> &'static str {
         ProviderType::AzureOpenAi => "azure_openai",
         ProviderType::Local => "local",
         ProviderType::Custom => "custom",
+        ProviderType::ChatgptOauth => "chatgpt_oauth",
     }
 }
 
@@ -1815,6 +2043,7 @@ fn failure_class_label(class: ExecutionFailureClass) -> &'static str {
         ExecutionFailureClass::RouteForbidden => "route_forbidden",
         ExecutionFailureClass::AgentProfileNotFound => "agent_profile_not_found",
         ExecutionFailureClass::AgentProfileDisabled => "agent_profile_disabled",
+        ExecutionFailureClass::SkillUnavailable => "skill_unavailable",
         ExecutionFailureClass::ModelNotFound => "model_not_found",
         ExecutionFailureClass::ModelForbidden => "model_forbidden",
         ExecutionFailureClass::ModelCapabilityMismatch => "model_capability_mismatch",
@@ -2603,6 +2832,90 @@ mod tests {
         )));
     }
 
+    /// The Argon2 gate's two families (#176).
+    ///
+    /// Both `outcome` series are asserted seeded, and that is the load-bearing half: the alert an
+    /// operator writes is `rate(moira_api_key_verification_total{outcome="shed"}[5m])`, and on a
+    /// process that has never shed one, an unseeded family evaluates to "no data" rather than to
+    /// zero — which is indistinguishable from the exporter having lost the family.
+    ///
+    /// The histogram is asserted to move on an admission and **not** on a shed. That asymmetry is
+    /// deliberate (a shed waited exactly the timeout, so it carries no information and would
+    /// distort the tail) and it is the sort of intent that quietly inverts on a later edit.
+    ///
+    /// All four `operation` x `outcome` series are asserted seeded and asserted to move
+    /// independently. The pair that matters is `verify`/`shed` against `mint`/`shed`: they share
+    /// one gate, so without the split an operator cannot tell an authentication overload from
+    /// somebody rotating keys, and the two have different responses.
+    #[test]
+    fn the_api_key_verification_gate_seeds_both_outcomes_and_times_only_admissions() {
+        let metrics = registry();
+        let seeded = metrics.render_prometheus("moira-test", false, false);
+        for operation in ApiKeyHashOperation::ALL {
+            for outcome in API_KEY_VERIFICATION_OUTCOMES {
+                let operation = operation.label();
+                assert!(
+                    seeded.contains(&format!(
+                        "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",\
+                         operation=\"{operation}\",outcome=\"{outcome}\"}} 0"
+                    )),
+                    "{API_KEY_VERIFICATION_TOTAL} is missing its zero-seeded \
+                     {operation}/{outcome} series:\n{seeded}"
+                );
+            }
+        }
+
+        metrics.record_api_key_verification(
+            ApiKeyHashOperation::Verify,
+            true,
+            Some(Duration::from_millis(4)),
+        );
+        metrics.record_api_key_verification(ApiKeyHashOperation::Verify, false, None);
+        metrics.record_api_key_verification(ApiKeyHashOperation::Verify, false, None);
+        metrics.record_api_key_verification(ApiKeyHashOperation::Mint, false, None);
+        let rendered = metrics.render_prometheus("moira-test", false, false);
+
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"verify\",\
+             outcome=\"admitted\"}} 1"
+        )));
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"verify\",\
+             outcome=\"shed\"}} 2"
+        )));
+        // The whole point of the label: the mint shed did not land in the verify series, so a
+        // key rotation cannot be read off the dashboard as an authentication overload.
+        assert!(
+            rendered.contains(&format!(
+                "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"mint\",\
+                 outcome=\"shed\"}} 1"
+            )),
+            "the mint shed was folded into another series:\n{rendered}"
+        );
+        assert!(rendered.contains(&format!(
+            "{API_KEY_VERIFICATION_TOTAL}{{service=\"moira-test\",operation=\"mint\",\
+             outcome=\"admitted\"}} 0"
+        )));
+
+        // One observation in the histogram, from the one admission — not four. The histogram
+        // carries no `operation` label, so this also pins that the split did not reach it.
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "+Inf"),
+            1,
+            "the queue histogram must record admissions only:\n{rendered}"
+        );
+        // And it landed in a bucket that can see a 4 ms wait, which is what makes the bucket
+        // choice a measurement rather than decoration.
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "0.001"),
+            0
+        );
+        assert_eq!(
+            bucket_count(&rendered, API_KEY_VERIFICATION_QUEUE_SECONDS, "0.005"),
+            1
+        );
+    }
+
     /// The three envelope families' label keys and values, checked at the registry.
     ///
     /// The *wiring* is asserted end to end in `tests/content_envelope_metrics.rs`, against a real
@@ -2770,7 +3083,7 @@ mod tests {
         labels.dedup();
         assert_eq!(
             labels.len(),
-            8,
+            9,
             "ALL_PROVIDER_TYPES must carry one entry per ProviderType variant, no duplicates"
         );
     }

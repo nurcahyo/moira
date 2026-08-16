@@ -1,15 +1,17 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
+use axum::http::StatusCode;
 use futures_util::{Stream, StreamExt};
 use rig_core::{
     OneOrMany,
     client::CompletionClient,
     completion::{
         AssistantContent, CompletionError, CompletionModel as RigCompletionModel,
-        CompletionRequest, CompletionResponse, GetTokenUsage, Message, Usage, message::UserContent,
+        CompletionRequest, CompletionResponse, GetTokenUsage, Message, Usage,
+        message::{ToolCall, UserContent},
     },
-    providers::{anthropic, azure, deepseek, gemini, openai},
+    providers::{anthropic, azure, chatgpt, deepseek, gemini, openai},
     streaming::StreamedAssistantContent,
 };
 use secrecy::ExposeSecret;
@@ -24,10 +26,116 @@ use crate::{
     },
     error::AppError,
     orchestration::normalize_openai_base_url,
+    security::ProviderEndpointPolicy,
 };
 
+/// Error code returned when a `chatgpt_oauth` provider is configured or executed without this
+/// deployment explicitly accepting the ToS risk. See
+/// [`require_chatgpt_subscription_opt_in`].
+pub const CHATGPT_SUBSCRIPTION_OPT_IN_REQUIRED: &str = "chatgpt_subscription_opt_in_required";
+
+/// Refuses `ProviderType::ChatgptOauth` — at admin-write time
+/// (`application::admin::providers::ProviderAdminService::create_provider`) and at execution
+/// time (this file's `build_completion_model` arm alike) — unless this deployment has
+/// explicitly opted in via `provider_security.allow_chatgpt_subscription`. A no-op for every
+/// other provider type.
+///
+/// **This is a deliberate ToS risk-acceptance gate, not a capability check.** Issue #216 /
+/// `docs/chatgpt-subscription-spike.md` establish that rig-core 0.40 ships a first-party
+/// `chatgpt` provider (`rig_core::providers::chatgpt`) targeting
+/// `chatgpt.com/backend-api/codex` that is technically wireable through the exact
+/// `RuntimeFactory` seam every other provider uses — the blocker was never "no rig-core
+/// provider", it is that ChatGPT/Codex subscriptions are personal, single-user under OpenAI's
+/// terms, with no carve-out for third-party, multi-tenant use analogous to Anthropic's
+/// reinstated third-party agent usage. Wiring this provider into a multi-tenant gateway is this
+/// deployment operator's own explicit acceptance of that risk for their own subscription — never
+/// a silent default, and never softened in the error this refusal returns.
+///
+/// Called from two places on purpose, not one: the admin-write-time check gives an operator
+/// immediate, actionable feedback before a `chatgpt_oauth` provider row can even be created; the
+/// execution-time check is defense in depth against a row that was created while the flag was on
+/// and is now stale, or against direct database access that bypassed the admin API entirely — so
+/// "never a silent attempt" holds regardless of how the row came to exist.
+pub fn require_chatgpt_subscription_opt_in(
+    provider_type: ProviderType,
+    allow_chatgpt_subscription: bool,
+) -> Result<(), AppError> {
+    if provider_type != ProviderType::ChatgptOauth || allow_chatgpt_subscription {
+        return Ok(());
+    }
+    // The code argument below is deliberately the literal, not the
+    // `CHATGPT_SUBSCRIPTION_OPT_IN_REQUIRED` constant:
+    // `i18n::catalog::tests::every_coded_error_literal_in_src_has_a_catalog_entry` scans
+    // `AppError::coded(...)` call sites for a literal code argument to prove every code Moira
+    // can emit has a catalog entry, and only recognises a bare `&'static str` there — an
+    // identifier reads as a dynamic site with no enumerable value set and fails that scan.
+    // `EMBEDDING_PROVIDER_UNSUPPORTED` in `orchestration/embedding.rs` follows the same split:
+    // the constant exists for callers to assert against without duplicating the string: the
+    // throw site spells it out.
+    Err(AppError::coded(
+        StatusCode::FORBIDDEN,
+        "chatgpt_subscription_opt_in_required",
+        "the chatgpt_oauth provider is disabled for this deployment; set \
+         provider_security.allow_chatgpt_subscription=true to enable it. ChatGPT/Codex \
+         subscriptions are personal, single-user under OpenAI's terms, and wiring them into a \
+         multi-tenant gateway is this deployment's own explicit ToS risk acceptance, not a \
+         sanctioned integration path",
+    ))
+}
+
 #[derive(Debug, Clone)]
-pub struct RigRuntimeFactory;
+pub struct RigRuntimeFactory {
+    /// Mirrors `config::ProviderSecuritySettings::allow_chatgpt_subscription`. Set once, at
+    /// construction (`MoiraExecutionService::new`), from resolved `Settings` — not re-read per
+    /// request, the same way every other static provider-security posture in this file is
+    /// captured once rather than threaded through per call.
+    allow_chatgpt_subscription: bool,
+    /// The address space this deployment permits a provider credential to be sent to,
+    /// captured from `provider_security` for the same reason the flag above is.
+    ///
+    /// See [`guard_endpoint`] and [`crate::security::provider_endpoint`].
+    endpoint_policy: ProviderEndpointPolicy,
+}
+
+/// Refuses to build a client pointed at an address this deployment's `provider_security`
+/// policy does not permit — **the use-time half of issue #251's class**.
+///
+/// Every arm of [`RigRuntimeFactory::build_completion_model`] below hands
+/// `credential.secret` to a Rig client aimed at exactly one address. This is the single place
+/// that address is checked, and it runs on every build rather than only on the admin write,
+/// because two of the three sources feeding it were never checked at write time at all:
+/// `credential.config["endpoint"]` (the Azure override, unread by
+/// `validate_credential_secret` until this change) and anything that reaches the tables
+/// without an admin request — a migration, a restore, a direct `psql` edit.
+///
+/// It is deliberately DNS-free; [`crate::security::provider_endpoint`] states exactly what
+/// that does and does not buy, and why this cannot be
+/// [`crate::security::validate_outbound_url`] instead.
+///
+/// The public message names the subject and nothing else. The server-side WARN carries the
+/// denial class and the value, which can name an internal address.
+pub(crate) fn guard_endpoint(
+    policy: ProviderEndpointPolicy,
+    subject: &'static str,
+    value: &str,
+) -> Result<(), AppError> {
+    match policy.permits(value) {
+        Ok(()) => Ok(()),
+        Err(denial) => {
+            tracing::warn!(
+                subject,
+                reason = denial.as_str(),
+                endpoint = value,
+                "refusing to send a provider credential to an address this deployment's \
+                 provider_security policy does not permit"
+            );
+            Err(AppError::Config(format!(
+                "{subject} is not an address this deployment permits a provider credential to \
+                 be sent to"
+            )))
+        }
+    }
+}
 
 #[async_trait]
 pub trait RuntimeFactory: Send + Sync {
@@ -47,6 +155,9 @@ pub enum RuntimeModelHandle {
     Gemini(gemini::completion::CompletionModel),
     DeepSeek(deepseek::CompletionModel),
     AzureOpenAi(azure::CompletionModel),
+    /// rig-core 0.40's native ChatGPT-subscription provider (issue #216), reached only when
+    /// `require_chatgpt_subscription_opt_in` has already let the build through.
+    ChatgptOauth(chatgpt::ResponsesCompletionModel),
 }
 
 impl std::fmt::Debug for RuntimeModelHandle {
@@ -57,6 +168,7 @@ impl std::fmt::Debug for RuntimeModelHandle {
             Self::Gemini(_) => write!(f, "RuntimeModelHandle::Gemini(<redacted>)"),
             Self::DeepSeek(_) => write!(f, "RuntimeModelHandle::DeepSeek(<redacted>)"),
             Self::AzureOpenAi(_) => write!(f, "RuntimeModelHandle::AzureOpenAi(<redacted>)"),
+            Self::ChatgptOauth(_) => write!(f, "RuntimeModelHandle::ChatgptOauth(<redacted>)"),
         }
     }
 }
@@ -66,17 +178,33 @@ pub struct RuntimeCompletionOutput {
     pub text: String,
     pub usage: UsageSummary,
     pub provider_request_id: Option<String>,
+    /// Every `AssistantContent::ToolCall` in the choice, in the order the provider sent
+    /// them (issue #84).
+    ///
+    /// Until the tool loop landed, `text_from_choice` silently discarded these, so a model
+    /// that answered with a tool call produced an empty-string success. That was harmless
+    /// only because `CompletionRequest.tools` was hardcoded empty and no model could ever
+    /// call one; the moment an agent profile's `skill_refs` put tools on the wire, dropping
+    /// them would turn every tool-calling turn into a blank answer.
+    pub tool_calls: Vec<rig_core::completion::message::ToolCall>,
 }
 
 impl RigRuntimeFactory {
-    pub fn new() -> Self {
-        Self
+    pub fn new(allow_chatgpt_subscription: bool, endpoint_policy: ProviderEndpointPolicy) -> Self {
+        Self {
+            allow_chatgpt_subscription,
+            endpoint_policy,
+        }
     }
 }
 
 impl Default for RigRuntimeFactory {
+    /// `allow_chatgpt_subscription: false` — the ToS-risk opt-in stays off unless a caller
+    /// passes `true` to [`RigRuntimeFactory::new`] explicitly. No production code path uses
+    /// this impl; `MoiraExecutionService::new` always calls `new` with the resolved setting.
+    /// The endpoint policy defaults to neither concession granted, for the same reason.
     fn default() -> Self {
-        Self::new()
+        Self::new(false, ProviderEndpointPolicy::default())
     }
 }
 
@@ -90,6 +218,12 @@ impl RuntimeFactory for RigRuntimeFactory {
         _policy: &ProviderRuntimePolicyRecord,
     ) -> Result<RuntimeModelHandle, AppError> {
         let secret = credential.secret.expose_secret();
+        // Before any arm below: whatever `base_url` the row carries is where this secret is
+        // about to go. Validated at write time too, but a row can also arrive from a
+        // migration or a direct database edit, and this is the check nothing can get behind.
+        if let Some(base_url) = provider.base_url.as_deref() {
+            guard_endpoint(self.endpoint_policy, "provider base_url", base_url)?;
+        }
         match provider.provider_type {
             ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::Local => {
                 require_credential_type(
@@ -162,6 +296,17 @@ impl RuntimeFactory for RigRuntimeFactory {
                             "azure_openai provider requires a configured endpoint".to_string(),
                         )
                     })?;
+                // The only arm whose destination can come from the *credential payload* rather
+                // than from `providers.base_url`, and therefore the one member of issue #251's
+                // class that no write path checked before this change. Re-guarded here even
+                // when it fell through to `base_url`: which of the two won is a runtime fact,
+                // and a guard that depends on which branch was taken is one edit from being
+                // wrong.
+                guard_endpoint(
+                    self.endpoint_policy,
+                    "azure_openai credential endpoint",
+                    endpoint,
+                )?;
                 let api_version = credential
                     .config
                     .get("api_version")
@@ -174,6 +319,38 @@ impl RuntimeFactory for RigRuntimeFactory {
                     .build()
                     .map_err(|err| safe_config_error("azure_openai", err))?;
                 Ok(RuntimeModelHandle::AzureOpenAi(
+                    client.completion_model(model_key),
+                ))
+            }
+            ProviderType::ChatgptOauth => {
+                require_chatgpt_subscription_opt_in(
+                    ProviderType::ChatgptOauth,
+                    self.allow_chatgpt_subscription,
+                )?;
+                require_credential_type(credential.credential_type, &[CredentialType::Oauth2])?;
+                // `chatgpt::ChatGPTAuth::AccessToken` is a bring-your-own-token construction —
+                // the same shape workstream B's Claude subscription credential storage already
+                // uses — and is a clean, thin wrapper: `Authenticator::auth_context()` for this
+                // variant is a synchronous clone with no file I/O and no device-code flow
+                // (`rig-core-0.40.0/src/providers/chatgpt/auth/mod.rs:106-118`). The alternative
+                // `ChatGPTAuth::OAuth` variant drives rig-core's own local-file/device-code login
+                // (`chatgpt/auth/native.rs`) and is never constructed here: it is the wrong shape
+                // for a multi-tenant server process, exactly as
+                // `docs/chatgpt-subscription-spike.md` calls out, and Moira runs its own refresh
+                // via the generic `oauth-token-refresh` worker instead.
+                let account_id = credential
+                    .config
+                    .get("account_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let client = chatgpt::Client::builder()
+                    .api_key(chatgpt::ChatGPTAuth::AccessToken {
+                        access_token: secret.to_string(),
+                        account_id,
+                    })
+                    .build()
+                    .map_err(|err| safe_config_error("chatgpt", err))?;
+                Ok(RuntimeModelHandle::ChatgptOauth(
                     client.completion_model(model_key),
                 ))
             }
@@ -195,6 +372,7 @@ impl RuntimeModelHandle {
             Self::Gemini(model) => completion_with_model(model, request).await,
             Self::DeepSeek(model) => completion_with_model(model, request).await,
             Self::AzureOpenAi(model) => completion_with_model(model, request).await,
+            Self::ChatgptOauth(model) => completion_with_model(model, request).await,
         }
     }
 
@@ -208,6 +386,7 @@ impl RuntimeModelHandle {
             Self::Gemini(model) => start_stream_with_model(model, request).await,
             Self::DeepSeek(model) => start_stream_with_model(model, request).await,
             Self::AzureOpenAi(model) => start_stream_with_model(model, request).await,
+            Self::ChatgptOauth(model) => start_stream_with_model(model, request).await,
         }
     }
 }
@@ -393,22 +572,31 @@ fn invalid_execution_request(message: &str) -> ExecutionFailure {
 }
 
 fn output_from_response<T>(response: CompletionResponse<T>) -> RuntimeCompletionOutput {
+    let (text, tool_calls) = split_choice(response.choice);
     RuntimeCompletionOutput {
-        text: text_from_choice(response.choice),
+        text,
         usage: usage_from_rig(response.usage),
         provider_request_id: response.message_id,
+        tool_calls,
     }
 }
 
-fn text_from_choice(choice: OneOrMany<AssistantContent>) -> String {
-    choice
-        .into_iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) => Some(text.text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+/// Splits an assistant turn into its text and its tool calls.
+///
+/// One pass rather than two filters so the two halves can never disagree about which
+/// content items were seen. Reasoning and any other content kind is still dropped here —
+/// that is unchanged and deliberate; only the tool calls stopped being discarded (#84).
+fn split_choice(choice: OneOrMany<AssistantContent>) -> (String, Vec<ToolCall>) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for content in choice {
+        match content {
+            AssistantContent::Text(part) => text.push_str(&part.text),
+            AssistantContent::ToolCall(tool_call) => tool_calls.push(tool_call),
+            _ => {}
+        }
+    }
+    (text, tool_calls)
 }
 
 pub fn usage_from_rig(usage: Usage) -> UsageSummary {
@@ -660,5 +848,335 @@ mod tests {
                 if error.class == ExecutionFailureClass::ProviderInvalidResponse
         ));
         assert!(items.next().await.is_none());
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Issue #216 — `chatgpt_oauth` provider: opt-in gate + network-free client construction.
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn chatgpt_subscription_opt_in_gate_refuses_when_off_and_allows_when_on() {
+        let refusal = require_chatgpt_subscription_opt_in(ProviderType::ChatgptOauth, false)
+            .expect_err("a chatgpt_oauth provider must be refused until the deployment opts in");
+        let message = refusal.to_string();
+        assert!(
+            message.contains(CHATGPT_SUBSCRIPTION_OPT_IN_REQUIRED),
+            "refusal must carry the keyed error code, got: {message}"
+        );
+        assert!(
+            message.contains("provider_security.allow_chatgpt_subscription"),
+            "refusal must name the flag an operator needs to set, got: {message}"
+        );
+
+        require_chatgpt_subscription_opt_in(ProviderType::ChatgptOauth, true)
+            .expect("a chatgpt_oauth provider must be allowed once the deployment opts in");
+    }
+
+    #[test]
+    fn chatgpt_subscription_opt_in_gate_is_a_no_op_for_every_other_provider_type() {
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+            ProviderType::DeepSeek,
+            ProviderType::AzureOpenAi,
+            ProviderType::Local,
+            ProviderType::Custom,
+        ] {
+            require_chatgpt_subscription_opt_in(provider_type, false).unwrap_or_else(|err| {
+                panic!("{provider_type:?} must never be gated by the chatgpt opt-in flag: {err}")
+            });
+        }
+    }
+
+    /// L2b (`.agents/skills/moira-rig-errors-testing/SKILL.md`): a real
+    /// `chatgpt::ResponsesCompletionModel` built with `ChatGPTAuth::AccessToken` over
+    /// rig-core's `RecordingHttpClient` — no socket, no real ChatGPT session, no real token.
+    /// Proves two things the spike (`docs/chatgpt-subscription-spike.md`) and the factory arm
+    /// both claim: the `AccessToken` construction path is real and reachable through the exact
+    /// `Client::builder().api_key(..).build()?.completion_model(..)` chain
+    /// `build_completion_model`'s new arm uses, and Moira's own generic `completion_with_model`
+    /// helper drives it end to end (choice text + usage mapping) exactly as it does for every
+    /// other provider.
+    #[tokio::test]
+    async fn chatgpt_client_construction_and_completion_output_work_without_a_network() {
+        use rig_core::test_utils::RecordingHttpClient;
+
+        // The exact SSE fixture shape rig-core's own vendored test uses
+        // (`rig-core-0.40.0/src/providers/chatgpt/mod.rs`,
+        // `test_parse_chatgpt_sse_completion`) — `completion()` always reads the ChatGPT
+        // backend's response as SSE text, streamed or not.
+        let sse_body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\
+             \"created_at\":1,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\
+             \"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-5.3-codex\",\
+             \"usage\":{\"input_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":0},\
+             \"output_tokens\":1,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":3},\
+             \"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\
+             \"content\":[{\"type\":\"output_text\",\"annotations\":[],\"text\":\"hi\"}]}],\"tools\":[]}}\n\
+             data: [DONE]";
+        let http = RecordingHttpClient::new(sse_body);
+
+        // Mirrors `build_completion_model`'s `ChatgptOauth` arm exactly, with a fake token that
+        // is never sent anywhere real: `RecordingHttpClient` never opens a socket.
+        let client = chatgpt::Client::builder()
+            .api_key(chatgpt::ChatGPTAuth::AccessToken {
+                access_token: "test-access-token".to_string(),
+                account_id: Some("test-account-id".to_string()),
+            })
+            .http_client(http.clone())
+            .build()
+            .expect("chatgpt client must build from a bare AccessToken with no I/O");
+        let model = client.completion_model(chatgpt::GPT_5_3_CODEX);
+
+        let request = CompletionRequest {
+            model: None,
+            preamble: None,
+            chat_history: OneOrMany::one(Message::user("ping")),
+            documents: Vec::new(),
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+            output_schema: None,
+        };
+
+        let output = completion_with_model(&model, request)
+            .await
+            .expect("completion output");
+
+        assert_eq!(output.text, "hi");
+        assert_eq!(output.usage.input_tokens, Some(2));
+        assert_eq!(output.usage.output_tokens, Some(1));
+        assert_eq!(output.usage.total_tokens, Some(3));
+
+        let captured = http.requests();
+        assert_eq!(captured.len(), 1, "exactly one request must have been sent");
+        assert_eq!(
+            captured[0].headers.get(axum::http::header::AUTHORIZATION),
+            Some(&axum::http::HeaderValue::from_static(
+                "Bearer test-access-token"
+            )),
+            "the AccessToken credential must reach the wire as a bearer header, proving the \
+             construction path is real rather than a stub"
+        );
+        assert_eq!(
+            captured[0]
+                .headers
+                .get("ChatGPT-Account-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("test-account-id"),
+            "credential.config's account_id must reach the wire as ChatGPT-Account-Id"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Issue #251's class, second member: the address a decrypted credential is sent to.
+    //
+    // Network-free by construction — every case below is refused *before* a client is built,
+    // which is the property under test.
+    // -----------------------------------------------------------------------------------
+
+    fn test_provider(
+        provider_type: ProviderType,
+        base_url: Option<&str>,
+    ) -> ResolvedProviderConfiguration {
+        ResolvedProviderConfiguration {
+            provider_id: uuid::Uuid::now_v7(),
+            provider_version: 1,
+            provider_type,
+            display_name: "test provider".to_string(),
+            base_url: base_url.map(str::to_string),
+        }
+    }
+
+    fn azure_credential(endpoint: Option<&str>) -> ResolvedCredential {
+        let config = match endpoint {
+            Some(endpoint) => serde_json::json!({ "api_key": "test-key", "endpoint": endpoint }),
+            None => serde_json::json!({ "api_key": "test-key" }),
+        };
+        ResolvedCredential {
+            credential_id: uuid::Uuid::now_v7(),
+            credential_version: 1,
+            credential_type: CredentialType::AzureOpenAi,
+            secret: secrecy::SecretString::new("test-key".to_string()),
+            config,
+        }
+    }
+
+    /// `build_completion_model` ignores its policy argument entirely (`_policy`), so the
+    /// values here are only shape.
+    fn test_runtime_policy() -> ProviderRuntimePolicyRecord {
+        ProviderRuntimePolicyRecord {
+            id: uuid::Uuid::now_v7(),
+            provider_id: uuid::Uuid::now_v7(),
+            connect_timeout_ms: 1_000,
+            request_timeout_ms: 30_000,
+            stream_idle_timeout_ms: 30_000,
+            max_concurrent_requests: 1,
+            max_concurrent_streams: 1,
+            retry_limit: 0,
+            retry_base_delay_ms: 1,
+            retry_max_delay_ms: 1,
+            circuit_failure_threshold: 1,
+            circuit_open_duration_ms: 1,
+            status: crate::domain::RuntimePolicyStatus::Active,
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        }
+    }
+
+    fn api_key_credential() -> ResolvedCredential {
+        ResolvedCredential {
+            credential_id: uuid::Uuid::now_v7(),
+            credential_version: 1,
+            credential_type: CredentialType::ApiKey,
+            secret: secrecy::SecretString::new("test-key".to_string()),
+            config: serde_json::json!({ "api_key": "test-key" }),
+        }
+    }
+
+    /// The open member of the class round one closed only one instance of.
+    ///
+    /// `credential.config["endpoint"]` is read **in preference to** `providers.base_url`, and
+    /// nothing on the credential write path looked at it before this change — so
+    /// `moira:credentials:write`, on its own, could aim the decrypted Azure API key at the
+    /// instance-metadata service. The `base_url` here is a perfectly ordinary public host, so
+    /// the only thing this can be failing on is the credential-supplied override.
+    #[tokio::test]
+    async fn an_azure_credential_endpoint_cannot_send_the_api_key_to_a_denied_address() {
+        let factory = RigRuntimeFactory::default();
+        for hostile in [
+            "http://169.254.169.254/",
+            "http://127.0.0.1:6379/",
+            "https://10.0.0.5/",
+            "https://user:pass@api.example/",
+        ] {
+            let error = factory
+                .build_completion_model(
+                    &test_provider(
+                        ProviderType::AzureOpenAi,
+                        Some("https://real.openai.azure.com"),
+                    ),
+                    "gpt-4o",
+                    &azure_credential(Some(hostile)),
+                    &test_runtime_policy(),
+                )
+                .await
+                .expect_err("a credential-supplied endpoint must not escape the address policy");
+            let message = error.to_string();
+            assert!(
+                message.contains("azure_openai credential endpoint"),
+                "the refusal must name the field an operator has to fix, got: {message}"
+            );
+            assert!(
+                !message.contains(hostile),
+                "the public message must not echo the address back, got: {message}"
+            );
+        }
+    }
+
+    /// The same value is permitted once the deployment has declared it lives there, so the
+    /// guard is this deployment's policy rather than a blanket ban.
+    #[tokio::test]
+    async fn an_azure_credential_endpoint_on_a_permitted_private_address_still_builds() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: true,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::AzureOpenAi, None),
+                "gpt-4o",
+                &azure_credential(Some("http://127.0.0.1:8080/")),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect("a deployment that granted both concessions may use a loopback endpoint");
+    }
+
+    /// Refused even with both concessions granted: there is no development story in which a
+    /// provider credential belongs at `169.254.169.254`.
+    #[tokio::test]
+    async fn the_metadata_address_is_refused_even_for_a_fully_permissive_deployment() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: true,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::AzureOpenAi, None),
+                "gpt-4o",
+                &azure_credential(Some("http://169.254.169.254/")),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect_err("the instance metadata service is never a provider endpoint");
+    }
+
+    /// `providers.base_url` is validated on both admin write paths, so this arm is the
+    /// backstop for a row that reached the table another way — a migration, a restore, a
+    /// direct `psql` edit. Covers the non-Azure arms, where `base_url` is the only address.
+    #[tokio::test]
+    async fn a_base_url_that_never_went_through_the_admin_write_path_is_still_refused() {
+        let factory = RigRuntimeFactory::default();
+        for provider_type in [
+            ProviderType::OpenAi,
+            ProviderType::OpenAiCompatible,
+            ProviderType::Local,
+            ProviderType::Anthropic,
+            ProviderType::Gemini,
+            ProviderType::DeepSeek,
+        ] {
+            let refused = factory
+                .build_completion_model(
+                    &test_provider(provider_type, Some("http://169.254.169.254/v1")),
+                    "some-model",
+                    &api_key_credential(),
+                    &test_runtime_policy(),
+                )
+                .await
+                .is_err();
+            assert!(
+                refused,
+                "{provider_type:?} must refuse a base_url pointing at the metadata service"
+            );
+        }
+    }
+
+    /// The guard must never be *stricter* than the admin write path, or a deployment that
+    /// legitimately runs an in-cluster provider over private `https` would have every
+    /// execution refused against a provider the admin plane already accepted. This is the
+    /// property that rules out reusing `validate_outbound_url`'s all-or-nothing
+    /// `allow_insecure`.
+    #[tokio::test]
+    async fn allow_private_alone_is_enough_for_an_in_cluster_https_provider() {
+        let factory = RigRuntimeFactory::new(
+            false,
+            ProviderEndpointPolicy {
+                allow_private: true,
+                allow_http: false,
+            },
+        );
+        factory
+            .build_completion_model(
+                &test_provider(ProviderType::OpenAiCompatible, Some("https://10.42.0.7/v1")),
+                "some-model",
+                &api_key_credential(),
+                &test_runtime_policy(),
+            )
+            .await
+            .expect(
+                "allow_private_provider_urls alone must keep an in-cluster https provider \
+                 working",
+            );
     }
 }

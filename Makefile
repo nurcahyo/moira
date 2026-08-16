@@ -46,6 +46,7 @@ ROUTE ?= general
         branch-invariant test-branch-invariant docs-only test-docs-only \
         keyring rotate-keys rotation-gate health openapi docs \
         console-install console-db console-dev console-build console-start console-check \
+        keycloak keycloak-down \
         fmt fmt-check clippy test nextest gates gates-fast check doctor clean
 
 ##@ Getting started
@@ -219,6 +220,14 @@ console-start: ## Serve the production console build
 
 console-check: ## Console lint, typecheck and unit tests
 	cd console && bun run lint && bun run typecheck && bun test
+
+##@ Local IdP (Keycloak, dev only — issue #260)
+
+keycloak: ## Start a local Keycloak IdP (dev-idp profile) and wait for the realm to be ready
+	@scripts/keycloak-dev.sh
+
+keycloak-down: ## Stop the local Keycloak IdP (keeps the generated TLS cert)
+	@scripts/keycloak-dev.sh --down
 
 ##@ Quality
 

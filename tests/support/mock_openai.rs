@@ -87,6 +87,17 @@ pub enum ProviderScript {
     Completion {
         text: String,
     },
+    /// A non-streaming turn that answers with a tool call instead of text — what a model
+    /// does when Moira advertises an agent profile's `skill_refs` (issue #84).
+    ///
+    /// `content` is `null` and `finish_reason` is `tool_calls`, exactly as OpenAI sends it,
+    /// so `rig-core`'s own response decoding is what turns this into an
+    /// `AssistantContent::ToolCall` rather than a shape the test invented.
+    ToolCallCompletion {
+        call_id: String,
+        name: String,
+        arguments: Value,
+    },
     HeldCompletion {
         text: String,
         gate: Arc<ScriptGate>,
@@ -433,6 +444,11 @@ async fn handle_completion(
             });
     match script {
         ProviderScript::Completion { text } => completion_response(text),
+        ProviderScript::ToolCallCompletion {
+            call_id,
+            name,
+            arguments,
+        } => tool_call_completion_response(call_id, name, arguments),
         ProviderScript::HeldCompletion { text, gate } => {
             gate.arrived.add_permits(1);
             let mut guard = ConnectionGuard::new(gate.clone());
@@ -506,6 +522,50 @@ fn completion_response(text: String) -> Response {
                 // ignored by every other provider and no existing expectation moves.
                 "prompt_cache_hit_tokens": 0,
                 "prompt_cache_miss_tokens": 2
+            }
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+/// The tool-calling twin of [`completion_response`].
+///
+/// `arguments` is serialized as a **JSON string**, not an object: that is what OpenAI and
+/// every compatible provider put on the wire, and `rig-core`'s `Function::arguments` uses
+/// `deserialize_maybe_stringified`, so sending an object would exercise a shape the real
+/// providers never produce.
+fn tool_call_completion_response(call_id: String, name: String, arguments: Value) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        json!({
+            "id": "chatcmpl-tool-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                },
+                "logprobs": null,
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 4
             }
         })
         .to_string(),

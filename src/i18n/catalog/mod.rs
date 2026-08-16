@@ -228,6 +228,58 @@ mod tests {
         assert!(is_known_key("moira.error.if_match_required"));
     }
 
+    /// Issue #214 (plan 12 §3) — the flow-execution engine and offline eval runner. The three
+    /// `*_not_runnable`/`*_missing` codes are emitted as `AppError::coded` refusals (also
+    /// covered generically by `every_coded_error_literal_in_src_has_a_catalog_entry`);
+    /// `flow_step_failed` is not an `AppError` — it is the message key a failed step's
+    /// `error_summary` carries — so it is named here explicitly to keep it catalogued.
+    #[test]
+    fn flow_and_eval_execution_error_keys_exist_in_the_catalog() {
+        for key in [
+            "moira.error.flow_not_runnable",
+            "moira.error.flow_step_failed",
+            "moira.error.eval_target_missing",
+            "moira.error.eval_suite_not_runnable",
+        ] {
+            let entry = all_entries()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} must be catalogued"));
+            assert!(
+                !entry.default_message.is_empty(),
+                "{key} default_message must be non-empty"
+            );
+            assert!(
+                !entry.description.is_empty(),
+                "{key} description must be non-empty"
+            );
+        }
+    }
+
+    /// Issue #216 — the `chatgpt_oauth` provider's opt-in refusal. Emitted from two call
+    /// sites sharing the same code, `orchestration::runtime_factory::
+    /// require_chatgpt_subscription_opt_in`: admin-write time
+    /// (`application::admin::providers::ProviderAdminService::create_provider`) and
+    /// execution time (`RuntimeFactory::build_completion_model`'s `ChatgptOauth` arm). Also
+    /// covered generically by `every_coded_error_literal_in_src_has_a_catalog_entry` below,
+    /// since the literal code appears at an `AppError::coded(...)` call site — this test names
+    /// the feature explicitly, the way `identity_error_keys_exist_in_the_catalog` does for its
+    /// own plan's keys.
+    #[test]
+    fn chatgpt_subscription_error_key_is_catalogued() {
+        let key = "moira.error.chatgpt_subscription_opt_in_required";
+        let entry = all_entries()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("{key} must be catalogued"));
+        assert!(
+            !entry.default_message.is_empty(),
+            "{key} default_message must be non-empty"
+        );
+        assert!(
+            !entry.description.is_empty(),
+            "{key} description must be non-empty"
+        );
+    }
+
     /// Plan 07's error keys, named exactly (CONVENTIONS §4.5). D1 cuts the
     /// setup-token credential path, so the four token-lifecycle codes the plan's body
     /// once named (`setup_token_invalid`/`_expired`/`_consumed`/`_target_mismatch`) and

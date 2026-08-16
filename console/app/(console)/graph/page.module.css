@@ -1,0 +1,28 @@
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  padding: 2rem 1.5rem;
+  max-width: 72rem;
+}
+
+.title {
+  margin: 0;
+}
+
+.intro {
+  margin: 0;
+  max-width: 48rem;
+  color: #4b5563;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}
+
+@media (prefers-color-scheme: dark) {
+  .intro {
+    color: #9ca3af;
+  }
+}

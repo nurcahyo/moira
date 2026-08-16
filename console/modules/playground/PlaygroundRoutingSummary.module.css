@@ -1,0 +1,95 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 0.375rem;
+  padding: 1rem;
+}
+
+.heading {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.subheading {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.empty {
+  margin: 0;
+  color: #555;
+}
+
+.problem {
+  margin: 0;
+  color: #8a1c1c;
+}
+
+.note {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: #555;
+}
+
+.factList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.fact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.fact dt {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: #555;
+}
+
+.fact dd {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 0.875rem;
+  word-break: break-word;
+}
+
+.list {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+@media (prefers-color-scheme: dark) {
+  .panel {
+    border-color: rgba(255, 255, 255, 0.16);
+  }
+
+  .empty,
+  .note,
+  .fact dt {
+    color: #9ca3af;
+  }
+
+  .table th,
+  .table td {
+    border-bottom-color: rgba(255, 255, 255, 0.14);
+  }
+}

@@ -7,6 +7,7 @@ mod provider_url;
 mod retrieval;
 mod runtime_cache;
 mod runtime_factory;
+mod skill_tool;
 
 pub use chunking::{ChunkCandidate, ChunkStrategy, ChunkingError, ChunkingLimits, chunk};
 pub use controls::{
@@ -27,8 +28,8 @@ pub use ingestion::{
     prepare_chunks,
 };
 pub use openapi_import::{
-    MAX_IMPORT_OPERATIONS, OpenApiImportError, ParsedImport, ParsedOperation,
-    parse_openapi_document,
+    MAX_DOCUMENT_BYTES, MAX_IMPORT_OPERATIONS, MAX_OPERATION_SCHEMA_BYTES, MAX_TOTAL_SCHEMA_BYTES,
+    OpenApiImportError, ParsedImport, ParsedOperation, parse_openapi_document,
 };
 pub use provider_url::normalize_openai_base_url;
 pub use retrieval::{
@@ -38,7 +39,13 @@ pub use retrieval::{
 };
 pub use runtime_cache::{AuthProviderSettingsCache, RuntimeConfigCache};
 pub use runtime_factory::{
-    RigRuntimeFactory, RuntimeCompletionOutput, RuntimeFactory, RuntimeItemStream,
-    RuntimeModelHandle, RuntimeStreamItem, classify_completion_error, rig_chat_history,
+    CHATGPT_SUBSCRIPTION_OPT_IN_REQUIRED, RigRuntimeFactory, RuntimeCompletionOutput,
+    RuntimeFactory, RuntimeItemStream, RuntimeModelHandle, RuntimeStreamItem,
+    classify_completion_error, require_chatgpt_subscription_opt_in, rig_chat_history,
     usage_from_rig,
+};
+pub use skill_tool::{
+    HttpSkillTool, SkillCallerScope, SkillCredential, SkillOutboundPolicy, SkillToolBuildError,
+    SkillToolSpec, ToolCallRecord, ToolLoopContext, ToolLoopFailure, ToolLoopOutcome,
+    build_skill_tool_set, run_tool_loop,
 };

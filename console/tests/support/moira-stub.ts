@@ -13,11 +13,26 @@ export interface RecordedRequest {
   readonly body: unknown;
   /** `"<METHOD> <path>"`, the key the tests assert order on. */
   readonly route: string;
+  /**
+   * The `AbortSignal` the caller passed on `init.signal`, if any — captured
+   * so a cancellation test can assert it is the SAME object the incoming
+   * request carried (`app/api/playground/stream/route.ts` forwards
+   * `request.signal` end to end), rather than re-implementing abort
+   * semantics in this stub.
+   */
+  readonly signal: AbortSignal | undefined;
 }
 
 export interface StubResponse {
   readonly status: number;
   readonly body?: unknown;
+  /**
+   * Raw text body (e.g. an SSE frame stream), sent verbatim instead of
+   * `JSON.stringify(body)`. `body` is ignored when this is set.
+   */
+  readonly bodyText?: string;
+  /** Content-Type for `bodyText`. Defaults to `text/event-stream`. */
+  readonly contentType?: string;
 }
 
 export type StubHandler = (request: RecordedRequest) => StubResponse;
@@ -48,7 +63,7 @@ export function createMoiraStub(handlers: Record<string, StubHandler>): MoiraStu
     const rawBody = init?.body;
     const body = typeof rawBody === "string" ? JSON.parse(rawBody) : undefined;
     const route = `${method} ${path}`;
-    const recorded: RecordedRequest = { method, url, path, headers, body, route };
+    const recorded: RecordedRequest = { method, url, path, headers, body, route, signal: init?.signal ?? undefined };
     requests.push(recorded);
 
     const handler = handlers[route];
@@ -56,6 +71,12 @@ export function createMoiraStub(handlers: Record<string, StubHandler>): MoiraStu
       throw new Error(`moira-stub: no handler registered for "${route}"`);
     }
     const response = handler(recorded);
+    if (response.bodyText !== undefined) {
+      return new Response(response.bodyText, {
+        status: response.status,
+        headers: { "content-type": response.contentType ?? "text/event-stream" },
+      });
+    }
     return new Response(response.body === undefined ? null : JSON.stringify(response.body), {
       status: response.status,
       headers: { "content-type": "application/json" },

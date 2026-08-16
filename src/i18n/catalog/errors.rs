@@ -7,9 +7,19 @@ use super::I18nEntry;
 
 pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
+        key: "moira.error.auth_verification_overloaded",
+        default_message: "The service is at capacity for credential checks. Retry shortly.",
+        description: "Used when an API-key verification or mint waited api_keys.verification_queue_timeout_ms for one of the api_keys.verification_concurrency Argon2id permits and did not get one. It says nothing about the presented credential, which was never checked - it is a capacity signal, not a rejection, which is why it is a 503 rather than a 401. Transient: retry after a short delay. If it persists, the gate is smaller than the authenticated traffic needs and the operator must raise resources.limits.cpu and api_keys.verification_concurrency together, because the default bound is derived from the core count.",
+    },
+    I18nEntry {
         key: "moira.error.bad_request",
         default_message: "The request could not be processed.",
         description: "Generic client-side request validation or shape errors.",
+    },
+    I18nEntry {
+        key: "moira.error.chatgpt_subscription_opt_in_required",
+        default_message: "This provider requires an explicit ToS risk-acceptance opt-in that this deployment has not enabled.",
+        description: "Used when a chatgpt_oauth provider is created, or would be executed, while provider_security.allow_chatgpt_subscription is false. ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no carve-out for third-party, multi-tenant use. Enabling the flag is a deployment operator's own explicit acceptance of that risk for their own subscription, not a sanctioned integration path (docs/chatgpt-subscription-spike.md, issue #216).",
     },
     I18nEntry {
         key: "moira.error.cluster_lease_denied",
@@ -35,6 +45,26 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         key: "moira.error.database_unavailable",
         default_message: "The database is temporarily unavailable.",
         description: "Used when Moira cannot reach or use its database, for example when a required database connection is not configured.",
+    },
+    I18nEntry {
+        key: "moira.error.eval_suite_not_runnable",
+        default_message: "This eval suite cannot be run.",
+        description: "Used by POST /api/v1/admin/eval-suites/{id}/run (issue #214, plan 12 §3) when the suite cannot be evaluated: it is not active, or it has no cases. An eval with nothing to grade produces no signal, so it is refused rather than returning an empty pass. The English message names the specific reason so the operator can enable the suite or add cases.",
+    },
+    I18nEntry {
+        key: "moira.error.eval_target_missing",
+        default_message: "This eval run has no target agent profile.",
+        description: "Used by POST /api/v1/admin/eval-suites/{id}/run (issue #214, plan 12 §3) when no target agent profile can be resolved for the run: the request did not supply agent_profile_id, the suite carries no metadata.target_agent_profile_id, or the resolved id names no live agent profile. Fail-closed: an eval measures a subject, so a run with no subject is refused rather than graded against nothing.",
+    },
+    I18nEntry {
+        key: "moira.error.flow_not_runnable",
+        default_message: "This flow cannot be run.",
+        description: "Used by POST /api/v1/admin/flows/{id}/run (issue #214, plan 12 §3) when the flow cannot be executed: it is not active, or it has no steps. The English message names the specific reason so the operator can enable the flow or add steps.",
+    },
+    I18nEntry {
+        key: "moira.error.flow_step_failed",
+        default_message: "A flow step failed, so the run was aborted.",
+        description: "Used to describe a flow step whose underlying execution did not succeed. A flow is sequential and fail-closed (plan 12 §3 decision 15): the first failing step aborts the whole run, no later step runs, and the run is marked failed. This is not returned as an HTTP error from POST /api/v1/admin/flows/{id}/run — that endpoint returns 200 with the failed run so the caller can inspect it — it is the message key for the failed step's error_summary, which also carries the sanitized failure class (no provider body, no prompt). The console renders this generic message alongside that class.",
     },
     I18nEntry {
         key: "moira.error.forbidden",
@@ -757,7 +787,7 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
     I18nEntry {
         key: "moira.error.invalid_openapi_spec",
         default_message: "The OpenAPI document could not be parsed.",
-        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, or it defines no importable operations. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
+        description: "Used by POST /api/v1/admin/skills/import (issue #237, plan 12 §5) for every OpenAPI parse failure other than the operation cap: the document is not a JSON object, it does not declare an OpenAPI 3.x version, it declares no server URL or an unparseable one, it defines no importable operations, or it exceeds the import byte budget (a document over 512 KiB, a single derived params_schema over 64 KiB, or derived schemas totalling over 2 MiB - the guard against $ref amplification, where one referenced schema is deep-cloned once per operation). The message carries the measured size and the cap it exceeded. See orchestration::openapi_import::OpenApiImportError for the full set of causes this one code covers.",
     },
     I18nEntry {
         key: "moira.error.ssrf_blocked_host",
@@ -765,8 +795,73 @@ pub const RESPONSE_ERROR_CATALOG: &[I18nEntry] = &[
         description: "Used when a skill's server URL - the OpenAPI document's servers[0].url on import, or a new url_template on a skill_http_executors PATCH (issue #237, plan 12 §5) - fails security::ssrf::validate_outbound_url: a non-https scheme, a private/loopback/link-local/metadata-range address, or an address that fails to resolve. The specific denial reason and any resolved address are logged server-side only, never returned here, so this response can never be used as an SSRF oracle - the same posture security::ssrf already takes on the JWKS fetch path.",
     },
     I18nEntry {
+        key: "moira.error.skill_credential_host_mismatch",
+        default_message: "The referenced credential's provider does not serve this executor's host.",
+        description: "Used by PATCH /api/v1/admin/skills/{id}/executor (issue #253 finding 1) when the credential_id the executor would carry after the patch belongs to a provider whose base_url host is not the executor's allowed_host. skill_http_executors.credential_id is decrypted at call time and sent as Authorization: Bearer <plaintext>, so an existence-only check on that id made moira:skills:write equivalent to reading the plaintext of every row in provider_credentials - a capability no other admin scope grants, since the credentials surface only ever returns masked values. The rule is entitlement by destination: a credential may only be sent to the host its own provider declares. Both halves of the pair are checked as they will be AFTER the patch, so binding a credential to an existing hostile host and moving a bound credential's host to a hostile one are both refused. A provider with no base_url configured is refused too, fail-closed: there is no host to compare against and inventing the vendor default would tie this rule to a hostname table kept in step with rig-core. The message deliberately names neither the provider nor its base_url - this endpoint needs only moira:skills:write, and a more specific refusal would let a caller enumerate the provider table. The same rule is re-checked at execution time in application::execution::skill_credential, because a row stored before it existed would otherwise still send the secret.",
+    },
+    I18nEntry {
         key: "moira.error.executor_not_found",
         default_message: "The skill has no HTTP executor.",
         description: "Used by GET/PATCH/DELETE /api/v1/admin/skills/{id}/executor (issue #237, plan 12 §5) when the named skill has no skill_http_executors row - either because the skill was hand-authored without one, or because the row was already deleted.",
+    },
+    I18nEntry {
+        key: "moira.error.skill_unavailable",
+        default_message: "An agent skill this request needs is unavailable.",
+        description: "Used when the agent profile a route resolved to names a skill in skill_refs that this execution cannot use (issue #84, plan 12 §5): no live skills row answers the id, the row is not enabled (still draft and unreviewed, or switched off), a kind='tool' row has no skill_http_executors child, or the set cannot be assembled into a tool list - a duplicate skill_key, a params_schema that is not a JSON-Schema object, a required name absent from properties, a credential type with no HTTP form, a bound credential whose provider does not declare the executor's allowed_host as its base_url (issue #253 finding 1 - re-checked here because a row stored before that rule existed would otherwise still send the secret), or more tools than skill_execution.maximum_advertised_tools permits. Fail-closed and refused before any provider call, matching the posture issue #79 chose for a dangling agent_profile_id: an agent silently missing a skill it was configured with is worse than a loud refusal. One code covers every cause because the remedy is always the same - fix the agent profile or the skill row - and the specific reason is recorded in the audit entry and the runtime event rather than on the wire, so this response cannot be used to enumerate which skill ids exist. Mapped to 409 rather than 404: every cause is an operator-visible state on the admin plane, not a resource the caller named.",
+    },
+    I18nEntry {
+        key: "moira.error.skill_guard_denied",
+        default_message: "A guard refused this skill call.",
+        description: "Used when a kind='guard' skill listed in the agent profile's skill_refs refuses one tool call before it is dispatched (issue #84, plan 12 §5 skills-as-guards). Unlike skill_unavailable this is not a terminal execution failure: the denial is returned to the model as the tool's result so it can proceed without that tool, which costs one turn instead of failing a request whose output may already be committed. Guards narrow only - a guard can refuse a call Moira's own authorization permitted, never permit one it refused - so a denial never widens what a caller may do. The machine-readable reason (skill_not_allowed, skill_denied, missing_scope, policy_unreadable) travels in the tool result and the runtime event. policy_unreadable is the fail-closed arm: a guard whose metadata.guard object is missing or malformed denies everything it governs rather than silently ceasing to guard.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_service_disabled",
+        default_message: "Containerised Claude runners are not enabled in this deployment.",
+        description: "Used by every /api/v1/admin/runners route (issue #275, workstream R2 of #272) when claude_runner.enabled is false, which is the default. Refused before any network call, so a deployment with no moira-runner gets a named 503 instead of a connect timeout with no attribution. moira-runner is the only component in the deployment that holds Docker Engine API access; Moira never does, which is why its absence is a configuration answer rather than a degraded mode. The remedy is to deploy moira-runner and set claude_runner.enabled, base_url and auth_token.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_service_unavailable",
+        default_message: "The runner service could not be reached.",
+        description: "Used when a call into moira-runner failed to produce a usable reply (issue #275, workstream R2 of #272): a connect failure, a timeout, a body that would not parse, or an upstream 5xx including the contract's own docker_unavailable. Deliberately one code for the whole class, and deliberately carrying nothing from the upstream response: moira-runner scrapes a container's tty stream, which is where the minted token lives, so relaying its prose would put an unbounded string that has been adjacent to credential material into a Moira response and a Moira log line at once. The specific cause is in the runner service's own logs, correlated by the runner_reference recorded in the audit row.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_service_unauthorized",
+        default_message: "Moira is not authorized to call the runner service.",
+        description: "Used when moira-runner answers 401 or 403 to Moira's own bearer token (issue #275, workstream R2 of #272). Split from runner_service_unavailable because the remedy differs in kind: this is a configuration mismatch between claude_runner.auth_token and the token moira-runner was started with, usually a rotation applied on one side only, and no amount of waiting or capacity fixes it. Mapped to 503 rather than 401 because the failed authentication is Moira's, not the caller's - the caller's own credential was accepted.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_not_found",
+        default_message: "The runner was not found.",
+        description: "Used when no live claude_runners row answers the requested id, or when moira-runner reports that the runner it names no longer exists (issue #275, workstream R2 of #272). Note the deliberate exception on the read path: a GET whose runner has been reaped past its TTL marks the mirror row expired and returns it, rather than 404-ing, so a runner that reached the end of its life stays visible in the console instead of vanishing from its own list.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_wrong_state",
+        default_message: "The runner is not in a state that permits this operation.",
+        description: "Used when a runner lifecycle transition is illegal (issue #275, workstream R2 of #272): submitting an authorization code to a runner that is not awaiting_authorization, or finalizing one that is not ready. Emitted from both sides of the boundary under one code - Moira's mirror refuses first, which saves a round trip, and a relayed upstream 409 maps here too - because they are the same fact seen at two moments and an operator should read one remedy rather than two failures that look unrelated. The check is a from-state comparison made inside the same transaction as the write, which is why these transitions carry no If-Match: a version match proves only that nobody else wrote, while a state match proves the transition is legal.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_token_unavailable",
+        default_message: "This runner's token has already been retrieved and cannot be read again.",
+        description: "Used when moira-runner answers 410 token_already_retrieved (issue #275, workstream R2 of #272). The token endpoint is one-shot by design, so this means the token was fetched once and the runner can never yield it again. The usual cause is a finalize whose credential write failed after the token had been read: Moira stores nothing on that path - no credential row, no state change - so the runner stays ready and the second attempt lands here. That is the honest signal, and the remedy is to delete the runner and provision a new one; there is no way to recover the token, and there is deliberately no place in Moira it could have been stashed.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_request_rejected",
+        default_message: "The runner service rejected the request.",
+        description: "Used when moira-runner answers 400 invalid_request, or when an authorization code arrives empty (issue #275, workstream R2 of #272). Mapped to 422 rather than relaying the upstream 400 because the request reached Moira in a well-formed shape and was refused on its content. Carries nothing from the upstream body, for the reason runner_service_unavailable records.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_label_invalid",
+        default_message: "A runner label must be 1 to 64 characters of [a-z0-9-].",
+        description: "Used when a runner provisioning request carries a label outside the charset moira-runner accepts (issue #275, workstream R2 of #272). Validated on Moira's side as well as the runner service's because the label becomes part of a container name: a local refusal names the rule, while a relayed remote 400 would only say the request was invalid.",
+    },
+    I18nEntry {
+        key: "moira.error.runner_ttl_invalid",
+        default_message: "The requested runner lifetime is outside the permitted window.",
+        description: "Used when ttl_seconds on a runner provisioning request is below 60 or above 3600 (issue #275, workstream R2 of #272). Refused rather than clamped, on the reasoning the API-key prefix and Argon2 gate settings already record: a clamp makes a misconfiguration invisible. The floor stops a runner expiring before the operator can read its authorization URL; the ceiling stops a container living for days holding a half-finished OAuth flow, which is the state in this feature with the largest blast radius.",
+    },
+    I18nEntry {
+        key: "moira.error.duplicate_runner_label",
+        default_message: "A live runner already uses this label.",
+        description: "Used when provisioning a runner whose label collides with an existing, not-soft-deleted claude_runners row (issue #275, workstream R2 of #272). The uniqueness is while-live, so a deleted runner's name is reusable; two live runners sharing a name would make the console's own list ambiguous.",
     },
 ];

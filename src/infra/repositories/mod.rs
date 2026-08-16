@@ -3,6 +3,10 @@ mod agent_platform;
 mod auth_settings;
 mod cluster;
 mod conversation;
+// Issue #234 (plan 12 §4). Read-only reads for the derived relationship graph, sibling to
+// `agent_platform` and `runtime` and owning no table of its own — see the module's header for
+// why this is one repository rather than five bespoke additions elsewhere.
+mod graph;
 mod identity;
 // Issue #93. The keyset SQL builder plan 04 wrote for the nine admin lists, lifted out of
 // `admin` so the four public lists page on the same predicate rather than a second copy of
@@ -13,18 +17,24 @@ mod keyset;
 // because the five members live in two repositories and had drifted into two different
 // wrong answers — four that wrote on every read, one that raced on first touch.
 mod policy_row;
+mod provider_observability;
 mod public;
+// Issue #275 (workstream R2 of #272). The `claude_runners` mirror table, as one repository
+// owning one table — see the module header for why no secret column exists on it.
+mod runners;
 mod runtime;
 mod setup;
 mod worker_jobs;
 
 pub use admin::{
     AdminIdempotencyClaim, AdminIdempotencyClaimOutcome, AdminRepository, KeyMaterial,
-    PgAdminCommandTransaction, PgAdminRepository, StoredCredentialSecret,
+    OauthCredentialLifecycleCounts, PgAdminCommandTransaction, PgAdminRepository,
+    StoredCredentialSecret,
 };
 // Issue #214 (plan 12 §3). The agent-platform registries (skills now; evals/flows to follow)
 // as one Postgres repository, sibling to `runtime` and `admin` and owning disjoint tables.
 pub use agent_platform::PgAgentPlatformRepository;
+pub use graph::PgGraphRepository;
 // Plan 07 modules 5-6. Both ship as a trait plus one Postgres implementation from their
 // first commit, so no later plan has to retrofit the seam onto a surface that already has
 // callers — the retrofit P2-3 had to perform for `AdminRepository` and `SetupRepository`.
@@ -92,10 +102,22 @@ pub(crate) use conversation::{
     count_messages_after_sequence, find_active_conversation_summary, find_conversation_route_hint,
     find_messages_after_sequence, insert_conversation_summary,
 };
+// Issues #211/#83 (plan 12 §2 "Later" phase). One repository for the two tables a periodic
+// maintenance worker writes and `GET /api/v1/admin/providers/health` reads — see the module's
+// header for why this is one trait rather than two.
+pub use provider_observability::{
+    HealthSnapshotInsert, PgProviderObservabilityRepository, ProviderHealthSummaryRow,
+    ProviderObservabilityRepository, ProviderProbeTarget,
+};
 pub use public::{
     IdempotencyClaim, PgPublicRepository, PublicAccess, PublicRepository, ResponseStartedInsert,
     ResponseTerminalUpdate, default_application_execution_policy, idempotency_record,
 };
+// Issue #275 (workstream R2 of #272).
+pub use runners::{
+    ClaudeRunnerInsert, ClaudeRunnerRepository, PgClaudeRunnerRepository, RunnerStateUpdate,
+};
+pub(crate) use runners::{runner_wrong_state, version_conflict as runner_version_conflict};
 pub use runtime::{
     ExecutionAttemptInsert, ExecutionAttemptUpdate, PgRuntimeRepository,
     RuntimeCredentialCandidate, RuntimeRepository, UsageRecordInsert,

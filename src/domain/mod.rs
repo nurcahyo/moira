@@ -2,6 +2,7 @@ mod admin;
 mod agent_platform;
 mod auth_settings;
 mod conversation;
+mod graph;
 mod i18n;
 mod identity;
 mod ids;
@@ -9,6 +10,10 @@ mod message;
 mod models;
 mod pagination;
 mod public;
+// Issue #275 (workstream R2 of #272). Containerised Claude runner DTOs — deliberately a module
+// of their own rather than more types in `admin.rs`, because the invariant that binds them (no
+// token field, ever) is easier to hold in a file whose header states it.
+mod runners;
 mod runtime;
 
 pub use admin::{
@@ -17,21 +22,25 @@ pub use admin::{
     AuditResult, ConsumerKeyCreateRequest, CredentialCreateRequest, CredentialPatchRequest,
     CredentialRecord, CredentialResolutionInput, CredentialResolutionSource, CredentialScope,
     CredentialSecret, CredentialStatus, CredentialType, IdempotencyRecord, JwtClaimMapping,
-    KeyStatus, ListResponse, PageQuery, Pagination, ProviderCreateRequest,
-    ProviderModelCreateRequest, ProviderModelPatchRequest, ProviderModelRecord,
-    ProviderPatchRequest, ProviderRecord, ProviderType, ResourceStatus, RotateCredentialRequest,
-    ScopeType, SetupCheckName, SetupCheckState, SetupChecks, SetupDeploymentEnvironment,
-    SetupStatus, SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
-    TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
+    KeyStatus, ListResponse, PageQuery, Pagination, ProviderCreateRequest, ProviderHealthEntry,
+    ProviderHealthResponse, ProviderHealthStatus, ProviderModelCreateRequest,
+    ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
+    ProviderType, ResourceStatus, RotateCredentialRequest, ScopeType, SetupCheckName,
+    SetupCheckState, SetupChecks, SetupDeploymentEnvironment, SetupStatus, SetupStatusResponse,
+    SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
+    TrustedJwtIssuerRecord,
 };
 pub use agent_platform::{
     AgentFlowCreateRequest, AgentFlowPatchRequest, AgentFlowRecord, AgentFlowRunRecord,
-    AgentFlowStepCreateRequest, AgentFlowStepRecord, EvalCaseCreateRequest, EvalCaseRecord,
-    EvalRunRecord, EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord,
-    EvalTriggerKind, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind, HttpMethod,
-    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest,
-    SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
-    SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillStatus,
+    AgentFlowRunResult, AgentFlowStepCreateRequest, AgentFlowStepRecord, AgentFlowStepRunRecord,
+    AgentSkillBinding, EvalCaseCreateRequest, EvalCaseRecord, EvalRunRecord, EvalRunRequest,
+    EvalRunStatus, EvalSuiteCreateRequest, EvalSuitePatchRequest, EvalSuiteRecord, EvalTriggerKind,
+    FlowRunRequest, FlowRunStatus, FlowStepOnFailure, FlowStepRunStatus, GradingKind, GuardContext,
+    GuardDenialReason, GuardPolicy, GuardPolicyError, GuardVerdict, HttpMethod,
+    SkillBulkEnableRequest, SkillBulkEnableResponse, SkillCreateRequest, SkillCredentialOutcome,
+    SkillGuard, SkillHttpExecutorPatchRequest, SkillHttpExecutorRecord, SkillImportRequest,
+    SkillImportResponse, SkillKind, SkillPatchRequest, SkillRecord, SkillResolution, SkillStatus,
+    SkillUnusableReason, credential_binding_permits_host, evaluate_guards,
 };
 pub use auth_settings::{
     AuthMethod, AuthProviderSettingsCreateRequest, AuthProviderSettingsPatchRequest,
@@ -52,6 +61,14 @@ pub use conversation::{
     RagCollectionVisibility, RagDocumentCreateRequest, RagDocumentIngestRequest, RagDocumentRecord,
     RagDocumentStatus, RagIngestionStatus, ResponseConversationInput, RetrievalPolicyPutRequest,
     RetrievalPolicyRecord,
+};
+// Issue #234 (plan 12 §4). `assemble_graph` and the raw row types are exported alongside the
+// wire types (`GraphNode`/`GraphEdge`/`GraphResponse`) so `infra::repositories::graph` can
+// decode into them and `application::graph` can call the pure assembler — both need more than
+// the OpenAPI-facing shapes.
+pub use graph::{
+    AgentProfileGraphRow, AgentRouteEdgeRow, FlowStepGraphRow, GraphEdge, GraphEdgeKind, GraphNode,
+    GraphNodeType, GraphRawData, GraphResponse, NamedStatusGraphRow, assemble_graph,
 };
 pub use i18n::{ResponseText, ResponseTextArgs};
 pub use identity::{
@@ -83,6 +100,10 @@ pub use public::{
     PublicResponseFormat, PublicResponseRecord, PublicResponseRequest, PublicResponseStatus,
     PublicRouteRef, PublicRouteResource, PublicSseEnvelope, PublicToolDeclaration,
     PublicUsageRecord, PublicUsageSummary, ResponsePersistenceMode, UsageQuery,
+};
+pub use runners::{
+    ClaudeRunnerAuthorizationCodeRequest, ClaudeRunnerFinalizeRequest,
+    ClaudeRunnerProvisionRequest, ClaudeRunnerRecord, ClaudeRunnerState,
 };
 pub use runtime::{
     AgentProfileCreateRequest, AgentProfilePatchRequest, AgentProfileRecord,

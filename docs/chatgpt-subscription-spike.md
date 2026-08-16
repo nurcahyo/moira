@@ -1,5 +1,27 @@
 # ChatGPT Subscription Execution — Feasibility Spike
 
+> **Status update (2026-08-15, issue #216).** The owner reviewed this spike's finding — that
+> rig-core 0.40 ships a first-party `chatgpt` provider reachable through the exact `RuntimeFactory`
+> seam every other provider uses — and decided to wire it, **behind the explicit, off-by-default
+> ToS opt-in this document's §3 recommends gating on**, rather than leaving it unbuilt pending a
+> future re-evaluation. This reverses this document's "NO-GO — do not wire
+> `rig_core::providers::chatgpt` into `RuntimeFactory` for production use yet" line below, but not
+> the ToS analysis it is based on: the analysis in §3 is carried forward unchanged and still applies
+> in full to any deployment that turns the opt-in on.
+>
+> What shipped: `ProviderType::ChatgptOauth` (`src/domain/admin.rs`), a `RuntimeFactory` arm
+> building `chatgpt::Client` from a stored `credential_type = 'oauth2'` access token via
+> `ChatGPTAuth::AccessToken` exactly as this document's §1 illustrative code sketches, and
+> `provider_security.allow_chatgpt_subscription` (default `false` in every environment, including
+> production) gating both provider creation and execution — refused with a keyed
+> `moira.error.chatgpt_subscription_opt_in_required` when off, never a silent attempt. The
+> `ChatGPTAuth::OAuth` native device-flow/local-file auth source this document's §1 flags as
+> "wrong for a multi-tenant server process" was **not** wired; only the bring-your-own-token
+> `AccessToken` path was, matching the recommendation. See `docs/rig-integration.md` and
+> `docs/provider-management.md` for the as-built contract, and `plans/12-feature-expansion-brainstorm.md`
+> §1 for the still-open, separately-tracked correction to the Option-D table cell and risk R5 this
+> spike's own "Concrete next step" section calls for.
+
 Research spike closing #212 (Workstream C of the plan 12 feature-expansion delivery). Scope: does
 executing against `chatgpt.com/backend-api/codex` — the ChatGPT-subscription-gated backend the
 Codex CLI uses — belong in Moira, and how? **This document is research only. No execution code

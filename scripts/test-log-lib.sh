@@ -132,7 +132,107 @@ tl_count_skips() {
 #
 # The `.config/nextest.toml` header carried "622 passed" for months and was wrong by ~730;
 # both numbers here were taken from a run, not copied from a comment.
-TL_TEST_COUNT_MINIMUM=1353
+#
+# Re-measured 2026-08-14 on the #176 branch by `/usr/bin/make gates`: **1442** at fe4b347
+# (source declaring 1436), then **1443** with the one test this branch's own review added. The
+# floor had drifted 89 tests below the truth — the suite grew across several merges while this
+# line stayed at 1353 — so the "any net drop reds it" claim above had become false by that
+# margin: 89 tests could have been deleted with every gate still green. It is the measured
+# number again.
+#
+# Re-measured 2026-08-15 after merging `origin/develop` (5a86a67) into the #176 branch:
+# **1458** passed, source declaring 1452, by `/usr/bin/make gates` with both Postgres and Redis
+# up and zero skip lines. #245 and #244 landed between the two measurements, which is the whole
+# 15-test difference — this branch adds no test to the 1443 above and removed the one runtime
+# assertion it briefly had, because clippy correctly asked for `const { assert!(..) }` and a
+# compile-time check is the better home for it.
+#
+# Re-measured 2026-08-15 on `fix/plan12-1-credentials-r2`: **1562** passed, source declaring
+# 1556, by `/usr/bin/make gates` with Postgres and Redis up and zero skip lines. 1561 of those
+# were already there before this branch's last commit; the +1 is
+# `the_documented_inventory_query_finds_every_row_the_binding_rule_refuses`. So 103 of the 104
+# this line moves is drift the constant accumulated across the merges since the measurement
+# above — the same drift the paragraph above records happening once already, which is the
+# argument for moving it on every commit that touches the count rather than when someone
+# notices. While it sat at 1458 the "any net drop reds it" claim was false by that margin.
+#
+# The gap between passed and declared is the doctests. `tl_declared_tests` counts `#[test]` /
+# `#[tokio::test]` attributes only, while both the local `cargo test --workspace` and CI's
+# `__doc__` shard (`scripts/ci-shard-run.sh`, `cargo test --all-features --doc`) also run the
+# documentation examples. Both sides count them, so the two numbers stay comparable — which is
+# what makes it safe for `scripts/ci-assert-union.sh` to check the union against this same
+# constant. The offset has been +6 across every measurement here.
+#
+# ZERO HEADROOM, DELIBERATELY. Pinning at the measured count is what makes "any net drop reds
+# it" true, and it is the reason the line above had become a lie. The cost is real and belongs
+# to whoever merges next: a change that lands concurrently and nets one test *down* reds CI
+# until this number moves with it. That is the intended failure, not a flake.
+#
+# Both sides of the merge below moved this line, so both histories are kept. `develop` carried
+# **1466** — 1458 + 8 derived, not measured, from `fix/plan12-4-backend` (issues #251 finding 1,
+# #253 finding 2: one SQL-shape unit test and one end-to-end HTTP test for the provider-health
+# average-latency decode, plus six unit tests for the OpenAPI import byte budget). That branch
+# ran its tests targeted rather than through a full `/usr/bin/make gates`, because five units
+# were working in parallel worktrees and a full gate run each would have serialised them. It was
+# therefore arithmetic on the last measured figure, safe in the direction that matters and
+# explicitly asking to be re-measured.
+#
+# This is that re-measurement. Re-measured 2026-08-16 on the merge of `develop` into
+# `fix/plan12-1-credentials-r2`: **1588** passed, source declaring 1582, by `/usr/bin/make gates`
+# with Postgres and Redis up and zero skip lines. It supersedes both 1466 and the branch's own
+# 1562, neither of which had seen the other side's tests. The +6 doctest offset holds again.
+#
+# Re-measured 2026-08-16 on the merge of `develop` into `fix/plan12-3-migrations`: **1602**
+# passed, source declaring 1596, by `MOIRA_TEST_REDIS_URL=… /usr/bin/make gates` with Postgres
+# and Redis up and zero skip lines. Measured, not derived.
+#
+# The +14 is this branch's own, and it is +14 rather than +18 because `tests/deepseek_v4_catalog.rs`
+# already existed on `develop` with four `0028` tests — the branch extends that file rather than
+# adding it, so only its four new `0035` tests are new attributes. Counted against `develop`
+# (declared 1582) file by file: `src/infra/migration_preflight.rs` +5,
+# `tests/migration_constraint_safety.rs` +5, `tests/deepseek_v4_catalog.rs` 4 -> 8 = +4.
+# `declared` therefore moves 1582 -> 1596 and `passed` 1588 -> 1602 by the same 14, which is the
+# check that no existing test was displaced by the merge. The +6 doctest offset holds again.
+#
+# 2026-08-16, item (c) of the same review: **1605**, +3, moved in the commit that adds them.
+# `src/infra/migration_preflight.rs` 5 -> 6 (the contended pre-apply, which needs a real server)
+# and `tests/migration_constraint_safety.rs` 5 -> 7 (the ledger-description pin and the
+# lock_timeout pin). Counted from the two targets directly — 6 and 7 passed — and confirmed
+# against the gate run recorded below rather than added to the constant on faith.
+#
+# Re-measured 2026-08-16 on `feat/runner-service-docker-engine` (issue #273, workstream R1 of
+# #272), rebased on `develop` at 05dbf9c: **1699** passed, source declaring 1693, by
+# `scripts/gates.sh` with Postgres and Redis up and zero skip lines. That branch adds 108 tests
+# — 92 unit tests under `src/runner/**` and 16 in `tests/runner_control_plane.rs` — so 1588 +
+# 108 = 1696, and the remaining 3 are `tests/runner_docker_engine.rs`, which is opt-in against
+# a real Docker daemon and *passes by returning early* when the opt-in is absent. That is worth
+# naming: those three count toward `passed` in every environment, including CI, precisely
+# because they are early-return-and-pass rather than `#[ignore]`d, which would count toward
+# `declared` and never toward `passed`. The +6 doctest offset holds again.
+#
+# Re-measured 2026-08-16 after rebasing that same branch onto `develop` at c19076b, which is
+# R2 (#282, the Moira-side orchestration of these runners): **1738** passed, source declaring
+# 1732, by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. 39 of that is
+# R2's own suite — it added tests without moving this line, which is the drift this file keeps
+# warning about and keeps accumulating — and 1 is the `ATTACH_HOLD` guard this branch added
+# after R2 landed. The +6 doctest offset holds for the sixth consecutive measurement.
+#
+# Re-measured 2026-08-16 on `fix/plan12-3-migrations` at 8408d45, after merging `develop` at
+# f79bc8e into it: **1756** passed, source declaring 1750, by `scripts/gates.sh` with Postgres
+# and Redis up and zero skip lines. The +6 doctest offset holds for the seventh consecutive
+# measurement.
+#
+# This one is NOT derived. The branch and `develop` were measured separately at 1605 and 1738,
+# and 1605 + 1738 is meaningless — they share every test either had before they diverged. The
+# merged tree was gated once and the number read off that run, which is the only way a floor
+# over a merge can be honest.
+#
+# The floor also applies in CI, through `scripts/ci-assert-union.sh:111`, and CI shards the
+# suite. Checked rather than assumed: `scripts/ci-shard-run.sh:85-87` runs
+# `cargo test --all-features --doc` on whichever shard draws the `__doc__` unit, so the union
+# includes the same 6 doctests this local run does and 1756 is the right floor for both. Had it
+# not, this constant would have turned CI red while every local gate stayed green.
+TL_TEST_COUNT_MINIMUM=1756
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

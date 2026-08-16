@@ -123,6 +123,85 @@ impl LibTestDatabase {
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
+
+    /// Closes the pool and drops the database.
+    ///
+    /// The process-private database from [`test_database`] must **not** be discarded — it is
+    /// shared by every test in the process and reclaimed by the leak sweep. This exists for the
+    /// fixtures that create a *second, disposable* database, where leaving one behind per test
+    /// run would accumulate on a developer's cluster for the whole
+    /// [`LEAKED_DATABASE_GRACE_SECONDS`] window. Best effort: a test that panics before reaching
+    /// it leaks a database the sweep will reclaim, which is the same posture as a killed process.
+    pub(crate) async fn discard(self) {
+        let LibTestDatabase { pool, url, name } = self;
+        pool.close().await;
+        let Ok(origin) = Url::parse(&url) else {
+            return;
+        };
+        let mut maintenance = connect(&url_for(&origin, MAINTENANCE_DATABASE)).await;
+        let _ = sqlx::raw_sql(&format!("drop database if exists \"{name}\" with (force)"))
+            .execute(&mut maintenance)
+            .await;
+        let _ = maintenance.close().await;
+    }
+}
+
+/// A disposable database migrated to `through_version` and no further.
+///
+/// # Why anything needs one
+///
+/// Every other fixture here hands out a **fully** migrated database, which is the right default
+/// and useless for testing what happens *at* a particular migration.
+/// [`crate::infra::migration_preflight`] exists to act in the window where one specific migration
+/// is the next one due, and a fixture standing anywhere else cannot exercise it: on a fully
+/// migrated database the preflight correctly does nothing, and a test written against that would
+/// pass with the preflight deleted.
+///
+/// Migrations are applied through `sqlx`'s own [`sqlx::migrate::Migrate::apply`] rather than by
+/// executing their SQL by hand, so `_sqlx_migrations` is populated exactly as a real partial
+/// migration would leave it — the same checksums, the same rows — instead of a hand-rolled
+/// approximation of it that a test could then be right about while production was wrong.
+pub(crate) async fn partially_migrated_database(through_version: i64) -> Option<LibTestDatabase> {
+    use sqlx::migrate::Migrate as _;
+
+    let origin = database_origin()?;
+    let mut maintenance = connect(&url_for(&origin, MAINTENANCE_DATABASE)).await;
+    let name = format!("moira_test_{}_{}", unix_seconds(), Uuid::now_v7().simple());
+    run(
+        sqlx::raw_sql(&format!("create database \"{name}\"")).execute(&mut maintenance),
+        "create a partially migrated database",
+    )
+    .await;
+    let _ = maintenance.close().await;
+
+    let url = url_for(&origin, &name);
+    let pool = timeout(
+        DATABASE_TIMEOUT,
+        PgPoolOptions::new().max_connections(2).connect(&url),
+    )
+    .await
+    .expect("partially migrated database connection timed out")
+    .expect("connect the partially migrated database");
+
+    {
+        let mut conn = pool
+            .acquire()
+            .await
+            .expect("acquire a connection to migrate with");
+        conn.ensure_migrations_table()
+            .await
+            .expect("create the migration ledger");
+        for migration in MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= through_version)
+        {
+            conn.apply(migration)
+                .await
+                .unwrap_or_else(|error| panic!("apply migration {}: {error}", migration.version));
+        }
+    }
+
+    Some(LibTestDatabase { pool, url, name })
 }
 
 /// The message a suite dies with when no database is configured and the opt-out is absent.

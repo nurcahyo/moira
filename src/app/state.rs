@@ -20,6 +20,7 @@ use crate::{
         AdminAuthenticator, ApiKeyHasher, AuthService, AuthorizationService, CallerAuthenticator,
         ContentKeyring, EnvironmentMasterKeyCustody, IdempotencyHasher, JwksCache,
         KeyringContentAccess, LocalSecretCipher, MasterKeyCustody, PreflightedCustody,
+        default_verification_concurrency,
     },
 };
 
@@ -126,10 +127,27 @@ impl AppState {
             settings.secrets.key_id.clone(),
         );
         let content_custody = build_content_custody(&settings).await?;
+        // Built before the hasher, and only because the hasher needs it: the Argon2 gate records
+        // its own admissions and sheds, and a gate whose refusals are invisible is
+        // indistinguishable from a client bug. `MetricsRegistry::new` depends on nothing but the
+        // service name and the pool, so hoisting it past `key_hasher` changes no behaviour.
+        let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
+        // ONE hasher for the whole process, cloned — never constructed twice. Every clone shares
+        // the `Arc<Semaphore>` that bounds concurrent Argon2 arenas, so `state.key_hasher` and the
+        // copy inside `AuthService` below draw on one budget. Two constructions would double the
+        // bound, double the peak resident memory, and fail nothing.
         let key_hasher = ApiKeyHasher::new(
             settings.api_keys.pepper_bytes()?,
             settings.api_keys.pepper_version.clone(),
             settings.api_keys.prefix_length,
+        )
+        .with_verification_gate(
+            settings
+                .api_keys
+                .verification_concurrency
+                .unwrap_or_else(default_verification_concurrency),
+            Duration::from_millis(settings.api_keys.verification_queue_timeout_ms),
+            metrics.clone(),
         );
         let idempotency_hasher = IdempotencyHasher::new(
             settings.idempotency.pepper_bytes()?,
@@ -149,7 +167,6 @@ impl AppState {
         );
         let authz = AuthorizationService::new();
         let redis = RedisClient::from_settings(&settings.redis)?;
-        let metrics = MetricsRegistry::new(&settings.telemetry.service_name, pool.clone());
         // Boot steps 3 to 5 of `docs/decision-encryption-at-rest.md` §10, before the listener
         // binds and before any worker starts. A keyring this process cannot fully open aborts
         // here, with a message naming both remedies; see `ContentKeyring::load`.
@@ -321,7 +338,9 @@ async fn preflighted(custody: Arc<dyn MasterKeyCustody>) -> Result<PreflightedCu
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use base64::{Engine, engine::general_purpose::STANDARD};
+    use secrecy::ExposeSecret;
     use zeroize::Zeroizing;
 
     use super::*;
@@ -415,6 +434,60 @@ mod tests {
         async fn preflight(&self) -> Result<(), KeyCustodyError> {
             Err(KeyCustodyError::Unavailable { backend: "aws_kms" })
         }
+    }
+
+    /// `AuthService` and `AppState` must draw Argon2 permits from **one** budget (issue #176).
+    ///
+    /// This is the assertion that `key_hasher.clone()` above is a clone and not a second
+    /// `ApiKeyHasher::new`. Two constructions would compile, pass every other test, double the
+    /// configured concurrency and double the peak resident memory — the classic silent non-fix.
+    /// `ApiKeyHasher`'s own test proves a clone shares its semaphore; this one proves the wiring
+    /// here actually clones.
+    ///
+    /// Deterministic rather than timed: the gate is configured to one permit, that permit is held
+    /// through `state.key_hasher`, and the verification is issued through
+    /// `state.auth`. Independent budgets would let it through.
+    #[tokio::test]
+    async fn the_auth_service_and_app_state_share_one_verification_budget() {
+        let mut settings = Settings::default();
+        settings.api_keys.verification_concurrency = Some(1);
+        settings.api_keys.verification_queue_timeout_ms = 20;
+        let state = AppState::new(settings, None).await.unwrap();
+        assert_eq!(state.key_hasher.verification_concurrency(), 1);
+
+        let generated = state
+            .key_hasher
+            .generate("moira_sys")
+            .await
+            .expect("mint a key before the gate is held");
+        let secret = generated.raw_key.expose_secret().to_string();
+
+        let held = state.key_hasher.hold_one_permit_for_test().await;
+        let error = state
+            .auth
+            .key_hasher()
+            .verify(&secret, &generated.key_hash)
+            .await
+            .expect_err(
+                "AuthService verified while AppState held the only permit, so the two hold \
+                 independent Argon2 budgets and the configured bound is double what it says",
+            );
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.error_response(None).error.code,
+            "auth_verification_overloaded"
+        );
+
+        // Control: the refusal was the shared gate, not something else about this hasher.
+        drop(held);
+        assert!(
+            state
+                .auth
+                .key_hasher()
+                .verify(&secret, &generated.key_hash)
+                .await
+                .expect("the same verification succeeds once the shared permit is released")
+        );
     }
 
     /// A backend that is *configured* but not *usable* must abort startup, and the refusal must

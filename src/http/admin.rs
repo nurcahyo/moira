@@ -19,13 +19,13 @@ use crate::{
         ApplicationRoutingDefaultsRecord, AuditLogRecord, ConsumerKeyCreateRequest,
         CredentialCreateRequest, CredentialPatchRequest, CredentialRecord, CredentialScope,
         DiagnosticExecutionRequest, DiagnosticExecutionResponse, ListResponse, PageQuery,
-        ProviderCreateRequest, ProviderModelCreateRequest, ProviderModelPatchRequest,
-        ProviderModelRecord, ProviderPatchRequest, ProviderRecord, ProviderRuntimePolicyPutRequest,
-        ProviderRuntimePolicyRecord, RotateCredentialRequest, RouteDefinitionCreateRequest,
-        RouteDefinitionPatchRequest, RouteDefinitionRecord, RoutingPolicyCreateRequest,
-        RoutingPolicyPatchRequest, RoutingPolicyRecord, SetupStatusResponse,
-        SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest, TrustedJwtIssuerPatchRequest,
-        TrustedJwtIssuerRecord,
+        ProviderCreateRequest, ProviderHealthResponse, ProviderModelCreateRequest,
+        ProviderModelPatchRequest, ProviderModelRecord, ProviderPatchRequest, ProviderRecord,
+        ProviderRuntimePolicyPutRequest, ProviderRuntimePolicyRecord, RotateCredentialRequest,
+        RouteDefinitionCreateRequest, RouteDefinitionPatchRequest, RouteDefinitionRecord,
+        RoutingPolicyCreateRequest, RoutingPolicyPatchRequest, RoutingPolicyRecord,
+        SetupStatusResponse, SystemKeyCreateRequest, TrustedJwtIssuerCreateRequest,
+        TrustedJwtIssuerPatchRequest, TrustedJwtIssuerRecord,
     },
     error::{AppError, ErrorResponse},
 };
@@ -428,6 +428,26 @@ pub async fn get_provider(
     let actor = admin_actor(&state, &headers).await?;
     let record = AdminService::new(&state)?.get_provider(&actor, id).await?;
     Ok((etag_headers(record.version), Json(record)))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/admin/providers/health", tag = "admin-providers",
+    responses(
+        (status = 200, description = "Rolling reachability window for every enabled provider (issue #83)", body = ProviderHealthResponse),
+        (status = "4XX", description = "Authentication or authorization error", body = ErrorResponse),
+        (status = "5XX", description = "Infrastructure or internal error", body = ErrorResponse)
+    ),
+    security(("bearerAuth" = []), ("systemKeyAuth" = []), ("consumerKeyAuth" = []))
+)]
+pub async fn get_provider_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ProviderHealthResponse>, AppError> {
+    let actor = admin_actor(&state, &headers).await?;
+    AdminService::new(&state)?
+        .provider_health(&actor)
+        .await
+        .map(Json)
 }
 
 #[utoipa::path(

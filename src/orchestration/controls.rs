@@ -1197,6 +1197,12 @@ mod tests {
             // provider was contacted, so there is nothing to say about anyone's health.
             | C::AgentProfileNotFound
             | C::AgentProfileDisabled
+            // Issue #84, and the same reasoning one level down: a skill an agent profile
+            // names is deployment configuration too. The next attempt resolves the same
+            // `skill_refs` to the same unusable rows, every provider in the chain would be
+            // offered the same tool list, and the refusal is decided before any provider is
+            // contacted.
+            | C::SkillUnavailable
             | C::ModelNotFound
             | C::ModelForbidden
             | C::ModelCapabilityMismatch

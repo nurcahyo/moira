@@ -84,9 +84,14 @@ summary exists" and "the summary text is available" are two separate facts.
 
 ## Known limits
 
-- Summarization runs **inline**, not on the queue, because `run_supervisor` still wires
-  `queue::StubJobDispatcher` — an enqueued run would be claimed and dropped. It moves behind
-  `conversation-summarization-retry` the moment a real dispatcher lands.
+- Summarization runs **inline**, not on the queue. Issue #90 gave `run_supervisor` a real
+  per-`job_name` dispatcher (`infra::workers::dispatch::RealJobDispatcher`, replacing
+  `queue::StubJobDispatcher`), but `conversation-summarization-retry` is still registered
+  against a documented stub (`dispatch::DeferredPipelineHandler`) rather than
+  `summarize_conversation`: reaching it from a queue job needs an `Actor` and a
+  `RequestContext` a bare job payload does not carry. It moves behind
+  `conversation-summarization-retry` for real the moment that pipeline extraction — the
+  other half of #90, tracked under plan 11 — lands.
 - There is no `conversation_summarization_runs` table, so a failed automatic run is visible on
   `moira_summarization_runs_total{outcome="failed"}` and in `audit_logs`, but is not individually
   retryable or inspectable the way `memory_extraction_runs` is.

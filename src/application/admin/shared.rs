@@ -30,7 +30,7 @@
 //! `insert_audit` call on a mutation path re-opens the divergence; `audit_denied` below is
 //! the one deliberate exception, and it records something that did **not** happen.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, ToSocketAddrs};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -512,7 +512,19 @@ pub(crate) fn validate_credential_scope(request: &CredentialCreateRequest) -> Re
             "credential priority must be non-negative".to_string(),
         ));
     }
-    match &request.scope {
+    validate_credential_scope_shape(&request.scope)
+}
+
+/// The scope half of [`validate_credential_scope`], reachable without a whole
+/// [`CredentialCreateRequest`].
+///
+/// Split out for issue #275: a Claude runner fixes its credential scope at **provisioning** time,
+/// long before a `CredentialCreateRequest` exists, and the scope has to be validated there — the
+/// finalize path has already spent a one-shot token by the time the credential chain would see it.
+/// Extracted rather than copied so the runner surface and the credential surface cannot drift into
+/// two different ideas of a well-formed scope.
+pub(crate) fn validate_credential_scope_shape(scope: &CredentialScope) -> Result<(), AppError> {
+    match scope {
         CredentialScope::Global => {}
         CredentialScope::Tenant { external_tenant_id } => {
             ExternalTenantId::parse(external_tenant_id.clone())?;
@@ -576,9 +588,27 @@ pub(crate) fn authorize_credential_record(
     }
 }
 
+/// Shape and content rules for a credential payload before it is encrypted.
+///
+/// # Why this now takes the provider-address policy
+///
+/// `CredentialSecret::AzureOpenAi` carries an `endpoint`, and that endpoint is not inert
+/// configuration: `RuntimeFactory::build_completion_model` and
+/// `EmbeddingFactory::build_embedding_model` both prefer it over `providers.base_url` and
+/// then send the decrypted API key there. Until this change the `..` in the `AzureOpenAi` arm
+/// discarded it unread, so `moira:credentials:write` — a scope that never touches the
+/// providers surface — could name an address `validate_provider_base_url` would have refused.
+/// That is the second member of issue #251's class (*a decrypted secret leaves the process to
+/// an address taken from unvalidated data*); see [`crate::security::provider_endpoint`] for
+/// the enumeration and for the matching use-time guard.
+///
+/// The endpoint goes through exactly the rules `providers.base_url` goes through, including
+/// the DNS step, because both are the same kind of value written by the same kind of actor in
+/// the same admin plane.
 pub(crate) fn validate_credential_secret(
     credential_type: &crate::domain::CredentialType,
     secret: &CredentialSecret,
+    endpoint_policy: crate::security::ProviderEndpointPolicy,
 ) -> Result<(), AppError> {
     match (credential_type, secret) {
         (crate::domain::CredentialType::ApiKey, CredentialSecret::ApiKey { api_key }) => {
@@ -604,8 +634,19 @@ pub(crate) fn validate_credential_secret(
         ) => validate_custom_headers(headers),
         (
             crate::domain::CredentialType::AzureOpenAi,
-            CredentialSecret::AzureOpenAi { api_key, .. },
-        ) => require_non_empty("api_key", api_key),
+            CredentialSecret::AzureOpenAi { api_key, endpoint },
+        ) => {
+            require_non_empty("api_key", api_key)?;
+            if let Some(endpoint) = endpoint {
+                validate_provider_endpoint(
+                    endpoint,
+                    "azure_openai credential endpoint",
+                    endpoint_policy.allow_private,
+                    endpoint_policy.allow_http,
+                )?;
+            }
+            Ok(())
+        }
         (
             crate::domain::CredentialType::ServiceAccount,
             CredentialSecret::ServiceAccount { payload },
@@ -734,53 +775,75 @@ pub(crate) fn validate_jwt_algorithm_list(values: &[String]) -> Result<(), AppEr
     Ok(())
 }
 
+/// The **write-time** provider-address check: every shape rule, plus the DNS step.
+///
+/// The shape rules themselves moved to [`crate::security::provider_endpoint_shape_denial`]
+/// and are shared, unchanged, with the use-time guard in `orchestration` — see that module's
+/// header for why the provider surface needed a use-time guard at all and why it must apply
+/// exactly these rules rather than `validate_outbound_url`'s. This function keeps the DNS
+/// resolution on top, because a write is the one moment where paying for a lookup is free.
 pub fn validate_provider_base_url(
     value: &str,
     allow_private: bool,
     allow_http: bool,
 ) -> Result<String, AppError> {
-    let trimmed = value.trim().trim_end_matches('/').to_string();
-    let parsed = url::Url::parse(&trimmed)
-        .map_err(|err| AppError::BadRequest(format!("invalid provider base_url: {err}")))?;
-    match parsed.scheme() {
-        "https" => {}
-        "http" if allow_http => {}
-        _ => {
-            return Err(AppError::BadRequest(
-                "provider base_url must use https unless HTTP is explicitly allowed".to_string(),
-            ));
-        }
-    }
-    if parsed.username() != "" || parsed.password().is_some() {
-        return Err(AppError::BadRequest(
-            "provider base_url must not contain credentials".to_string(),
-        ));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("provider base_url must include a host".to_string()))?;
-    if is_cloud_metadata_host(host) {
-        return Err(AppError::coded(
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "provider_url_not_allowed",
-            "provider base_url targets a cloud metadata endpoint",
-        ));
-    }
-    if !allow_private && (is_private_host(host) || resolves_to_forbidden_ip(host, &parsed)) {
-        return Err(AppError::BadRequest(
-            "provider base_url host is private, loopback, link-local, or otherwise unsafe"
-                .to_string(),
-        ));
-    }
-    Ok(trimmed)
+    validate_provider_endpoint(value, "base_url", allow_private, allow_http)
 }
 
-fn is_private_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") {
-        return true;
+/// [`validate_provider_base_url`] with the field name parameterised.
+///
+/// `label` names the field in the caller-visible message, because the same rules now govern
+/// two different admin inputs: `providers.base_url` and an `azure_openai` credential's
+/// `endpoint` (issue #251's class, second member — see
+/// [`crate::security::provider_endpoint`]). A message that said `base_url` while rejecting a
+/// credential payload would send an operator to the wrong resource.
+pub fn validate_provider_endpoint(
+    value: &str,
+    label: &str,
+    allow_private: bool,
+    allow_http: bool,
+) -> Result<String, AppError> {
+    use crate::security::ProviderEndpointDenial;
+
+    let trimmed = value.trim().trim_end_matches('/').to_string();
+    if let Some(denial) =
+        crate::security::provider_endpoint_shape_denial(&trimmed, allow_private, allow_http)
+    {
+        return Err(match denial {
+            ProviderEndpointDenial::Unparseable(err) => {
+                AppError::BadRequest(format!("invalid provider {label}: {err}"))
+            }
+            ProviderEndpointDenial::Scheme => AppError::BadRequest(format!(
+                "provider {label} must use https unless HTTP is explicitly allowed"
+            )),
+            ProviderEndpointDenial::Credentials => {
+                AppError::BadRequest(format!("provider {label} must not contain credentials"))
+            }
+            ProviderEndpointDenial::NoHost => {
+                AppError::BadRequest(format!("provider {label} must include a host"))
+            }
+            ProviderEndpointDenial::CloudMetadata => AppError::coded(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "provider_url_not_allowed",
+                format!("provider {label} targets a cloud metadata endpoint"),
+            ),
+            ProviderEndpointDenial::PrivateAddress => AppError::BadRequest(format!(
+                "provider {label} host is private, loopback, link-local, or otherwise unsafe"
+            )),
+        });
     }
-    host.parse::<IpAddr>().is_ok_and(is_forbidden_ip)
+    // Shape passed, so the value parses and has a host. The remaining rule needs the network.
+    let parsed = url::Url::parse(&trimmed)
+        .map_err(|err| AppError::BadRequest(format!("invalid provider {label}: {err}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::BadRequest(format!("provider {label} must include a host")))?;
+    if !allow_private && resolves_to_forbidden_ip(host, &parsed) {
+        return Err(AppError::BadRequest(format!(
+            "provider {label} host is private, loopback, link-local, or otherwise unsafe"
+        )));
+    }
+    Ok(trimmed)
 }
 
 fn resolves_to_forbidden_ip(host: &str, parsed: &url::Url) -> bool {
@@ -790,45 +853,12 @@ fn resolves_to_forbidden_ip(host: &str, parsed: &url::Url) -> bool {
     let port = parsed.port_or_known_default().unwrap_or(443);
     (host, port)
         .to_socket_addrs()
-        .map(|addresses| addresses.map(|address| address.ip()).any(is_forbidden_ip))
+        .map(|addresses| {
+            addresses
+                .map(|address| address.ip())
+                .any(crate::security::is_forbidden_ip)
+        })
         .unwrap_or(false)
-}
-
-fn is_cloud_metadata_host(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "169.254.169.254"
-            | "metadata.google.internal"
-            | "metadata"
-            | "instance-data"
-            | "100.100.100.200"
-    )
-}
-
-fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_broadcast()
-                || ip.is_multicast()
-                || ip == Ipv4Addr::new(0, 0, 0, 0)
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || is_ipv6_unicast_link_local(ip)
-                || ip.is_multicast()
-        }
-    }
-}
-
-fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
-    (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 #[cfg(test)]
@@ -1103,6 +1133,74 @@ mod tests {
         assert!(validate_provider_base_url("http://api.example.com", false, false).is_err());
         assert!(validate_provider_base_url("http://127.0.0.1:8000", false, true).is_err());
         assert!(validate_provider_base_url("http://127.0.0.1:8000", true, true).is_ok());
+    }
+
+    /// Issue #251's class, second member, at the write path.
+    ///
+    /// An `azure_openai` credential's `endpoint` is a runtime destination for the very key
+    /// being stored — `build_completion_model` prefers it over `providers.base_url` — and
+    /// until this change `validate_credential_secret` matched it with `..` and never looked.
+    /// `moira:credentials:write` alone could therefore name an address the providers surface
+    /// would have refused.
+    #[test]
+    fn an_azure_credential_endpoint_is_held_to_the_provider_address_policy() {
+        use crate::domain::CredentialType;
+        use crate::security::ProviderEndpointPolicy;
+
+        let strict = ProviderEndpointPolicy::default();
+        let permissive = ProviderEndpointPolicy {
+            allow_private: true,
+            allow_http: true,
+        };
+        let with_endpoint = |endpoint: Option<&str>| CredentialSecret::AzureOpenAi {
+            api_key: "test-key".to_string(),
+            endpoint: endpoint.map(str::to_string),
+        };
+
+        assert!(
+            validate_credential_secret(
+                &CredentialType::AzureOpenAi,
+                &with_endpoint(Some("https://example.openai.azure.com")),
+                strict,
+            )
+            .is_ok(),
+            "an ordinary public azure endpoint must still be accepted"
+        );
+        let refusal = validate_credential_secret(
+            &CredentialType::AzureOpenAi,
+            &with_endpoint(Some("http://169.254.169.254/")),
+            strict,
+        )
+        .expect_err("the metadata service must not be storable as an azure endpoint");
+        assert!(
+            refusal
+                .to_string()
+                .contains("azure_openai credential endpoint"),
+            "the refusal must name the credential field, not `base_url`, got: {refusal}"
+        );
+        assert!(
+            validate_credential_secret(
+                &CredentialType::AzureOpenAi,
+                &with_endpoint(Some("http://127.0.0.1:8080")),
+                strict,
+            )
+            .is_err(),
+            "loopback is refused under the shipped defaults"
+        );
+        assert!(
+            validate_credential_secret(
+                &CredentialType::AzureOpenAi,
+                &with_endpoint(Some("http://127.0.0.1:8080")),
+                permissive,
+            )
+            .is_ok(),
+            "…and permitted once the deployment has granted both concessions"
+        );
+        assert!(
+            validate_credential_secret(&CredentialType::AzureOpenAi, &with_endpoint(None), strict,)
+                .is_ok(),
+            "no endpoint at all is the ordinary shape: the provider's base_url is used"
+        );
     }
 
     #[test]

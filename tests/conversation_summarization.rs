@@ -121,8 +121,15 @@ impl Case {
                     // first run inside `ProviderScript::HeldCompletion` and then performs a
                     // **complete authenticated HTTP round trip** — including an uncached,
                     // memory-hard Argon2id (19 MiB) consumer-key verify (`src/security/auth.rs` ->
-                    // `src/security/api_keys.rs`, no `spawn_blocking`; see issue #176) — before
-                    // releasing the gate. The first run's clock runs for all of it.
+                    // `src/security/api_keys.rs`) — before releasing the gate. The first run's
+                    // clock runs for all of it.
+                    //
+                    // Issue #176 moved that verify onto tokio's blocking pool behind a bounded
+                    // semaphore, which is why this comment no longer says "no `spawn_blocking`".
+                    // It does not weaken the argument: the round trip still *waits* for a 19 MiB
+                    // Argon2id computation, and can now additionally wait up to
+                    // `api_keys.verification_queue_timeout_ms` for a permit, so the wall-clock a
+                    // budget has to cover went up rather than down.
                     //
                     // That is the argument: "the singleflight lock is held while the second caller
                     // is served" is the property under test, so the first run is *required* to

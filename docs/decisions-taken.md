@@ -374,8 +374,53 @@ listed here so a reader who starts at this file can find them.
 | Decision | Record | Decided | Status |
 |---|---|---|---|
 | Envelope encryption at rest for the five `*_encrypted` content columns — key custody behind a pluggable trait, environment-backed first (F33, issue [#86](https://github.com/nurcahyo/moira/issues/86)) | [`decision-encryption-at-rest.md`](./decision-encryption-at-rest.md) | Maintainer, 2026-08-06 | Decided; implementation issued as #134–#142 |
+| `moira-runner`'s `image` config accepts a bare local `sha256:<64 hex>` image ID as content-pinned, not only a `name@sha256:...` registry digest (issue [#272](https://github.com/nurcahyo/moira/issues/272), R4) | §8 below | Owner delegate, mid-session correction to R1, 2026-08-16 | Decided; contract relaxed before R4 raised it independently |
 
 The other established home for maintainer decisions is
 [`plans/CONVENTIONS.md` §0](../plans/CONVENTIONS.md) — "product-owner decisions (RESOLVED — do not
 reopen)", D1–D7. That table is scoped to the iteration plans `02a`–`11` and to one-row entries; a
 decision that is neither gets a file, and the file says why in its own opening section.
+
+---
+
+## 8. `moira-runner`'s image reference: a bare local image ID counts as content-pinned
+
+**Question.** Issue #272's frozen `moira-runner` control contract (R1's workstream:
+`src/bin/moira-runner.rs`, `src/runner/**`) originally said the configured `image` "MUST contain an
+`@sha256:`". `scripts/build-claude-runner-image.sh` (R4's workstream, packaging the container image
+every provisioned runner runs) instead prints a **bare** Docker image ID —
+`docker inspect --format '{{.Id}}'`, i.e. `sha256:<64 hex>` with no `@` — because that is the only
+form that actually resolves for an image built locally and never pushed to a registry. Does the
+literal contract wording stand, or does `moira-runner` need to accept the bare-ID form too?
+
+**Decided.** Accept both. `moira-runner` validates that the configured `image` is either a
+`registry/name@sha256:<64 hex>` reference or a bare `sha256:<64 hex>` local image ID, and continues
+to reject mutable references (`:latest`, a version tag, or a bare repository name with neither). This
+was decided by the owner delegate mid-session, as a correction sent to R1 **before** R4 raised the
+same gap independently through `NEED_CONFIRMATION.md` — R4's measurement is what confirmed the
+correction was necessary, not what prompted it.
+
+**Evidence.**
+
+- `scripts/build-claude-runner-image.sh` builds `deploy/claude-runner/Dockerfile`, tags the result
+  `moira-claude-runner:local`, and prints `docker inspect --format '{{.Id}}'` — a bare
+  `sha256:<64 hex>` — as the value to paste into `moira-runner`'s `image` config.
+- Measured directly on this machine on 2026-08-16: `docker run someRepo@sha256:<that same local id>`
+  fails with `pull access denied for someRepo, repository does not exist or may require 'docker
+  login'` — a purely local build carries no `RepoDigests`, so the `name@sha256:...` form Docker
+  itself understands as "pull this by digest" cannot be constructed for it. `docker run
+  sha256:<id>` (bare, unprefixed), by contrast, resolves correctly against the local daemon and
+  actually ran `claude --version` through the image. Both commands' output is reproduced in
+  `docs/claude-runners.md`'s "Building and pinning the image" section.
+- `docs/claude-runners.md` documents the bare-ID form as correct for `moira-runner` and this build
+  script running against the same local Docker daemon.
+
+**Reversal condition.** This holds only because `moira-runner` and the image it starts are talking to
+the *same* Docker daemon — a bare image ID is meaningless outside that daemon's local image store. If
+runners are ever provisioned against a remote or shared Docker host (a `DOCKER_HOST` pointing off-box,
+a managed container service, or any topology where `moira-runner` does not share a filesystem and
+image store with wherever the image was built), the bare-ID form stops being valid: the image must
+be pushed to a registry reachable from that host and referenced by its real `name@sha256:...`
+registry digest instead, and `moira-runner`'s validation would need to require that form specifically
+in that deployment mode. `docs/claude-runners.md` should be updated to say so explicitly if or when
+that topology is built.

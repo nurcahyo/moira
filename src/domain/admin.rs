@@ -101,7 +101,7 @@ pub enum ResourceStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderType {
     OpenAiCompatible,
@@ -112,6 +112,19 @@ pub enum ProviderType {
     AzureOpenAi,
     Local,
     Custom,
+    /// rig-core 0.40's native `rig_core::providers::chatgpt` client against
+    /// `chatgpt.com/backend-api/codex` (issue #216). Spelled `Chatgpt`, not `ChatGpt` or
+    /// `ChatGPT`, so `#[serde(rename_all = "snake_case")]` derives the wire/DB value
+    /// `chatgpt_oauth` directly — the same convention `CredentialType::Oauth2` already uses for
+    /// "OAuth" in this file.
+    ///
+    /// **Refused unless `provider_security.allow_chatgpt_subscription` is explicitly `true`.**
+    /// ChatGPT/Codex subscriptions are personal, single-user under OpenAI's terms; there is no
+    /// carve-out for third-party, multi-tenant use. Wiring this provider is this deployment
+    /// operator's own explicit ToS risk acceptance for their own subscription, never a silent
+    /// default — see `orchestration::runtime_factory::require_chatgpt_subscription_opt_in` and
+    /// `docs/chatgpt-subscription-spike.md`.
+    ChatgptOauth,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -319,7 +332,9 @@ pub struct ProviderModelPatchRequest {
     pub capabilities: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+// `PartialEq`/`Eq` added by issue #275 so a runner's stored scope can be compared against the one
+// its credential was written at. Additive only: the wire shape is untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CredentialScope {
     Global,
@@ -407,6 +422,41 @@ pub enum CredentialSecret {
     ServiceAccount {
         payload: Value,
     },
+}
+
+/// One provider's rolling health window (issue #83), as `GET
+/// /api/v1/admin/providers/health` serves it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderHealthEntry {
+    pub provider_id: Uuid,
+    pub provider_type: ProviderType,
+    pub display_name: String,
+    pub status: ProviderHealthStatus,
+    /// Total reachability probes observed within the rolling window.
+    pub probes_total: i64,
+    /// Probes that reached the provider at all — `healthy` or `degraded`, not `unhealthy`.
+    pub probes_successful: i64,
+    pub average_latency_ms: Option<f64>,
+    pub last_probe_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_failure_at: Option<DateTime<Utc>>,
+}
+
+/// The classification `src/infra/workers/provider_health_check.rs::classify_probe` produces,
+/// plus `Unknown` for a provider with no snapshot inside the rolling window at all (never
+/// probed, or not probed recently enough to still be in window).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProviderHealthResponse {
+    pub providers: Vec<ProviderHealthEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
