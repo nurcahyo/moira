@@ -256,16 +256,19 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
     // so the cap check below runs before any per-operation work.
     let mut path_keys: Vec<&String> = paths.keys().collect();
     path_keys.sort();
-    let mut raw_operations: Vec<(&str, &str, &Value, HttpMethod)> = Vec::new();
+    let mut raw_operations: Vec<(&str, &Value, &str, &Value, HttpMethod)> = Vec::new();
     for path in path_keys {
-        let Some(item) = paths.get(path).and_then(Value::as_object) else {
+        let Some(item) = paths.get(path) else {
+            continue;
+        };
+        let Some(item_obj) = item.as_object() else {
             continue;
         };
         for (method_name, method) in RECOGNIZED_METHODS {
-            if let Some(operation) = item.get(method_name)
+            if let Some(operation) = item_obj.get(method_name)
                 && operation.is_object()
             {
-                raw_operations.push((path.as_str(), method_name, operation, method));
+                raw_operations.push((path.as_str(), item, method_name, operation, method));
             }
         }
     }
@@ -284,10 +287,11 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
     let mut budget = SchemaBudget::default();
     let operations = raw_operations
         .into_iter()
-        .map(|(path, method_name, operation, method)| {
+        .map(|(path, path_item, method_name, operation, method)| {
             build_operation(
                 document,
                 path,
+                path_item,
                 method_name,
                 operation,
                 method,
@@ -372,11 +376,13 @@ fn serialized_len(value: &Value) -> usize {
     }
 }
 
-fn build_operation(
-    root: &Value,
+#[allow(clippy::too_many_arguments)]
+fn build_operation<'a>(
+    root: &'a Value,
     path: &str,
+    path_item: &'a Value,
     method_name: &str,
-    operation: &Value,
+    operation: &'a Value,
     method: HttpMethod,
     used_keys: &mut HashSet<String>,
     budget: &mut SchemaBudget,
@@ -418,7 +424,7 @@ fn build_operation(
         })
         .unwrap_or_default();
 
-    let params_schema = build_params_schema(root, operation, &skill_key, budget)?;
+    let params_schema = build_params_schema(root, path_item, operation, &skill_key, budget)?;
 
     Ok(ParsedOperation {
         skill_key,
@@ -437,9 +443,10 @@ fn build_operation(
 /// Every value this copies into `properties` is charged against `budget` *before* the copy,
 /// because the copies are the whole amplification: a resolved `$ref` is a deep clone of a
 /// subtree the document holds once and this function may hold three hundred times.
-fn build_params_schema(
-    root: &Value,
-    operation: &Value,
+fn build_params_schema<'a>(
+    root: &'a Value,
+    path_item: &'a Value,
+    operation: &'a Value,
     skill_key: &str,
     budget: &mut SchemaBudget,
 ) -> Result<Value, OpenApiImportError> {
@@ -447,29 +454,48 @@ fn build_params_schema(
     let mut required: Vec<String> = Vec::new();
     budget.begin_operation();
 
-    if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
-        for parameter in parameters {
-            let parameter = resolve_maybe_ref(root, parameter);
-            let Some(name) = parameter.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            // A parameter that declares no schema gets the fixed 17-byte `{"type":"string"}`
-            // substitute below, which cannot amplify — three hundred of them is under 6 KiB —
-            // so only a declared (and possibly `$ref`-resolved) schema is charged.
-            let declared = parameter.get("schema");
-            budget.charge(declared.map_or(0, serialized_len), skill_key)?;
-            let schema = declared
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "string"}));
-            if parameter
-                .get("required")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                required.push(name.to_string());
+    let mut param_list: Vec<(&'a Value, &'a str, Option<&'a str>)> = Vec::new();
+
+    let mut process_param_array = |params: &'a Value| {
+        if let Some(arr) = params.as_array() {
+            for param in arr {
+                let resolved = resolve_maybe_ref(root, param);
+                if let Some(name) = resolved.get("name").and_then(Value::as_str) {
+                    let param_in = resolved.get("in").and_then(Value::as_str);
+                    if let Some(pos) = param_list
+                        .iter()
+                        .position(|(_, n, i)| *n == name && *i == param_in)
+                    {
+                        param_list[pos] = (resolved, name, param_in);
+                    } else {
+                        param_list.push((resolved, name, param_in));
+                    }
+                }
             }
-            properties.insert(name.to_string(), schema);
         }
+    };
+
+    if let Some(params) = path_item.get("parameters") {
+        process_param_array(params);
+    }
+    if let Some(params) = operation.get("parameters") {
+        process_param_array(params);
+    }
+
+    for (parameter, name, _) in param_list {
+        let declared = parameter.get("schema");
+        budget.charge(declared.map_or(0, serialized_len), skill_key)?;
+        let schema = declared
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "string"}));
+        if parameter
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            required.push(name.to_string());
+        }
+        properties.insert(name.to_string(), schema);
     }
 
     if let Some(request_body) = operation.get("requestBody") {
@@ -482,22 +508,34 @@ fn build_params_schema(
         {
             let schema = resolve_maybe_ref(root, schema);
             budget.charge(serialized_len(schema), skill_key)?;
-            properties.insert("body".to_string(), schema.clone());
+            let body_prop_name = if properties.contains_key("body") {
+                "request_body"
+            } else {
+                "body"
+            };
+            properties.insert(body_prop_name.to_string(), schema.clone());
             if request_body
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                required.push("body".to_string());
+                required.push(body_prop_name.to_string());
             }
+        }
+    }
+
+    let mut unique_required = Vec::new();
+    for req in required {
+        if !unique_required.contains(&req) {
+            unique_required.push(req);
         }
     }
 
     let mut schema = Map::new();
     schema.insert("type".to_string(), json!("object"));
     schema.insert("properties".to_string(), Value::Object(properties));
-    if !required.is_empty() {
-        schema.insert("required".to_string(), json!(required));
+    if !unique_required.is_empty() {
+        schema.insert("required".to_string(), json!(unique_required));
     }
     Ok(Value::Object(schema))
 }
@@ -1075,5 +1113,65 @@ mod tests {
         }));
         let parsed = parse_openapi_document(&document).expect("must parse");
         assert!(parsed.operations[0].skill_key.len() <= MAX_SKILL_KEY_LEN);
+    }
+
+    #[test]
+    fn path_item_level_parameters_are_inherited_and_overridden_by_operation_level() {
+        let document = minimal_document(json!({
+            "/orders/{order_id}": {
+                "parameters": [
+                    {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string"}},
+                    {"name": "tenant", "in": "header", "schema": {"type": "string"}}
+                ],
+                "get": {
+                    "operationId": "getOrder",
+                    "parameters": [
+                        {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ]
+                }
+            }
+        }));
+
+        let parsed = parse_openapi_document(&document).expect("must parse");
+        let op = &parsed.operations[0];
+        let props = op.params_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("order_id"));
+        assert!(props.contains_key("tenant"));
+        assert_eq!(props["order_id"]["format"], "uuid");
+    }
+
+    #[test]
+    fn body_parameter_and_request_body_collision_is_prevented_and_required_is_deduplicated() {
+        let document = minimal_document(json!({
+            "/items": {
+                "post": {
+                    "operationId": "createItem",
+                    "parameters": [
+                        {"name": "body", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "body", "in": "header", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object", "properties": {"name": {"type": "string"}}}
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let parsed = parse_openapi_document(&document).expect("must parse");
+        let op = &parsed.operations[0];
+        let props = op.params_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("body"));
+        assert!(props.contains_key("request_body"));
+
+        let req = op.params_schema["required"].as_array().unwrap();
+        let req_strings: Vec<&str> = req.iter().filter_map(Value::as_str).collect();
+        assert_eq!(req_strings, vec!["body", "request_body"]);
     }
 }
