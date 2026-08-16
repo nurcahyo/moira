@@ -2582,11 +2582,15 @@ async fn execute_rig_completion(
 /// not reachable with an `output_schema` — `execute_inner` refuses that combination before
 /// a candidate is chosen (finding F48) — so `structured_output` is always `None` here.
 ///
-/// **On success, usage is the final turn's, not a sum.** `UsageSummary` feeds `usage_records`,
-/// whose rows are per attempt, and `usage_from_rig` is the only sanctioned source either way.
-/// The under-count on that path is real and is filed separately (issue #252 finding 4); it is
-/// not what the failure arm below does, because a failed loop has no final turn to report and
-/// reporting nothing was the actual hole.
+/// **Usage is the sum of every turn, on both arms** (issue #252 finding 4). It used to be the
+/// final turn's on success, defended as "summing turns would report one figure the provider
+/// will invoice as several" — which inverts the argument: the invoice *is* the sum, a
+/// `usage_records` row is per attempt, and this attempt made all of those calls. The same
+/// comment claimed the retry path has that shape too, and it does not — each retry attempt
+/// writes its own row, whereas these calls collapse into one. Left as it was, a four-turn
+/// execution hid three completions, and the hidden ones are the expensive ones: each carries
+/// the whole grown history plus the tool results. `usage_from_rig` remains the only source of
+/// the per-turn figures being added; nothing here is synthesized.
 ///
 /// **On failure, both the counts and the dispatch records survive.** A bare `?` here dropped
 /// them: a loop that made four billed completions and issued four outbound calls reported

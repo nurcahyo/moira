@@ -979,6 +979,13 @@ async fn a_dangling_skill_reference_refuses_the_execution() {
 /// turn is another tool call, so the loop can only end by exhausting the budget — and it
 /// must end as `DeadlineExceeded` rather than looping until the execution timeout, which
 /// would be indistinguishable from a slow provider.
+///
+/// The two counts are asserted together because the boundary between them is the property
+/// (issue #252 finding 3): the budget is `4` **model calls**, and the fourth of those has no
+/// successor to read a tool result, so it must not dispatch. Four dispatches would mean the
+/// last one fired a real request — `HttpMethod` admits `POST`/`PUT`/`PATCH`/`DELETE` against
+/// an operator's third-party API — purely to have its result discarded by the failure below,
+/// with the caller told only `504`.
 #[tokio::test]
 async fn a_model_that_never_stops_calling_tools_exhausts_the_turn_budget() {
     let scripts = (0..8)
@@ -1007,6 +1014,13 @@ async fn a_model_that_never_stops_calling_tools_exhausts_the_turn_budget() {
         fixture.provider.call_count().await,
         4,
         "the loop must stop at `skill_execution.maximum_tool_turns` model calls"
+    );
+    assert_eq!(
+        fixture.target.calls().len(),
+        3,
+        "the fourth turn asked for a tool too, but no turn is left to read the result, so it \
+         must not have been dispatched: {:?}",
+        fixture.target.calls()
     );
 
     fixture.shutdown().await;
@@ -1099,6 +1113,91 @@ async fn an_exhausted_turn_budget_still_reports_its_tool_calls_and_its_tokens() 
         metered, 1,
         "an all-`None` usage skips `insert_usage_record`, so dropping the counts also dropped \
          the billing row for four calls the provider will invoice"
+    );
+
+    fixture.shutdown().await;
+}
+
+/// **A loop that succeeds meters every turn it made, not just the one that answered
+/// (issue #252 finding 4).**
+///
+/// The sibling above pins the failure path. This is the success path, where the under-count
+/// was larger and quieter: `run_tool_loop` overwrote its output each turn and reported only
+/// the last one, so a four-turn execution put three billed completions outside
+/// `usage_records` — and the hidden ones are the *expensive* ones, because each later turn
+/// re-sends the whole grown history plus every tool result. The row is per attempt and this
+/// attempt made all of the calls, so the sum is the figure that row is for.
+///
+/// The scripted mock bills a tool-calling turn 4/2 and an answering turn 2/1, so the correct
+/// total is arithmetic rather than a guess — and, importantly, the two turns bill *different*
+/// amounts, so "reports the last turn" and "reports the sum" cannot coincide.
+#[tokio::test]
+async fn a_successful_loop_meters_every_turn_not_only_the_one_that_answered() {
+    let Some(fixture) = SkillFixture::new(
+        vec![
+            ProviderScript::ToolCallCompletion {
+                call_id: "call_1".to_string(),
+                name: "orders_get".to_string(),
+                arguments: json!({ "order_id": "D-1" }),
+            },
+            ProviderScript::Completion {
+                text: "order D-1 is shipped".to_string(),
+            },
+        ],
+        json!({ "state": "shipped" }),
+    )
+    .await
+    else {
+        return;
+    };
+    fixture
+        .seed_skill(SkillSeed::tool("orders_get", "/orders/{order_id}"))
+        .await;
+
+    let outcome = fixture.execute().await;
+    assert_eq!(
+        outcome.status,
+        ExecutionStatus::Succeeded,
+        "{:?}",
+        outcome.failure
+    );
+    assert_eq!(
+        fixture.provider.call_count().await,
+        2,
+        "the scenario is only meaningful if both turns really billed"
+    );
+    assert_eq!(fixture.target.calls().len(), 1);
+
+    let attempt = outcome.attempts.first().expect("one attempt was made");
+    assert_eq!(
+        attempt.usage.total_tokens,
+        Some(9),
+        "6 for the tool-calling turn plus 3 for the answer; reporting only the answer's 3 \
+         hides the turn that carried the tools: {:?}",
+        attempt.usage
+    );
+    assert_eq!(attempt.usage.input_tokens, Some(6), "{:?}", attempt.usage);
+    assert_eq!(attempt.usage.output_tokens, Some(3), "{:?}", attempt.usage);
+    assert_eq!(
+        outcome.usage.total_tokens,
+        Some(9),
+        "the outcome reports what its own attempts reported"
+    );
+
+    // `usage_records` is the surface `infra::repositories::public` reports spend from, so the
+    // wire figure being right is not enough — the persisted row has to carry the same total.
+    let metered: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "select input_tokens, output_tokens, total_tokens from usage_records \
+         where execution_id = $1",
+    )
+    .bind(outcome.execution_id)
+    .fetch_one(&fixture.fixture.pool)
+    .await
+    .expect("the attempt must have written exactly one usage row");
+    assert_eq!(
+        metered,
+        (Some(6), Some(3), Some(9)),
+        "the billing row must carry both completions, not the last one"
     );
 
     fixture.shutdown().await;

@@ -745,6 +745,14 @@ pub struct ToolCallRecord {
 #[derive(Debug)]
 pub struct ToolLoopOutcome {
     pub text: String,
+    /// Every turn that answered, summed — not the final turn's (issue #252 finding 4).
+    ///
+    /// A tool-bearing execution makes up to `maximum_tool_turns` billed provider calls, and
+    /// the later ones are the expensive ones because each carries the whole grown history
+    /// plus the tool results. Reporting only the last one put up to `maximum_tool_turns - 1`
+    /// completions outside `usage_records`, which is what `infra::repositories::public`
+    /// reports spend from. The row is per attempt and this attempt made all of those calls,
+    /// so the sum is the figure that row is for.
     pub usage: UsageSummary,
     pub provider_request_id: Option<String>,
     /// Model calls made, including the final one that produced `text`.
@@ -765,12 +773,7 @@ pub struct ToolLoopOutcome {
 #[derive(Debug)]
 pub struct ToolLoopFailure {
     pub failure: ExecutionFailure,
-    /// Every turn that answered, summed.
-    ///
-    /// A sum rather than "the last turn's", which is what [`ToolLoopOutcome`] reports:
-    /// there is no answering turn on this path, so the only honest figure is the total of
-    /// the calls that were actually made and invoiced. (Whether the success path should sum
-    /// too is a separate, filed question — see issue #252 finding 4.)
+    /// Every turn that answered, summed — the same rule [`ToolLoopOutcome`] follows.
     pub usage: UsageSummary,
     /// Tool calls dispatched before the failure, in call order.
     pub tool_calls: Vec<ToolCallRecord>,
@@ -897,11 +900,21 @@ pub async fn run_tool_loop(
         if output.tool_calls.is_empty() {
             return Ok(ToolLoopOutcome {
                 text: output.text,
-                usage: output.usage,
+                usage: spent,
                 provider_request_id: output.provider_request_id,
                 turns: turn,
                 tool_calls,
             });
+        }
+
+        // The last permitted turn must not dispatch (issue #252 finding 3). Feeding a tool
+        // result back costs a further model call, and there is none left in the budget — so
+        // every request issued here would be a pure side effect whose result no model ever
+        // reads, and `HttpMethod` admits `Post`/`Put`/`Patch`/`Delete` against an operator's
+        // third-party API. Breaking rather than returning keeps one exhaustion exit below,
+        // so the two cannot report different classes or drop different records.
+        if turn == maximum_tool_turns {
+            break;
         }
 
         // One assistant message carrying every tool call of the turn ...
@@ -953,6 +966,8 @@ pub async fn run_tool_loop(
 
     // The budget-exhaustion exit is the one that discards the most: `maximum_tool_turns`
     // billed completions and every tool call they asked for, all of which really happened.
+    // Reached only through the `break` above — the loop cannot otherwise run out, because
+    // the last turn either answers or breaks.
     Err(ToolLoopFailure::new(
         ExecutionFailureClass::DeadlineExceeded,
         "execution exceeded the configured tool turn budget",
