@@ -875,8 +875,25 @@ jobs:
           context: .
           tags: moira:ci
           load: true
-          cache-from: type=registry,ref=ghcr.io/nurcahyo/moira-cache:server
-          cache-to: type=registry,ref=ghcr.io/nurcahyo/moira-cache:server,mode=max
+          # `ignore-error=true` is REQUIRED, not defensive. This repository is public, and a
+          # pull request from a fork runs with a `GITHUB_TOKEN` that GitHub caps at read-only
+          # no matter what the job's `permissions:` block asks for. Without this, the cache
+          # export 403s and takes the whole step with it — so every external contributor's PR
+          # goes red on `container-and-helm-build`, which backs the required `container-and-helm`
+          # check, *after* paying the full Rust build. The failure surfaces inside a step named
+          # "Build …", so it reads as a broken build rather than a permission they never had and
+          # cannot grant themselves. With this, the export degrades to a warning and the build
+          # still publishes its result.
+          #
+          # `cache-from` is deliberately left without it: a registry cache miss is already
+          # non-fatal, and silencing read errors would hide a cache that has stopped existing.
+          #
+          # `github.repository_owner` rather than a literal: on `pull_request` the workflow runs
+          # in the BASE repository's context, so this still resolves to the upstream owner for
+          # fork PRs — the point is that a rename or transfer cannot leave a dangling literal
+          # that degrades to a permanent silent cache miss.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/moira-cache:server
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/moira-cache:server,mode=max,ignore-error=true
       # SBOM of the IMAGE, not of the source tree, and therefore necessarily HERE: this
       # job is the only place the image exists, and a source-tree SBOM would omit the
       # base layer and every OS package — which is most of what the Trivy step below is
@@ -1126,8 +1143,11 @@ jobs:
           context: console
           tags: moira-console:ci
           load: true
-          cache-from: type=registry,ref=ghcr.io/nurcahyo/moira-cache:console
-          cache-to: type=registry,ref=ghcr.io/nurcahyo/moira-cache:console,mode=max
+          # Same reasoning as the server image above: `ignore-error=true` so a fork PR's
+          # read-only `GITHUB_TOKEN` degrades the cache export to a warning instead of failing
+          # a required check, and `github.repository_owner` so a rename cannot strand the ref.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/moira-cache:console
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/moira-cache:console,mode=max,ignore-error=true
       # Same reasoning as the Moira image's SBOM: before the scanner, inventory only,
       # generated where the image exists. The console is the internet-facing half, so
       # if anything it is the image whose contents most need to be enumerable after the
