@@ -232,7 +232,20 @@ tl_count_skips() {
 # `cargo test --all-features --doc` on whichever shard draws the `__doc__` unit, so the union
 # includes the same 6 doctests this local run does and 1756 is the right floor for both. Had it
 # not, this constant would have turned CI red while every local gate stayed green.
-TL_TEST_COUNT_MINIMUM=1756
+#
+# Re-measured 2026-08-17 on `fix/openapi-body-collision-regression`: **1761** passed, source
+# declaring 1755, by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. Measured
+# twice, once based on `develop` at 38e789d and again after rebasing onto f62e444, which is
+# docs-only and moved neither number. The branch adds 3 tests (2 in
+# `src/orchestration/openapi_import.rs`, 1 in `src/orchestration/skill_tool.rs`), and the base was
+# already carrying 2 more than the line above claimed — 1756 was 2 low before this branch existed,
+# which is exactly the drift this file keeps warning about and keeps accumulating.
+#
+# The local/CI equality was checked directly this time rather than reasoned about: CI run
+# 31963437261 on that same base commit printed `tests passed: 1758 (source declares 1752)`, and
+# this branch measured 1761/1755 locally — the same +3 on both halves, so the local number and
+# the sharded union are still the same number and 1761 is the right floor for both.
+TL_TEST_COUNT_MINIMUM=1761
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

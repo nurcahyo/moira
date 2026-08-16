@@ -91,11 +91,20 @@ tool loop (#84).
 Every imported skill lands `draft`, exactly like a hand-authored one (§5 decision 22) — the
 operator reviews and enables via the existing `/enable`/`/bulk-enable` endpoints above.
 
-`params_schema` is derived from each operation's `parameters` (flattened to top-level properties)
-and `requestBody`'s `application/json` schema (nested under a `body` property). Component `$ref`s
+`params_schema` is derived from each operation's `parameters` — both the operation's own and the
+path item's, which OpenAPI says every operation under that path inherits, with the operation's
+winning on a `(name, in)` tie — flattened to top-level properties, plus `requestBody`'s
+`application/json` schema nested under a `body` property. Component `$ref`s
 (`#/components/parameters/...`, `#/components/schemas/...`) are resolved one level against the
 same document; a `$ref` nested inside an already-resolved schema is left as written. See the
 module docs in `src/orchestration/openapi_import.rs` for the exact rules.
+
+Nothing stops a spec from declaring a **parameter** named `body`. When one does, the request body
+is nested under the first free name from `request_body`, `request_body_2`, … and the schema
+carries `"x-moira-body-property": "<that name>"` at its root. The executor never assumes the name:
+it asks `openapi_import::body_property_name`, the one function that decides, so a schema whose
+body moved cannot be dispatched as though it had not. Schemas with no such property are
+unchanged — the annotation is written only when the default name was taken.
 
 ### `skill_http_executors` CRUD
 
@@ -363,7 +372,8 @@ the agent author". Resolution runs once per execution, before any provider is ch
 
 `HttpSkillTool` fills `{placeholder}` segments from the model's arguments (percent-encoded, so an
 argument cannot escape its segment), sends every remaining declared argument as a query parameter,
-sends `body` as the JSON request body on `POST`/`PUT`/`PATCH`, and re-runs
+sends the argument `openapi_import::body_property_name` names — `body` unless a parameter took
+that name, see above — as the JSON request body on `POST`/`PUT`/`PATCH`, and re-runs
 `security::ssrf::validate_outbound_url` on the **resolved** URL plus an `allowed_host` equality
 check (plan 12 risk R20 — import-time validation cannot cover a URL that only exists at call time).
 The executor's `credential_id` is decrypted per execution into an `Authorization: Bearer` header;

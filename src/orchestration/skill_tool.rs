@@ -67,7 +67,7 @@ use crate::{
         CredentialType, ExecutionFailure, ExecutionFailureClass, GuardContext, GuardVerdict,
         HttpMethod, SkillGuard, UsageSummary, evaluate_guards,
     },
-    orchestration::RuntimeModelHandle,
+    orchestration::{RuntimeModelHandle, openapi_import::body_property_name},
     security::{OutboundUrlPolicy, SystemResolver, validate_outbound_url},
 };
 
@@ -214,6 +214,12 @@ pub struct SkillToolArgs(pub Value);
 pub struct HttpSkillTool {
     spec: SkillToolSpec,
     client: reqwest::Client,
+    /// Which argument carries the JSON request body, read out of `params_schema` once at
+    /// construction by `openapi_import::body_property_name` — the importer's own answer,
+    /// asked rather than assumed. Nothing in this module spells the name out; hard-coding
+    /// `"body"` here while the importer renamed a colliding body is precisely what inverted
+    /// the dispatch once already.
+    body_property: Option<String>,
 }
 
 impl std::fmt::Debug for HttpSkillTool {
@@ -229,7 +235,12 @@ impl HttpSkillTool {
         if let Some(credential) = &spec.credential {
             authorization_header(credential)?;
         }
-        Ok(Self { spec, client })
+        let body_property = body_property_name(&spec.params_schema).map(str::to_string);
+        Ok(Self {
+            spec,
+            client,
+            body_property,
+        })
     }
 
     pub fn skill_key(&self) -> &str {
@@ -244,8 +255,10 @@ impl HttpSkillTool {
     ///
     /// Argument placement follows one rule, chosen to match what
     /// `orchestration::openapi_import::build_params_schema` actually produces: a name the
-    /// template names becomes a path segment, `body` becomes the JSON request body on the
-    /// methods that carry one, and everything else becomes a query parameter. An OpenAPI
+    /// template names becomes a path segment, the property
+    /// `orchestration::openapi_import::body_property_name` identifies becomes the JSON
+    /// request body on the methods that carry one, and everything else becomes a query
+    /// parameter. That property is usually — but not always — literally `body`. An OpenAPI
     /// parameter declared `in: header` therefore arrives as a query parameter — the
     /// importer flattens path/query/header into one property list and does not keep the
     /// `in` location, so nothing downstream can recover it. That is a documented
@@ -262,9 +275,12 @@ impl HttpSkillTool {
         //
         // Collected before touching `query_pairs_mut` because that borrow writes a `?` even
         // when nothing is appended, turning a clean `/orders/A-1` into `/orders/A-1?`.
+        let body_property = self.body_property.as_deref();
         let query: Vec<(&str, String)> = arguments
             .iter()
-            .filter(|(name, _)| !consumed.contains(name.as_str()) && *name != "body")
+            .filter(|(name, _)| {
+                !consumed.contains(name.as_str()) && Some(name.as_str()) != body_property
+            })
             .map(|(name, value)| (name.as_str(), scalar_to_query_value(value)))
             .collect();
         if !query.is_empty() {
@@ -375,7 +391,10 @@ impl Tool for HttpSkillTool {
             }
         }
         if method_carries_body(self.spec.method)
-            && let Some(body) = arguments.get("body")
+            && let Some(body) = self
+                .body_property
+                .as_deref()
+                .and_then(|name| arguments.get(name))
         {
             request = request.json(body);
         }
@@ -1462,6 +1481,156 @@ mod tests {
         tokio::spawn(async move {
             // The result is ignored because the client disconnects mid-body by design, which
             // is the whole point of this target.
+            let _ = axum::serve(listener, app).await;
+        });
+        address
+    }
+
+    /// The importer and this module are two halves of one contract, and they are tested
+    /// together here because testing them apart is exactly how they came to disagree: the
+    /// importer grew a rename, its own unit test asserted the renamed property was present,
+    /// and nothing anywhere asked where the bytes went.
+    ///
+    /// So this drives the real pipeline end to end — `parse_openapi_document` produces the
+    /// `params_schema`, that schema builds the tool unedited, and a loopback target reports
+    /// what actually arrived on the wire. Both shapes matter: the ordinary one, which was
+    /// always right and must stay right, and the colliding one, where the dispatch was
+    /// inverted — the JSON request body serialised into the query string and the scalar
+    /// query parameter posted as the JSON body.
+    #[tokio::test]
+    async fn the_imported_schema_decides_which_argument_is_the_body_and_which_is_a_query() {
+        use crate::orchestration::openapi_import::parse_openapi_document;
+
+        let body_schema = json!({
+            "required": true,
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"sku": {"type": "string"}}}
+                }
+            }
+        });
+        let document = json!({
+            "openapi": "3.0.3",
+            "info": {"title": "Dispatch API", "version": "1.0.0"},
+            "servers": [{"url": "https://api.example.test"}],
+            "paths": {
+                // A query parameter named `body` — legal OpenAPI, and the shape that made the
+                // importer rename the request body out from under this module.
+                "/collide": {
+                    "post": {
+                        "operationId": "collide",
+                        "parameters": [
+                            {"name": "body", "in": "query", "required": true,
+                             "schema": {"type": "string"}}
+                        ],
+                        "requestBody": body_schema.clone()
+                    }
+                },
+                "/plain": {
+                    "post": {
+                        "operationId": "plain",
+                        "parameters": [
+                            {"name": "page", "in": "query", "schema": {"type": "integer"}}
+                        ],
+                        "requestBody": body_schema
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_openapi_document(&document).expect("the document parses");
+        let operation = |path: &str| {
+            parsed
+                .operations
+                .iter()
+                .find(|operation| operation.path == path)
+                .unwrap_or_else(|| panic!("{path} was imported"))
+        };
+
+        let address = start_dispatch_target().await;
+
+        // `request_body` is spelled out rather than read back through
+        // `body_property_name`: asking the contract what it expects and then asserting it
+        // got it would pass however the contract drifted.
+        let collide = call_imported(
+            operation("/collide"),
+            address,
+            json!({"body": "scalar-parameter", "request_body": {"sku": "S-1"}}),
+        )
+        .await;
+        assert_eq!(
+            collide.0, "body=scalar-parameter",
+            "the parameter named `body` is a query parameter and nothing else"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&collide.1).expect("a JSON request body"),
+            json!({"sku": "S-1"}),
+            "the request body must be the JSON body, not a query value"
+        );
+
+        let plain = call_imported(
+            operation("/plain"),
+            address,
+            json!({"page": 2, "body": {"sku": "S-2"}}),
+        )
+        .await;
+        assert_eq!(plain.0, "page=2");
+        assert_eq!(
+            serde_json::from_str::<Value>(&plain.1).expect("a JSON request body"),
+            json!({"sku": "S-2"}),
+            "the uncollided case must be untouched by the collision handling"
+        );
+    }
+
+    /// Builds a tool from an imported operation, unedited, and calls it against `address`.
+    /// Returns the raw query string and the raw request body the target received.
+    async fn call_imported(
+        operation: &crate::orchestration::ParsedOperation,
+        address: std::net::SocketAddr,
+        arguments: Value,
+    ) -> (String, String) {
+        let mut imported = spec(
+            &format!("http://{address}{}", operation.path),
+            operation.params_schema.clone(),
+        );
+        imported.method = operation.method;
+        imported.allowed_host = "127.0.0.1".to_string();
+        // Same dev escape hatch the oversize target above needs, for the same reason.
+        imported.outbound_policy.allow_insecure = true;
+
+        let tool = HttpSkillTool::new(imported, reqwest::Client::new()).expect("tool builds");
+        let output = tool
+            .call_with_extensions(SkillToolArgs(arguments), &ToolCallExtensions::new())
+            .await
+            .expect("the target answers 200");
+        assert_eq!(output.status, 200);
+        let received = output.body;
+        (
+            received["query"].as_str().unwrap_or_default().to_string(),
+            received["body"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Echoes back what it received rather than recording it in shared state: the assertion
+    /// is then about this exact call, with no ordering to get wrong.
+    async fn serve_dispatch(
+        axum::extract::RawQuery(query): axum::extract::RawQuery,
+        body: String,
+    ) -> axum::response::Response {
+        let payload = json!({"query": query.unwrap_or_default(), "body": body}).to_string();
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(payload))
+            .expect("dispatch response builds")
+    }
+
+    async fn start_dispatch_target() -> std::net::SocketAddr {
+        let app = axum::Router::new().fallback(axum::routing::any(serve_dispatch));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dispatch target");
+        let address = listener.local_addr().expect("dispatch target address");
+        tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         address
