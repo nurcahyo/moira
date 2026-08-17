@@ -298,7 +298,18 @@ tl_count_skips() {
 # which is exactly how the earlier attempt here reported 1364.
 #
 # It agrees with 1772 + 6. As above, the agreement is the check and not the derivation.
-TL_TEST_COUNT_MINIMUM=1778
+#
+# Re-measured 2026-08-18 on `fix/conversation-etag-341`, rebased on `develop` at 3478dee (which
+# carries the branch measured directly above): **1779**, source declaring 1773, zero skip lines,
+# 66 `test result` lines. The branch adds one test and both halves moved by one. The +6 doctest
+# offset holds for the twelfth consecutive measurement.
+#
+# Same method and same reason as the entry above — `--no-fail-fast` at `RUST_TEST_THREADS=4`,
+# because the two `tests/execution_lifecycle.rs` deadline assertions tracked by #369 are still
+# red under this machine's load and still green at `--test-threads=1`. 1776 passed + 3 failed,
+# of which the third was NOT flaky: `conversation_list_pages_through_by_updated_at_with_id_tiebreaker`
+# genuinely broke on this branch and was fixed in the same commit, so it is green in the total.
+TL_TEST_COUNT_MINIMUM=1779
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

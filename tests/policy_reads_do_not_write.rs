@@ -58,8 +58,12 @@ mod support;
 
 use std::sync::Arc;
 
+use moira::domain::{
+    ContentWrite, ConversationCreateRequest, ConversationMessageRole, ConversationMessageType,
+};
 use moira::infra::repositories::{
-    ConversationRepository, PgConversationRepository, PgPublicRepository, PublicRepository,
+    ConversationInsert, ConversationMessageInsert, ConversationRepository,
+    PgConversationRepository, PgPublicRepository, PublicRepository,
 };
 use serde_json::json;
 use sqlx::{PgPool, Row, postgres::PgListener};
@@ -486,5 +490,148 @@ async fn concurrent_first_touches_all_succeed() {
             1,
             "{RACERS} concurrent first touches of {table} left more or fewer than one row"
         );
+    }
+}
+
+/// #341 — a persisted turn must not advance the conversation's ETag.
+///
+/// This sits in this file rather than beside the conversation tests because it is the same
+/// property, observed the same way: the module docs above already name `version` as "the `ETag`
+/// served by `GET …/policy` and demanded back on `If-Match`, bumped by the `<table>_bump_version`
+/// trigger". F47 was a *read* that wrote. This is a write that wrote **more than it meant to**,
+/// and the consequence is the sharper one — a caller holding an `If-Match` got a 412 in the
+/// middle of a conversation because ordinary traffic, not a competing writer, had moved the
+/// precondition underneath it.
+///
+/// # It drives the real `add_message`, not a re-typed `update`
+///
+/// The counter statement could be copied here from
+/// `src/infra/repositories/conversation.rs:1239-1249` and asserted against directly. That test
+/// would pass forever, including on the day `add_message` grows a write to `title` or `status` —
+/// it would be asserting the SQL this test file contains rather than the SQL the repository
+/// runs. So the turn is persisted through the repository, both halves of it, exactly as a real
+/// turn is.
+///
+/// # The control is the whole test
+///
+/// "The version did not change" is satisfied just as well by a trigger that has been dropped
+/// altogether, which would be a strictly worse bug than #341 and would leave this green. The
+/// title update at the end is what separates "counters are excluded" from "nothing bumps
+/// anymore", and it runs on the same row, in the same test, after the assertion it protects.
+#[tokio::test]
+async fn a_persisted_turn_does_not_advance_the_conversation_etag() {
+    let Some(db) = database(5).await else {
+        return;
+    };
+    let pool = db.pool.clone();
+    let application_id = seed_application(&pool).await;
+
+    let conversation_id = Uuid::now_v7();
+    let public_id = format!("conv_{conversation_id}");
+    let repo = PgConversationRepository::new(pool.clone(), None);
+    let request = ConversationCreateRequest {
+        title: Some("341".to_string()),
+        metadata: json!({}),
+    };
+    repo.create_conversation(&ConversationInsert {
+        id: conversation_id,
+        public_id: &public_id,
+        application_id,
+        external_tenant_id: None,
+        external_user_id: None,
+        request: &request,
+        retention_days: 0,
+    })
+    .await
+    .expect("create the conversation");
+
+    let before = conversation_signature(&pool, conversation_id).await;
+
+    // One turn: the caller's message and the assistant's reply. Two `add_message` calls, which
+    // before #341 was two ETag bumps rather than zero.
+    for (index, role) in [
+        ConversationMessageRole::User,
+        ConversationMessageRole::Assistant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = format!("turn body {index}");
+        repo.add_message(&ConversationMessageInsert {
+            conversation_public_id: public_id.clone(),
+            response_id: None,
+            execution_id: None,
+            role,
+            message_type: ConversationMessageType::Input,
+            content: ContentWrite::Plain(body.clone()),
+            content_hash: format!("test:341:{index}"),
+            content_size_bytes: body.len() as i64,
+            token_count: Some(1),
+            metadata: json!({}),
+        })
+        .await
+        .expect("persist the message");
+    }
+
+    let counted: i64 = sqlx::query_scalar("select message_count from conversations where id = $1")
+        .bind(conversation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read message_count");
+    assert_eq!(
+        counted, 2,
+        "the turn did not actually persist, so the assertions below would prove nothing"
+    );
+
+    let after = conversation_signature(&pool, conversation_id).await;
+    assert_eq!(
+        after.version, before.version,
+        "a persisted turn advanced the conversation ETag from {} to {}. Any caller holding an \
+         If-Match now gets a 412 it did not earn — the precondition was invalidated by traffic, \
+         not by a competing writer",
+        before.version, after.version
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "`updated_at` moved with the counters. It is carried by two indexes on this table, so \
+         besides feeding the ETag it makes every counter update non-HOT"
+    );
+
+    // The control. Without it, deleting `conversations_bump_version` outright would pass
+    // everything above.
+    sqlx::query("update conversations set title = $2 where id = $1")
+        .bind(conversation_id)
+        .bind("341 renamed")
+        .execute(&pool)
+        .await
+        .expect("rename the conversation");
+
+    let renamed = conversation_signature(&pool, conversation_id).await;
+    assert!(
+        renamed.version > after.version,
+        "editing the title did not advance the ETag, so the trigger is not merely ignoring \
+         counters — it is not firing at all, which is a worse bug than the one under test"
+    );
+}
+
+/// The `version`/`updated_at` pair for one conversation, keyed by `id`.
+///
+/// [`signature`] above cannot serve here: it keys on `application_id`, which is correct for the
+/// policy tables — one row per application — and wrong for conversations, where an application
+/// has many.
+async fn conversation_signature(pool: &PgPool, conversation_id: Uuid) -> RowSignature {
+    let row = sqlx::query(
+        "select xmin::text as xmin, version, updated_at::text as updated_at \
+         from conversations where id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await
+    .expect("read the conversation row signature")
+    .expect("the conversation row exists");
+    RowSignature {
+        xmin: row.get("xmin"),
+        version: row.get("version"),
+        updated_at: row.get("updated_at"),
     }
 }
