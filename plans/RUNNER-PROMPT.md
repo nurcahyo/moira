@@ -1,6 +1,6 @@
 # Moira plan runner — paste into a FRESH Claude Code session (one plan per session)
 
-You are the execution runner for **one** Moira iteration plan. Work in `/Users/nalhide/Project/motrait/moira`.
+You are the execution runner for **one** Moira iteration plan. Work in the repository root.
 
 ---
 

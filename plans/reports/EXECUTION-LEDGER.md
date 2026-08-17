@@ -4453,7 +4453,7 @@ to the remedy as written above, all found while taking it:
 ### F56 — a reasoning model's chain-of-thought is stored as the conversation summary
 
 **Measured against a real provider, not inferred.** The user's vLLM moved to
-`https://local-llm.motrait.com` (`Qwen/Qwen3-4B`, OpenAI-compatible, no key) on 2026-08-04, which
+a self-hosted vLLM endpoint (`Qwen/Qwen3-4B`, OpenAI-compatible, no key) on 2026-08-04, which
 made this testable for the first time. Every number below came off that wire.
 
 Moira's **actual** summarization call — `SUMMARIZATION_INSTRUCTION`, the real transcript shape, **no

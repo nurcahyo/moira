@@ -8,7 +8,7 @@ This document responds to "Moira Engineering Specification Part 2" and intention
 
 ### 1.1 Existing workspace structure
 
-Moira is currently a single Rust crate under `/Users/nalhide/Project/motrait/moira`.
+Moira is currently a single Rust crate at the repository root.
 
 ```text
 src/
