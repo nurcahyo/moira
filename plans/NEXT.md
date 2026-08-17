@@ -52,15 +52,25 @@ directions. **Update it when you claim or release work**, in the same commit as 
 
 | Claimed by | State | Issue | Files it owns |
 |---|---|---|---|
-| unknown | **in flight, uncommitted** | #236 flaky key-open test | main tree, branch `fix/flaky-key-open-236`; `src/security/data_keys.rs` held ~146 uncommitted lines on 2026-08-17 |
+| — | no active claims as of 2026-08-17 | — | — |
 
-**Released since the last revision of this table.** Both entries that stood here are done, and the
+**Released since the last revision of this table.** Every entry that stood here is done, and the
 blocks they imposed elsewhere in this file are lifted:
 
 - **#252 Rig tool loop — CLOSED**, merged as `253b783` (PR #265). Every "do not start while #252 is
   open" warning below is void.
 - **#253 OpenAPI spec import — PR #303 MERGED.** The umbrella issue stays open for its remaining
   findings, but no branch is claiming those files.
+- **#236 flaky key-open test — CLOSED**, merged as `d055cea` (PR #315).
+
+**A caution about this table, learned by getting it wrong.** The previous revision recorded #236 as
+in flight with ~146 uncommitted lines in the main tree. That was true when the tree was looked at
+and false by the time it was written down: the author had already committed the work, merged it,
+and deleted the branch. A snapshot of `git status` is evidence about one instant, and this table
+outlives the instant. **Confirm a claim against the issue and the PR** — `gh issue view`,
+`gh pr list --state merged` — before recording it here. Working-tree state alone will mislead you,
+and a false claim in this table is worse than no claim, because it makes the next agent avoid work
+that is free.
 
 **Someone works in the main tree** at the repository root, and has held unpushed commits there.
 Do not `git checkout`, `git switch`, `git stash` or `git add -A` in the main tree while that is
@@ -117,17 +127,15 @@ Touches `src/config/settings.rs` (overlaps #251), plus `src/orchestration/runtim
 `src/domain/{admin,runners}.rs`, `src/i18n/catalog/errors.rs`. **Unblocked** — the #252 hold that
 stood here is lifted.
 
-### 4.3 Flaky test — #236
+### 4.3 Flaky test — #236 — **DONE**
 
-`a_hundred_concurrent_unknown_key_opens_cost_exactly_one_database_load` reds `rust-shard (2)` on
-unrelated commits. A flaky test in a required check trains everyone to re-run CI without reading
-it, which is how a real failure gets merged.
+Closed. Fixed in `d055cea` (PR #315): the single-flight test now asserts the invariant rather than
+one particular interleaving, which is why it stopped reddening `rust-shard (2)` on unrelated
+commits.
 
-Touches `src/domain/message.rs` and `src/security/data_keys.rs`.
-
-**Claimed, and being worked right now.** On 2026-08-17 the main tree sat on `fix/flaky-key-open-236`
-with ~146 uncommitted lines in `src/security/data_keys.rs`. This is no longer a free task — take
-something else, and leave that tree alone.
+Kept here rather than deleted because the shape recurs: a test that pins an interleaving instead of
+the property it is trying to prove will go flaky, and a flaky test in a required check trains
+everyone to re-run CI without reading it — which is how a real failure gets merged.
 
 ### 4.4 Held on a human decision — do not start these
 
