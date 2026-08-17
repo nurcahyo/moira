@@ -378,3 +378,37 @@ Scoped to the diff on purpose, and deliberately not a CI gate. See [docs/mutatio
 See [docs/conversations.md](docs/conversations.md), [docs/conversation-api.md](docs/conversation-api.md), [docs/conversation-persistence.md](docs/conversation-persistence.md), [docs/context-planning.md](docs/context-planning.md), [docs/conversation-summarization.md](docs/conversation-summarization.md), [docs/memory-architecture.md](docs/memory-architecture.md), [docs/memory-policy.md](docs/memory-policy.md), [docs/memory-consent.md](docs/memory-consent.md), [docs/memory-extraction.md](docs/memory-extraction.md), [docs/memory-retrieval.md](docs/memory-retrieval.md), [docs/memory-correction-and-deletion.md](docs/memory-correction-and-deletion.md), [docs/rag-architecture.md](docs/rag-architecture.md), [docs/rag-collections.md](docs/rag-collections.md), [docs/document-ingestion.md](docs/document-ingestion.md), [docs/document-chunking.md](docs/document-chunking.md), [docs/embeddings.md](docs/embeddings.md), [docs/pgvector.md](docs/pgvector.md), [docs/retrieval-ranking.md](docs/retrieval-ranking.md), [docs/retrieval-citations.md](docs/retrieval-citations.md), [docs/rag-security.md](docs/rag-security.md), [docs/conversation-memory-rag-api.md](docs/conversation-memory-rag-api.md), [docs/data-retention-and-deletion.md](docs/data-retention-and-deletion.md), [docs/public-api.md](docs/public-api.md), [docs/responses-api.md](docs/responses-api.md), [docs/streaming-api.md](docs/streaming-api.md), [docs/public-authentication.md](docs/public-authentication.md), [docs/public-authorization.md](docs/public-authorization.md), [docs/idempotency.md](docs/idempotency.md), [docs/response-persistence.md](docs/response-persistence.md), [docs/execution-and-usage-api.md](docs/execution-and-usage-api.md), [docs/model-and-route-discovery.md](docs/model-and-route-discovery.md), [docs/openai-compatibility.md](docs/openai-compatibility.md), [docs/admin-api.md](docs/admin-api.md), [docs/application-management.md](docs/application-management.md), [docs/provider-management.md](docs/provider-management.md), [docs/provider-deepseek-catalog.md](docs/provider-deepseek-catalog.md), [docs/provider-credential-management.md](docs/provider-credential-management.md), [docs/jwt-issuer-management.md](docs/jwt-issuer-management.md), [docs/admin-identity-claiming.md](docs/admin-identity-claiming.md), [docs/admin-invitations.md](docs/admin-invitations.md), [docs/system-and-consumer-keys.md](docs/system-and-consumer-keys.md), [docs/audit-api.md](docs/audit-api.md), [docs/runtime-architecture.md](docs/runtime-architecture.md), [docs/rig-integration.md](docs/rig-integration.md), [docs/task-routing.md](docs/task-routing.md), [docs/model-routing.md](docs/model-routing.md), [docs/credential-resolution-runtime.md](docs/credential-resolution-runtime.md), [docs/provider-runtime-factory.md](docs/provider-runtime-factory.md), [docs/provider-pools.md](docs/provider-pools.md), [docs/concurrency-and-backpressure.md](docs/concurrency-and-backpressure.md), [docs/retry-and-fallback.md](docs/retry-and-fallback.md), [docs/circuit-breakers.md](docs/circuit-breakers.md), [docs/runtime-events.md](docs/runtime-events.md), [docs/execution-attempts-and-usage.md](docs/execution-attempts-and-usage.md), [docs/runtime-diagnostics.md](docs/runtime-diagnostics.md), [docs/runtime-cache-invalidation.md](docs/runtime-cache-invalidation.md), [docs/deployment.md](docs/deployment.md), [docs/kubernetes.md](docs/kubernetes.md), [docs/claude-runners.md](docs/claude-runners.md), [docs/moira-runner.md](docs/moira-runner.md), [docs/claude-subscription-sidecar.md](docs/claude-subscription-sidecar.md), [docs/claude-subscription-boundary.md](docs/claude-subscription-boundary.md), [docs/console-multi-provider-rollout.md](docs/console-multi-provider-rollout.md), [docs/redis.md](docs/redis.md), [docs/otel.md](docs/otel.md), [docs/prometheus.md](docs/prometheus.md), [docs/grafana.md](docs/grafana.md), [docs/production-checklist.md](docs/production-checklist.md), [docs/security.md](docs/security.md), [docs/decision-encryption-at-rest.md](docs/decision-encryption-at-rest.md), [docs/disaster-recovery.md](docs/disaster-recovery.md), [docs/scaling.md](docs/scaling.md), [docs/load-testing.md](docs/load-testing.md), [docs/chaos-testing.md](docs/chaos-testing.md), [docs/enterprise-operations.md](docs/enterprise-operations.md), [docs/todo.md](docs/todo.md), and [docs/openapi.md](docs/openapi.md). See [docs/project-structure.md](docs/project-structure.md) for module boundaries and agent guidance.
 
 For the response localization contract, see [docs/i18n-response-contract.md](docs/i18n-response-contract.md) and the runtime registry at [src/i18n/catalog/](src/i18n/catalog/). The directory index lives in [src/i18n/catalog/mod.rs](src/i18n/catalog/mod.rs), with error translations in [src/i18n/catalog/errors.rs](src/i18n/catalog/errors.rs) and notice translations in [src/i18n/catalog/notices.rs](src/i18n/catalog/notices.rs). The docs copy lives at [docs/i18n-response-catalog.json](docs/i18n-response-catalog.json).
+
+## Licence
+
+Moira is licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+You may run it, modify it, fork it, host it, and build commercial products on it. The licence
+includes an express patent grant and a patent-retaliation clause, which is the practical reason
+it is preferred over MIT for a project anyone might deploy in production.
+
+Adopted 2026-08-17. Before that date the repository carried no licence, which under the Berne
+Convention meant all rights reserved: the code was public, and nobody had the right to use it.
+If you took a copy before that date, this licence now covers it.
+
+**The name is not part of the grant.** Apache-2.0 §6 excludes trade names and trademarks, and
+[TRADEMARK.md](TRADEMARK.md) sets out what that means: fork freely, name your fork something
+else. Nothing there restricts use of the software, including hosting it commercially.
+
+**Contributing** requires a one-time [CLA](CLA.md), which preserves the ability to relicense.
+It is not a copyright assignment — you keep your copyright. The reasoning, and the honest
+objection to it, are both in that file.
+
+Dependencies are permissive throughout — `deny.toml` allows no copyleft licence, and adding a
+dependency under one fails the supply-chain gate deliberately, so that it becomes a decision
+rather than an accident.
+
+**Everything in this repository is Apache-2.0.** There is no dual licence, no `ee/` directory, and
+no source-available tier here. Any commercial component will live in a separate repository under
+its own terms rather than as a differently-licensed corner of this one — at one-maintainer scale a
+mixed-licence monorepo costs more to police than it returns, and it invites contributors to patch
+files they may not modify.
+
+`NOTICE` is deliberately short. Apache-2.0 §4(d) only obliges downstream redistributors to carry a
+NOTICE file **if one exists**, so every line added to it becomes an obligation imposed on everyone
+who redistributes. It carries the copyright line and the trademark reservation, and nothing else.

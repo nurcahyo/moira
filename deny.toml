@@ -142,17 +142,21 @@ confidence-threshold = 1.0
 exceptions = []
 
 [licenses.private]
-# `moira` itself declares no `license` field (it is a deployed service, not a published
-# crate), which cargo-deny reports as `error[unlicensed]: moira = 0.1.0 is unlicensed`.
-# This setting suppresses that for workspace members marked `publish = false`.
+# **This setting is no longer load-bearing, and the reasoning it carried has expired.**
 #
-# `ignore = true` only suppresses the error for workspace members actually marked
-# unpublishable, so this setting is load-bearing together with `publish = false` in
-# `Cargo.toml`. That line has landed. Removing either one turns this gate red again with:
-#     error[unlicensed]: moira = 0.1.0 is unlicensed
-#     advisories ok, bans ok, licenses FAILED, sources ok   (exit 4)
-# This pairing is deliberately preferred over asserting a license Moira does not have via a
-# `[[licenses.clarify]]` entry.
+# It was added when `moira` declared no `license` field, which cargo-deny reports as
+# `error[unlicensed]: moira = 0.1.0 is unlicensed`. The comment here used to say the
+# suppression was "deliberately preferred over asserting a license Moira does not have" —
+# which was correct, and stopped being correct on 2026-08-17 when the crate adopted
+# Apache-2.0. It has a licence now, and `Cargo.toml` declares it.
+#
+# Kept rather than deleted for one reason: `publish = false` is still correct (Moira is a
+# deployed service, not a published crate), and this setting is the documented pairing for
+# it. Removing it now would be a no-op while the `license` field stands, and a silent
+# regression the day anyone removes that field.
+#
+# So: this is belt-and-braces, not the thing holding the gate. `Apache-2.0` is in the
+# allow-list above, so the crate's own licence passes on its merits.
 ignore = true
 registries = []
 
