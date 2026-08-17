@@ -8,7 +8,19 @@ session state, context assembly, and prompt caching. This document is the record
 It is not a proposal and it is not awaiting sign-off.
 
 **Scope:** how an end-user identity reaches Moira, how the caller attaches a conversation, what
-Moira persists of that conversation, and how the three commerce-os surfaces are separated.
+Moira persists of that conversation, and how a caller's distinct surfaces are separated into
+independent applications.
+
+**commerce-os is the worked example, not the design constraint.** This document names it throughout
+because it is the first caller, but every mechanism specified here — a JWKS-published `ES256`
+assertion carrying `aud = moira:<surface>`, a pairwise pseudonymous subject, one application per
+surface — assumes nothing about who the caller is. Any consumer that can publish a JWKS satisfies
+it. Read the commerce-os references as an instance, and do not bend a second integration to match
+its incidental choices.
+
+> This notice sits here, above §1, on purpose. An earlier revision placed it inside §2, where a
+> reader arriving at §4 or §5 through a cross-reference — which is how a contract drafter arrives —
+> never saw it.
 
 **Supersedes nothing.** Retires one standing assumption: that Moira would eventually become the
 system of record for conversation content. It will not. See §4.
@@ -30,19 +42,15 @@ earlier one being settled. The order is preserved here.
 
 ## 2. Decision 1 — end-user identity arrives as a short-lived asymmetric assertion
 
-**Decided:** commerce-os publishes a JWKS. Moira does **not** accept HS256 and does not hold any
-commerce-os secret.
+**Decided:** end-user identity arrives as an assertion signed by a trusted issuer that publishes a
+JWKS. **Moira does not accept HS256 and holds no issuer secret** — that is a property owed to every
+issuer, not a term negotiated with one. commerce-os, the first such issuer, has committed to
+publishing one.
 
 The reasoning is a security boundary, not a preference: a verifier that also holds the signing
 secret can mint the tokens it verifies. That collapses the distinction between "Moira checked this
 claim" and "Moira could have written this claim", and it is the distinction the whole per-user
 isolation story rests on.
-
-**commerce-os is the worked example, not the design constraint.** This document names it throughout
-because it is the first caller, but the mechanism specified here — a JWKS-published `ES256`
-assertion carrying `aud = moira:<surface>` and a pairwise pseudonymous subject — assumes nothing
-about who the caller is. Any consumer that can publish a JWKS satisfies it. Read the commerce-os
-references as an instance, and do not bend a second integration to match its incidental choices.
 
 ### Shape
 
@@ -69,9 +77,10 @@ repositories agree on before either writes code, so it has to be right on paper:
   likewise required. Listing it among the claims invites a minter to put it in the payload, where
   Moira will not look for it.
 
-This is a **separate assertion minted for Moira**, not commerce-os's own session JWT. commerce-os
-keeps HS256 internally; nothing about its existing session handling changes. The assertion is
-minted per request path, for Moira, and is useless anywhere else.
+This is a **separate assertion minted for Moira**, not the caller's own session token. It is minted
+per request path, for Moira, and is useless anywhere else — so the HS256 refusal above constrains
+what Moira accepts, not what the caller uses internally. Concretely: commerce-os keeps HS256 for its
+own sessions, and nothing about its existing session handling changes.
 
 The subject is a **pairwise pseudonym**: Moira gets stable per-user isolation and per-user quota
 without ever learning who the person is. Moira cannot reverse it, and cannot correlate the same
@@ -114,19 +123,23 @@ doing it.
 
 ### 2.3 Consequence: per-user quota is per-surface, not per-person
 
-Three applications with three salts means one human holds three unrelated pseudonyms. That is the
-unlinkability the pairwise scheme is chosen for, and it is also the reason a single person can draw
-three separate quotas by using all three surfaces. This is accepted as a deliberate trade, recorded
-here so that a future "the limiter is broken" report can be answered without re-deriving it.
+One application per surface, each with its own salt, means one human holds as many unrelated
+pseudonyms as there are surfaces. That is the unlinkability the pairwise scheme is chosen for, and
+it is also the reason a single person can draw a separate per-user quota on each surface. This is
+accepted as a deliberate trade, recorded here so that a future "the limiter is broken" report can be
+answered without re-deriving it.
 
 ---
 
-## 3. Decision 2 — the caller attaches a conversation; commerce-os stays the system of record
+## 3. Decision 2 — the caller attaches a conversation; the caller stays the system of record
 
-**Decided:** commerce-os attaches a real `conversation` object. The system of record stays in
-commerce-os (`chat_messages`, in the tenant schema). The identifier Moira receives is an **opaque
-UUID**, stable across turns, carrying no PII and no tenant slug — the same rule commerce-os already
-applies to references handed to logistics providers.
+**Decided:** the caller attaches a real `conversation` object and remains the system of record for
+the transcript. The identifier Moira receives is an **opaque UUID**, stable across turns, carrying
+no PII and no tenant slug — the standard rule for an identifier handed across a trust boundary to a
+third-party processor.
+
+For the first integration that means commerce-os attaches the object and keeps the transcript in
+`chat_messages`, in the tenant schema.
 
 ### 3.1 The contract must not be widened
 
@@ -141,7 +154,8 @@ The `deny_unknown_fields` attribute enforces this at the wire today. Do not remo
 
 ## 4. Decision 3 — `metadata_only`: Moira stores no conversation content
 
-**Decided:** `conversation_content_persistence = metadata_only` for all three commerce-os
+**Decided:** `conversation_content_persistence = metadata_only` for every application provisioned
+under this integration, and — per #336 — as the shipped default for all newly provisioned
 applications.
 
 **Moira is not a processor for the *storage* of conversation content. It remains a processor for
@@ -156,10 +170,14 @@ of what that decision achieves is corrected.
 
 UU PDP No. 27/2022 Art. 16(1) enumerates processing as *pemerolehan dan pengumpulan*, *pengolahan
 dan penganalisisan*, *penyimpanan*, and onward. **Storage is one activity among several, not the
-definition.** And §4.1 states the premise that defeats the wider claim: commerce-os sends the full
-conversation history on every turn. Moira receives it, budgets and assembles it through
+definition.** And §4.1 states the premise that defeats the wider claim: the caller sends the full
+conversation history on every turn — which the first integration does, so this is not a
+hypothetical. Moira receives it, budgets and assembles it through
 `src/application/context_planner.rs`, and transmits it to a provider. Declining to persist removes
 one activity; it does not exit processor status.
+
+The generic form is the stronger one: Moira transmits whatever *any* caller sends it, so the
+argument holds for every integration rather than for one.
 
 **Why this correction is not cosmetic.** §4 exists precisely to settle the processor question, so
 it is the sentence most likely to be lifted verbatim into a tenant agreement. A contract drafted on
@@ -169,12 +187,18 @@ providers Moira routes to — on the belief that none were owed. **The obligatio
 therefore a floor, not the whole set**; what else is owed is a question for counsel, raised as a
 separate issue rather than answered here.
 
-### 4.1 Why this costs nothing
+### 4.1 Why this costs nothing — for a caller that replays its own history
 
-Because commerce-os is the system of record, it sends the full history each turn. Moira was
-therefore never going to use server-side history replay. What `metadata_only` gives up —
-history replay, summarisation, cross-conversation memory extraction — is precisely the set of
-features that decision 2 already declined.
+Because the caller is the system of record, it sends the full history each turn, and Moira was
+therefore never going to use server-side history replay for this integration. What `metadata_only`
+gives up — history replay, summarisation, cross-conversation memory extraction — is precisely the
+set of features that decision 2 already declined.
+
+**State the condition, because it is what makes the trade free.** `metadata_only` costs nothing
+**for a caller that retains its own transcript and replays it every turn**. A caller that expects
+Moira to hold the history loses exactly those three features and must select a different
+persistence value. An earlier revision presented this caller-conditional trade as an unconditional
+one, which is false for any integration built the other way round.
 
 What it keeps is the part that matters:
 
@@ -234,21 +258,24 @@ than for this document, and it is raised as its own issue in §9.
 
 ---
 
-## 5. Decision 4 — three separate Moira applications
+## 5. Decision 4 — one application per surface
 
-**Decided:** three applications, three consumer keys, three policy rows, three retention clocks.
-Zero Moira change required.
+**Decided:** surfaces with materially different risk profiles get separate applications — separate
+consumer keys, policy rows and retention clocks. Zero Moira change required.
 
-The three surfaces have materially different risk profiles — the platform assistant touches
-cross-tenant data, the seller chat is single-tenant, the content service is close to zero risk —
-and **one leaked key must not bring down all three**. The pairwise salt differs per application,
-so the separation is an isolation boundary rather than a labelling convention.
+A cross-tenant surface, a single-tenant surface, and a near-zero-risk surface each carry different
+exposure, and **one leaked consumer key must not bring down the others**. The pairwise salt differs
+per application, so the separation is an isolation boundary rather than a labelling convention.
+
+For the first integration this yields three applications — a platform assistant that touches
+cross-tenant data, a single-tenant seller chat, and a near-zero-risk content service. **The count is
+a property of the caller's surface inventory, not of Moira.**
 
 **Deferred, not rejected:** consolidating onto one application with a `policy_key` discriminator.
 That would require relaxing `application_conversation_policies`'s primary key from `application_id`
 to `(application_id, policy_key)` and populating the already-present, currently-unreferenced
 `conversations.conversation_policy_id` foreign key. The named trigger for revisiting it is **budget
-pooling across surfaces**. Until then, three applications is both cheaper and safer.
+pooling across surfaces**. Until then, one application per surface is both cheaper and safer.
 
 ---
 
@@ -280,7 +307,7 @@ caching on", and that cannot be answered retroactively from data nobody wrote do
   rate; see §9. Nothing here authorises turning it on — §5A removes a contractual blocker, not the
   measurement ones.
 - The consolidation in §5, pending the named trigger.
-- Anything about the logistics surface, which has no code in any repository today.
+- Any surface beyond those enumerated above, including ones a caller has scoped but not yet built.
 
 ---
 
@@ -318,8 +345,10 @@ assumed. Where the original specification and the code disagreed, the code won a
 
 Each becomes its own ticket. None is started by this document.
 
-1. Register commerce-os as a trusted JWT issuer for three applications — `ES256`, JWKS URL,
-   `aud = moira:<surface>` per application, explicit `clock_skew_seconds`.
+1. Register commerce-os as a trusted JWT issuer for its three surfaces — `ES256`, JWKS URL,
+   `aud = moira:<surface>` per application, explicit `clock_skew_seconds`. The §2 Shape table is
+   Moira's general trusted-issuer contract, not a commerce-os-specific one; any issuer registered
+   later must satisfy the same table.
 2. Measure JWKS cache/refresh behaviour under overlapping rotation, and document the minimum
    overlap window. Blocks the first rotation. (§7)
 3. Enforce the conversation-id contract in Moira rather than trusting the caller: validate that

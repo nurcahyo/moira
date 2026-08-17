@@ -181,7 +181,7 @@ tier bound have to land in the first version, not a later migration.
 
 | Issue | | Note |
 |---|---|---|
-| #322 | Register commerce-os as a trusted JWT issuer | Blocked on commerce-os publishing a JWKS. Also closes #283. |
+| #322 | Register the first trusted JWT issuer | The requirement is generic — see the ADR §2 Shape table, which every later issuer must also satisfy. **Blocked externally:** waiting on commerce-os to publish its JWKS. Also closes #283. |
 | #323 | Measure JWKS cache behaviour under overlapping rotation | Pure investigation, no dependencies. **Blocks the first key rotation** — measure before, not during. |
 | #324 | Enforce the conversation-id contract | `title` and `metadata` are the only remaining path by which personal data reaches Moira, and nothing enforces the caller-side rule today. |
 | #325 | Propagate erasure to embeddings | Embeddings are unsealed under **every** persistence policy value. |
