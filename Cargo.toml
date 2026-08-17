@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 # Moira is a deployed service, not a library, so it must never be `cargo publish`-able.
-# This also satisfies `[licenses.private] ignore = true` in `deny.toml`: that setting only
-# suppresses `error[unlicensed]` for workspace members actually marked unpublishable, so
-# without this line `cargo deny check` fails on a crate that has no `license` field by design.
 publish = false
+# Apache-2.0 as of 2026-08-17 — see LICENSE, NOTICE, and TRADEMARK.md. Before that date the
+# repository carried no licence at all, which under Berne meant all rights reserved: it was
+# public but nobody had the right to run it. The field is declared here as well as in LICENSE
+# so `cargo deny check` reads it from metadata rather than relying on
+# `[licenses.private] ignore = true`, which only ever suppressed `error[unlicensed]` for
+# unpublishable members and was never a statement about what the licence actually was.
+license = "Apache-2.0"
 # Since `src/bin/moira-runner.rs` landed (#284) this crate has two binaries, and a bare
 # `cargo run` cannot guess between them — it exits 101 with "could not determine which binary
 # to run". That broke every documented call site at once: `make migrate`, `make run`,
