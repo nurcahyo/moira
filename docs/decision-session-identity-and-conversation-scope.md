@@ -173,8 +173,8 @@ position to make, and no amount of narrowing fixes it.
 What this document owes its reader instead is **facts about behaviour**, precise enough that an
 operator can assess their own position:
 
-> Under `metadata_only`, Moira **stores** no conversation content. It still **receives** the full
-> history on every turn, **assembles** it through `src/application/context_planner.rs`, and
+> Under `metadata_only`, Moira **stores** no conversation content. It still **receives** whatever
+> history the caller sends, **assembles** it through `src/application/context_planner.rs`, and
 > **transmits** it to a third-party provider.
 
 That distinction is the one that matters, and it is the one the withdrawn claim obscured: declining
@@ -187,10 +187,10 @@ The consequence for the first integration is recorded on that side, not here: se
 
 ### 4.1 Why this costs nothing — for a caller that replays its own history
 
-Because the caller is the system of record, it sends the full history each turn, and Moira was
-therefore never going to use server-side history replay for this integration. What `metadata_only`
-gives up — history replay, summarisation, cross-conversation memory extraction — is precisely the
-set of features that decision 2 already declined.
+Because the caller is the system of record, it replays history itself, and Moira was therefore never
+going to use server-side history replay for this integration. What `metadata_only` gives up —
+history replay, summarisation, cross-conversation memory extraction — is precisely the set of
+features that decision 2 already declined.
 
 **State the condition, because it is what makes the trade free.** `metadata_only` costs nothing
 **for a caller that retains its own transcript and replays it every turn**. A caller that expects
@@ -198,15 +198,68 @@ Moira to hold the history loses exactly those three features and must select a d
 persistence value. An earlier revision presented this caller-conditional trade as an unconditional
 one, which is false for any integration built the other way round.
 
-What it keeps is the part that matters:
+### 4.1a Two premises this section previously asserted, both false — corrected 2026-08-17
 
-**Prompt caching is a wire concern, not a storage concern.** `cache_control` breakpoints are placed
-on the outbound provider request. A caller that sends full append-only history each turn can be
-given a pinned prefix breakpoint and a rolling tail breakpoint without Moira persisting a single
-byte. The measured ~87% saving on a long conversation survives `metadata_only` intact.
+Three independent reviews checked the first integration against the code and found this section had
+been written from an assumption about it rather than an observation of it. Both corrections are
+recorded rather than quietly patched, because each was load-bearing somewhere.
 
-Also retained: per-conversation usage attribution, per-conversation rate limiting, cache shard
-affinity, and a stable correlation id across turns.
+**Premise 1 — "the caller sends full history each turn" — false.** It sends a fixed sliding window
+of ten messages (`commerce-os backend/internal/chat/service.go:15`, `const aiHistoryWindow = 10`,
+applied in SQL). The outbound token count per turn is therefore **constant, not growing**. §4.0's
+earlier phrasing — "which the first integration does, so this is not a hypothetical" — asserted the
+opposite while the legal argument leaned on it.
+
+**Premise 2 — "Moira runs `metadata_only` for this integration" — true by accident, not by policy.**
+That caller sends no `conversation` object at all, so `prepare_response_conversation` returns
+`Ok(None)` on its first line (`src/application/conversation.rs:654-656`) and **no conversation row
+is ever written.** Moira stores nothing here *structurally*. The policy governs zero rows.
+
+That second one cuts both ways and both directions matter:
+
+- The status quo is **stronger** than a policy setting — nothing is stored because nothing is
+  reachable, not because a value was chosen well.
+- The status quo is also **one provisioning step from its opposite.** The schema default is
+  `plain_content` (`migrations/0007:5`) and a *missing* policy row coalesces to the same
+  (`src/infra/repositories/conversation.rs:1123-1126`). The day any caller attaches a `conversation`
+  object to an application with no policy row, Moira stores full plaintext. #336 remains open.
+
+### 4.1b The prompt-caching justification, withdrawn
+
+An earlier revision claimed: *"A caller that sends full append-only history each turn can be given a
+pinned prefix breakpoint and a rolling tail breakpoint without Moira persisting a single byte. The
+measured ~87% saving on a long conversation survives `metadata_only` intact."*
+
+**Withdrawn on three counts.**
+
+1. **Its condition is false.** A sliding window is not append-only. Turn *N* sends `[k…k+9]`; turn
+   *N+1* sends `[k+2…k+11]`. The first element differs, so the byte sequence differs from offset
+   zero — and prefix caching requires a common prefix from the start. Past turn ten the hit rate is
+   **zero, permanently**.
+2. **"Measured" was unsupported.** The figure appears once in this repository, in that sentence,
+   and it is the only claim in this document **absent from §8's verification record** while every
+   other claim carries a `file:line`.
+3. **The same document says the measurement is impossible.** §9 item 7: without
+   `cache_creation_input_tokens` mapped through, "a 0.1x read and a 1.25x write are
+   indistinguishable in the usage record, and the caching question stays unanswerable." Prompt
+   caching is also unimplemented — `cache_control` appears nowhere in `src/`.
+
+What survives is the narrower true statement: **prompt caching is a wire concern rather than a
+storage one**, so *if* it is implemented, whether Moira holds the history is not what decides
+whether it can be used. The append-only discipline in §2.2 is what decides that, and it is the
+caller's to keep.
+
+Also retained under `metadata_only`: per-conversation usage attribution, per-conversation rate
+limiting, cache shard affinity, and a stable correlation id across turns.
+
+### 4.1c Storing history in Moira would not reduce provider tokens — it would risk doubling them
+
+Recorded because it is the first thing anyone proposing the reversal in §10 will assume.
+
+`apply_planned_context` **prepends** the planned context and never replaces the caller's messages
+(`src/application/public.rs:2077-2079`). So a caller that keeps resending its window while Moira
+also replays its stored copy sends the provider **both**. The saving requires the *caller* to stop
+sending history — a client change — and is not obtained by Moira storing it.
 
 ### 4.2 Three exemptions that must not be misread as content storage — but must be stated
 
