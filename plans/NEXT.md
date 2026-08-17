@@ -137,16 +137,31 @@ Kept here rather than deleted because the shape recurs: a test that pins an inte
 the property it is trying to prove will go flaky, and a flaky test in a required check trains
 everyone to re-run CI without reading it — which is how a real failure gets merged.
 
-### 4.4 Held on a human decision — do not start these
+### 4.4 Held on something other than code
 
-- **#71** — the `/setup` wizard branch. The harness blocked autonomous merge three times. Surface
-  it; do not retry.
-- **#91, #78** — labelled `[decision]`. They need a product answer, not an implementation.
+**Nothing here is waiting on a product decision any more.** Audited on 2026-08-17; every entry that
+stood here was either answered, closed, or mislabelled. What remains is waiting on an *action* or a
+*dependency*, which is a different thing and gets triaged differently.
 
-**#283 is no longer held.** It asked for a decision on per-tenant authorization for
-credential-scoped writes; that decision is recorded in
-`docs/decision-session-identity-and-conversation-scope.md` and implemented by #322. It is now
-blocked on commerce-os publishing a JWKS, which is a dependency rather than an unanswered question.
+| Issue | Actually waiting on | |
+|---|---|---|
+| #78 | **A deployment.** A human deploys Stage 4A, multi-provider behaviour is verified there, and only then does the `ambiguous_enabled_providers` guard come out. | The `[decision]` label is wrong; there is no open question in that sequence. Prerequisite `replicaCount: 1` is part of the wider pattern in #346. |
+| #283 | **commerce-os publishing a JWKS.** | The decision it wanted is recorded in `docs/decision-session-identity-and-conversation-scope.md`; #322 implements it. |
+
+**Closed or answered since the last revision:**
+
+- **#71** — `/setup` wizard: **CLOSED**. The "harness blocked autonomous merge three times, surface
+  it, do not retry" instruction that stood here is spent.
+- **#91** — failed summarization: **already decided on 2026-08-06 — metrics-only, no run table.**
+  The answer was recorded in `plans/12-feature-expansion-brainstorm.md:834` and never written back
+  to the issue, so it sat in decision triage for weeks with its answer already in the tree. What is
+  left is the implementation: a failure metric with a bounded `reason` label, and the reasoning
+  written into `docs/conversation-summarization.md` so the absent run table reads as a choice.
+
+**The pattern worth noticing.** Three entries in this section were stale in three different ways —
+closed, answered-elsewhere, and mislabelled. A decision recorded only in a plan document does not
+reach the issue tracker by itself. **When you answer a `[decision]` issue, answer it on the
+issue.**
 
 ### 4.5 Session, context, and provider work — from the 2026-08-17 architecture review
 
@@ -177,6 +192,22 @@ tier bound have to land in the first version, not a later migration.
 | #332 | Per-provider cache semantics as a capability | The five providers disagree; a router should absorb that, not each caller. |
 | #333 | Update the rig-providers skill | Ships last. |
 | #336 | Default new applications to `metadata_only` | Breaking for new applications; existing ones untouched. |
+| #338 | Bump `jsonwebtoken` to 10.3.0 (CVE-2026-25537) | **Not currently exploitable** — `exp` is in `required_spec_claims` on both paths — but the second path is safe by *library default*, not by assertion. #322 makes `exp` the entire lifetime control. |
+
+**The remaining review findings**, filed 2026-08-17 and each verified against the tree at filing
+time rather than carried over from the review:
+
+| Issue | | |
+|---|---|---|
+| #340 | `token_count` uses `split_whitespace()` | **Undercounts badly for Indonesian and CJK** — the languages this deployment serves — and it is the number every per-conversation token report reads. |
+| #341 | Conversation ETag bumps twice per turn | `conversations_bump_version` has no `WHEN` clause, so ordinary traffic 412s any `If-Match` holder. |
+| #342 | Summarization runs on the primary model | No cheaper-model hint; ~20x more than it needs to cost, on exactly the long conversations that already cost most. |
+| #343 | `context_plans` / `retrieval_runs` unswept | One row per turn each, forever, and `on delete set null` orphans them past conversation deletion — so erasure cannot reach them either. |
+| #344 | `protected_instruction_policy` enforces nothing | Stored, updated, round-tripped, read by no decision path. Enforce it or remove it; do not leave a comment. |
+| #345 | Streamed transcripts can diverge silently | Best-effort persistence is right for the *response* and insufficient for the *record*. |
+| #346 | Concurrency defaults are undocumented | `replicaCount: 1`, `max_replicas: 1`, Redis off. The defaults are correct; the arithmetic is missing. |
+| #347 | `maximum_messages` is deployment-wide | The per-application knob exists and is not read — same defect class as #344. |
+| #348 | Stale `StubJobDispatcher` comment | It is the stated justification for inline memory extraction, and **it sent three independent analyses down the same wrong path** during the review. |
 
 **Three security findings are tracked privately** as GitHub security advisories, not as issues, so
 that an unfixed exploit chain is not published on a public repository. Two are live today. They are

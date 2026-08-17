@@ -176,10 +176,33 @@ pooling across surfaces**. Until then, three applications is both cheaper and sa
 
 ---
 
+## 5A. No tenant is under a zero-data-retention or data-residency commitment
+
+Answered by the maintainer, 2026-08-17, and recorded here so the next caching decision does not
+have to ask again.
+
+**No current or prospective tenant carries a ZDR or data-residency obligation.** That removes one
+class of blocker from prompt caching — a provider-side cache is a retention event (5 minutes to an
+hour on Anthropic, 30 minutes on OpenAI, rented by the hour on Gemini), and under a ZDR contract
+that alone would forbid it regardless of cost.
+
+**This is not permission to enable caching.** The remaining gates are unchanged and are all
+measurement, not contract: a pricing table with dated and tiered rates, the
+`cache_creation_input_tokens` mapping, and the requirement that the cache decision be a function of
+the *resolved credential* rather than the application.
+
+**This answer expires the moment a tenant signs such a commitment.** If that happens, caching needs
+a per-credential control and a recorded effective cache mode on `execution_attempts` *before* the
+tenant is onboarded, not after — because the audit question is "prove this tenant never ran with
+caching on", and that cannot be answered retroactively from data nobody wrote down.
+
+---
+
 ## 6. What this decision does *not* settle
 
 - Whether Moira ever enables prompt caching. That is gated on a pricing table and on measured hit
-  rate; see §9. Nothing here authorises turning it on.
+  rate; see §9. Nothing here authorises turning it on — §5A removes a contractual blocker, not the
+  measurement ones.
 - The consolidation in §5, pending the named trigger.
 - Anything about the logistics surface, which has no code in any repository today.
 
