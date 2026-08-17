@@ -125,7 +125,18 @@ The same command has produced **81 s, 118 s and 472 s** in this repository, from
 - **Green local gates are not green CI.** `gates.sh` runs six checks; `ci.yml` defines eleven jobs
   and seven have no local equivalent. Real CI green is the merge criterion.
 - Put the issue-closing keyword in the **commit message**, not only the PR body — squash merges
-  compose the commit from commit messages, and `main` is the default branch.
+  compose the commit from commit messages, and GitHub only auto-closes for commits landing on the
+  **default** branch. Since 2026-08-17 that is `develop`, so a keyword in a commit merged there now
+  works. It did not before: while `main` was default, every fixed issue stayed open until the next
+  promotion — #295, #305, #309 and #236 all sat open after their fixes had shipped, and
+  `plans/NEXT.md`, which is reconciled from the issue list, inherited the error.
+- **Never target `~DEFAULT_BRANCH` in a repository ruleset here.** It follows the default branch, so
+  changing the default silently moves which branch the ruleset protects. On 2026-08-17 the switch to
+  `develop` moved the *"promotions land as merge commits"* rule off `main` — making a `main` squash
+  configuration-legal, the exact thing `CONVENTIONS.md` §1A exists to prevent — and simultaneously
+  forbade squash on `develop`, where every feature PR squashes. Nobody edited that ruleset. Target
+  explicit `refs/heads/…` refs. (Repairing this is a settings change: see §0 — report it, do not do
+  it.)
 - Merged-ness comes from GitHub, not ancestry: feature PRs are squashed, so
   `git merge-base --is-ancestor` reports merged branches as unmerged. Use
   `gh pr list --state merged --json headRefName`. *Measured 2026-08-16:* of 135 local branches
