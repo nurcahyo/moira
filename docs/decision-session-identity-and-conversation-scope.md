@@ -38,6 +38,12 @@ secret can mint the tokens it verifies. That collapses the distinction between "
 claim" and "Moira could have written this claim", and it is the distinction the whole per-user
 isolation story rests on.
 
+**commerce-os is the worked example, not the design constraint.** This document names it throughout
+because it is the first caller, but the mechanism specified here — a JWKS-published `ES256`
+assertion carrying `aud = moira:<surface>` and a pairwise pseudonymous subject — assumes nothing
+about who the caller is. Any consumer that can publish a JWKS satisfies it. Read the commerce-os
+references as an instance, and do not bend a second integration to match its incidental choices.
+
 ### Shape
 
 | Property | Value | Note |
@@ -48,7 +54,20 @@ isolation story rests on.
 | Key discovery | `/.well-known/jwks.json` | `trusted_jwt_issuers.jwks_url` |
 | Rotation | `kid` + overlapping validity | Unverified, see §7 |
 | Subject | pairwise pseudonym | `hash(tenant_id, user_id, salt)`, salt per application |
-| Claims | `sub`, `aud`, `exp`, `iat`, `kid` | No tenant slug. No email. No phone number. |
+| Claims | `iss`, `sub`, `aud`, `exp`, `iat` | No tenant slug. No email. No phone number. |
+| JOSE header | `alg`, `kid` | **`kid` is a header, not a claim** — see below |
+
+Two corrections to this table, both found in review, and both of the kind that would have been
+caught at first integration rather than in production — but this table is the artifact two
+repositories agree on before either writes code, so it has to be right on paper:
+
+- **`iss` is structurally required and was missing.** `src/security/auth.rs:705-706` refuses a token
+  with no `iss` *before any key is fetched*, and `load_issuer` selects the `trusted_jwt_issuers` row
+  `where issuer = $1` — the issuer lookup is keyed on it. It is bound again at `auth.rs:1334` through
+  `set_issuer`. A minter built to the original table would have 401'd on every request.
+- **`kid` is a JOSE header, not a claim.** It is read from `header.kid` (`auth.rs:700-703`) and is
+  likewise required. Listing it among the claims invites a minter to put it in the payload, where
+  Moira will not look for it.
 
 This is a **separate assertion minted for Moira**, not commerce-os's own session JWT. commerce-os
 keeps HS256 internally; nothing about its existing session handling changes. The assertion is
@@ -69,11 +88,29 @@ the platform assistant.
 Encoding the surface as `aud = moira:seller-chat` therefore makes surface binding a **verified**
 property rather than a convention. Adopted.
 
-### 2.2 Consequence: set `clock_skew_seconds` explicitly
+### 2.2 Consequence: set `clock_skew_seconds` explicitly — and know what it does not do
 
-`trusted_jwt_issuers.clock_skew_seconds` defaults to `60`, and the leeway applies to `exp` and
-`iat` alike. A ~5-minute assertion therefore has a ~7-minute effective acceptance window unless the
-value is set deliberately. Set it on registration; do not inherit the default.
+`trusted_jwt_issuers.clock_skew_seconds` defaults to `60`. Set it on registration rather than
+inheriting the default.
+
+**The advice stands; the reason first given for it did not, and the corrected reason matters more.**
+An earlier revision said the leeway applies to `exp` and `iat` alike, giving a ~7-minute window.
+That is wrong in both halves:
+
+- **`iat` is never validated.** `jsonwebtoken` 9.3.1's `ClaimsForValidation` deserialises `exp`,
+  `nbf`, `sub`, `iss` and `aud` — there is no `iat` field at all, so the claim is not read and
+  cannot be checked.
+- **`nbf` is not validated either.** `validate_nbf` defaults to `false`, and
+  `trusted_jwt_validation` (`auth.rs:1332-1359`) never enables it.
+
+So the leeway extends only the **trailing** edge, and the real acceptance window is lifetime plus
+skew — about **6 minutes**, not 7. That error was in the safe direction.
+
+The unsafe half is what it implies about the leading edge: **a token whose `iat` is set in the
+future still authenticates.** Nothing bounds how early an assertion may claim to have been issued.
+If the leading edge ever needs to matter — a replay window, a mint-ahead attack — it must be
+enforced with `nbf` plus `validate_nbf`, or checked outside the library. Do not assume `iat` is
+doing it.
 
 ### 2.3 Consequence: per-user quota is per-surface, not per-person
 
@@ -105,7 +142,32 @@ The `deny_unknown_fields` attribute enforces this at the wire today. Do not remo
 ## 4. Decision 3 — `metadata_only`: Moira stores no conversation content
 
 **Decided:** `conversation_content_persistence = metadata_only` for all three commerce-os
-applications. **Moira does not become a processor of conversation content under UU PDP.**
+applications.
+
+**Moira is not a processor for the *storage* of conversation content. It remains a processor for
+its transmission and use.**
+
+### 4.0 The narrower claim, and why the wider one was withdrawn
+
+An earlier revision of this document said flatly that *"Moira does not become a processor of
+conversation content under UU PDP"*. **That conclusion does not follow from its own premise, and it
+is withdrawn.** The decision itself — `metadata_only` — is unchanged; only the legal characterisation
+of what that decision achieves is corrected.
+
+UU PDP No. 27/2022 Art. 16(1) enumerates processing as *pemerolehan dan pengumpulan*, *pengolahan
+dan penganalisisan*, *penyimpanan*, and onward. **Storage is one activity among several, not the
+definition.** And §4.1 states the premise that defeats the wider claim: commerce-os sends the full
+conversation history on every turn. Moira receives it, budgets and assembles it through
+`src/application/context_planner.rs`, and transmits it to a provider. Declining to persist removes
+one activity; it does not exit processor status.
+
+**Why this correction is not cosmetic.** §4 exists precisely to settle the processor question, so
+it is the sentence most likely to be lifted verbatim into a tenant agreement. A contract drafted on
+the wider claim would omit the processor obligations that do apply — documented processing
+instructions, Art. 39 security duties, breach notification, sub-processor consent for the LLM
+providers Moira routes to — on the belief that none were owed. **The obligations in §4.3 are
+therefore a floor, not the whole set**; what else is owed is a question for counsel, raised as a
+separate issue rather than answered here.
 
 ### 4.1 Why this costs nothing
 
@@ -139,14 +201,22 @@ affinity, and a stable correlation id across turns.
    the content tables alone does not discharge a deletion obligation.
 
 3. **`title` and `metadata` are not governed by the persistence policy.** They are the caller's own
-   JSON and are retained under every value, including `metadata_only`. **They are therefore the
-   only remaining path by which personal data can reach Moira**, and nothing in Moira currently
-   prevents it. The caller-side rule in decision 2 is not hygiene — it is the sole control. §9
-   carries a ticket to make it machine-enforced rather than relying on caller discipline.
+   JSON and are retained under every value, including `metadata_only`. **They are therefore the only
+   path by which personal data comes to *rest* in Moira** — nothing in Moira currently prevents it,
+   and the caller-side rule in decision 2 is not hygiene but the sole control. §9 carries a ticket to
+   make it machine-enforced rather than relying on caller discipline.
 
-### 4.3 Contractual obligations this creates
+   **Read that as "at rest", not "at all".** An earlier revision called these the only path by which
+   personal data could reach Moira *at all*, which contradicted §4.1 two paragraphs above it: the
+   full conversation history arrives in the request body on every turn. It is processed and
+   transmitted, and simply not stored. Distinguishing *reaches* from *rests* is the whole of the
+   correction in §4.0, and it is why these two fields matter disproportionately — they are what
+   survives the request.
 
-Whatever Moira holds, it must be able to surrender and destroy. The tenant contract must carry:
+### 4.3 Contractual obligations this creates — a floor, not the whole set
+
+These follow from what Moira *holds*: whatever it holds, it must be able to surrender and destroy.
+The tenant contract must carry:
 
 - **dated retention** — not "we delete periodically";
 - **delete by conversation id**;
@@ -155,6 +225,12 @@ Whatever Moira holds, it must be able to surrender and destroy. The tenant contr
 `conversations.retention_expires_at` has been written and ignored since migration 0007, and the
 retention sweeper currently covers two tables. Shipping these obligations without shipping the
 sweeper would be a contract Moira cannot honour.
+
+**What this list does not cover** is the obligations that follow from processing Moira performs
+*without* storing — see §4.0. Documented processing instructions, Art. 39 security duties, breach
+notification, and sub-processor consent for the LLM providers Moira routes to are all plausibly
+owed and are **not** discharged by the three bullets above. That is a question for counsel rather
+than for this document, and it is raised as its own issue in §9.
 
 ---
 
@@ -257,6 +333,10 @@ Each becomes its own ticket. None is started by this document.
 7. Map `cache_creation_input_tokens` through to usage records. Without the write count, a 0.1x read
    and a 1.25x write are indistinguishable in the usage record, and the caching question stays
    unanswerable.
+8. **Establish which processor obligations Moira owes for the content it transmits but never
+   stores** (§4.0, §4.3). This is a legal question, not an engineering one — it needs counsel, and
+   it must be settled before a tenant agreement is drafted, because the wider claim this document
+   used to make is exactly the sentence such an agreement would have been drafted on.
 
 ---
 
