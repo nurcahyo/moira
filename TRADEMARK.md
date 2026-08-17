@@ -41,9 +41,7 @@ affiliated with it. That single sentence is what makes the rest work.
 - **"Managed Moira", "Hosted Moira", "MyMoira", "MoiraConnector"** — and **"Moira Cloud"**, which
   is reserved to this project. The test is whether the mark is the service's *identity* rather
   than a description of what it runs.
-- Registering any **domain** containing the name or a variant of it.
-- Using it as a **noun**, pluralising it (*"three Moiras"*), or hyphenating it
-  (*"Moira-Gateway"*).
+- Registering any **domain** whose identity is the name — `moiracloud.com`, `getmoira.com`.
 - Using a logo on a managed service, or on a modified build.
 - Naming a **modified** version "Moira", or anything confusable with it — fork freely and give
   the fork its own name.
@@ -92,9 +90,17 @@ terms will not become more restrictive retroactively.
 
 Three things a reader deserves to know rather than discover.
 
-**"Moira" is a weak mark.** It is an ordinary word — the Greek Fates — and ordinary words are
-harder to register and harder to enforce than invented ones. This policy is written to be useful
-anyway, but nobody should mistake it for the protection an arbitrary or coined name would carry.
+**"Moira" is an *arbitrary* mark, which is the second-strongest category there is.** An earlier
+revision of this file called it weak on the grounds that it is an ordinary word. That was wrong,
+and the error is worth naming because it is a common one: what makes a mark weak is being
+*descriptive of the goods*, not being a real word. "Apple" is an ordinary word and one of the
+strongest marks in the world, because apples have nothing to do with computers.
+
+By the same test, "Moira" — the Greek Fates — describes nothing about routing requests to language
+models. USPTO's own strength spectrum runs fanciful, then **arbitrary**, then suggestive, then
+descriptive, then generic; only the last is never registrable, and descriptive names are where
+developer tooling usually gets refused. This name is in the strong half, and that is worth
+something.
 
 **Indonesia is first-to-file, and that changes the calculation.** Under Law No. 20 of 2016
 Article 3, the party that registers a mark first is its lawful owner **even if someone else used
@@ -111,6 +117,37 @@ protected for over a year.
 **Writing this policy is not a substitute for registering.** The policy establishes what use
 looks like and is worth having regardless. But in a first-to-file system it does not, by itself,
 secure the mark.
+
+The Python Software Foundation is the cautionary case, and it is not a small one. After using
+"Python" for **twenty years**, it had no EU registration when a UK hosting company applied to
+register the name across software, servers and web services for the entire EU. The PSF had to
+crowdsource evidence of prior use from European companies, and said plainly that opposing a
+registration costs "tens of thousands of dollars". Twenty years of use did not protect them.
+
+## Using the symbols correctly
+
+Use **™** now, and **®** the moment a registration issues — not before, which is a
+misrepresentation.
+
+This is not decoration. Under US law, an owner who fails to give notice of registration
+recovers **no profits and no damages** unless the infringer had actual notice. Registering and
+then omitting the symbol can cost the entire monetary remedy.
+
+## What this policy cannot do, stated so nobody over-relies on it
+
+**It cannot stop anyone running Moira as a commercial service.** That is the licence, and the
+licence is irrevocable.
+
+**It cannot stop "compatible with Moira".** That is nominative fair use, and in a dispute the
+burden of proving it does *not* apply falls on the mark holder, not the user. Every mature
+policy — the Linux Foundation's, Elastic's, the PSF's, Rust's — permits it expressly, because
+trying to claw it back is both futile and expensive in goodwill. The Rust Foundation attempted
+something close to it in 2023, withdrew the draft after more than a thousand objections, and
+apologised.
+
+**And it must actually be applied.** A mark whose owner licenses it without exercising any
+control can be lost entirely — "naked licensing". A permissive policy is safe; a permissive
+policy nobody ever enforces is not.
 
 **Contact:** open an issue at <https://github.com/nurcahyo/moira/issues>, or write to
 PT Vayu Akasa Teknologi.
