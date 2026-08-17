@@ -1,5 +1,7 @@
 # Trademark policy
 
+**The marks "Moira" and any associated logos are owned by PT Vayu Akasa Teknologi.**
+
 **The Apache-2.0 licence covers the code. It does not cover the name.**
 
 Section 6 of the licence is explicit about this: it *"does not grant permission to use the
@@ -83,22 +85,48 @@ governs the market.** Apache-2.0 §6 leaves that lever untouched on purpose.
 
 ## Status, stated honestly
 
-The name is **not currently a registered trademark**. Common-law rights arise from use, and this
-policy is the statement of that use. Registration may follow; this file will be updated if it
-does, and its terms will not become more restrictive retroactively.
+The marks are held by **PT Vayu Akasa Teknologi**, an Indonesian limited liability company.
+They are **not currently registered**. Common-law rights arise from use, and this policy is the
+statement of that use. Registration may follow; this file will be updated if it does, and its
+terms will not become more restrictive retroactively.
 
-Two things a reader deserves to know rather than discover:
+Three things a reader deserves to know rather than discover.
 
-- **"Moira" is a weak mark.** It is an ordinary word — the Greek Fates — and ordinary words are
-  harder to register and harder to enforce than invented ones. This policy is written to be
-  useful anyway, but nobody should mistake it for the protection an arbitrary or coined name
-  would carry.
-- **Registration is cheap and worth doing early.** PostHog reports securing their mark across
-  four territories for roughly USD 3,000 in total, and advises founders to do it after a seed
-  round rather than before. That is the order of magnitude, not a quote.
+**"Moira" is a weak mark.** It is an ordinary word — the Greek Fates — and ordinary words are
+harder to register and harder to enforce than invented ones. This policy is written to be useful
+anyway, but nobody should mistake it for the protection an arbitrary or coined name would carry.
 
-The reason to write this file before registering anything: the policy is the evidence of use,
-and use is what common-law rights are built from. Waiting for registration to say what the rules
-are means having no rules during the period when the name is easiest to take.
+**Indonesia is first-to-file, and that changes the calculation.** Under Law No. 20 of 2016
+Article 3, the party that registers a mark first is its lawful owner **even if someone else used
+it first**. The common-law reasoning that makes "register later" safe in the United States does
+not transfer here: in Indonesia, prior use is largely not a defence against a later registrant.
 
-**Contact:** open an issue at <https://github.com/nurcahyo/moira/issues>.
+The widely-repeated advice to wait until after a funding round is sound in a first-to-use
+jurisdiction and **wrong in this one**. Registration through DJKI costs roughly Rp500,000 to
+Rp1,800,000 per class and takes about 10 to 15 months to process. Protection runs ten years and
+renews. So the cost of registering early is small and known; the cost of waiting is that someone
+else may hold the name by the time it is worth holding — and even a decision made today is not
+protected for over a year.
+
+**Writing this policy is not a substitute for registering.** The policy establishes what use
+looks like and is worth having regardless. But in a first-to-file system it does not, by itself,
+secure the mark.
+
+**Contact:** open an issue at <https://github.com/nurcahyo/moira/issues>, or write to
+PT Vayu Akasa Teknologi.
+
+### One note on ownership, recorded because it is cheaper to fix now
+
+The marks sit with PT Vayu Akasa Teknologi. The **copyright** in the code currently sits with the
+individual author, and the Apache-2.0 grant in `LICENSE` is made on that basis.
+
+That split is workable and common, but it is not automatic: a company does not acquire rights in
+code simply by being the company. If PT Vayu Akasa Teknologi is to operate a commercial service
+built on this software, it needs a licence or assignment from the copyright holder, recorded in
+writing.
+
+ClickHouse is the cautionary case. Its trademark was originally registered to Yandex and had to
+be formally transferred to ClickHouse, Inc. years later, through recorded assignments. Nothing
+went wrong — but the transfer was work that would have been trivial at the outset. Aligning the
+holders now, while there is one author and no registrations, costs almost nothing; doing it after
+contributors and registrations accumulate does not.

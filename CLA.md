@@ -27,7 +27,9 @@ alongside it.
 
 ## The agreement
 
-By submitting a contribution to this project, you agree to the following.
+By submitting a contribution to this project, you agree to the following. The counterparty is
+**PT Vayu Akasa Teknologi**, the Indonesian company that holds the Moira marks and operates the
+hosted service.
 
 ### 1. Definitions
 
@@ -38,7 +40,7 @@ other means.
 
 ### 2. Copyright licence
 
-You grant the project maintainer a perpetual, worldwide, non-exclusive, royalty-free,
+You grant PT Vayu Akasa Teknologi a perpetual, worldwide, non-exclusive, royalty-free,
 irrevocable copyright licence to reproduce, prepare derivative works of, publicly display,
 publicly perform, sublicense, and distribute your Contribution and such derivative works,
 **under any licence terms, including proprietary and commercial terms**.
@@ -48,7 +50,7 @@ not instead of, your own rights.
 
 ### 3. Patent licence
 
-You grant the project maintainer and every recipient of the software a perpetual, worldwide,
+You grant PT Vayu Akasa Teknologi and every recipient of the software a perpetual, worldwide,
 non-exclusive, royalty-free, irrevocable patent licence to make, have made, use, offer to sell,
 sell, import, and otherwise transfer your Contribution — covering only those patent claims
 that your Contribution necessarily infringes, alone or in combination with the project.
