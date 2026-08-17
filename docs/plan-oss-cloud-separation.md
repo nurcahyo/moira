@@ -408,24 +408,109 @@ the fourth, no dated retention clause can honestly be signed.
 
 ---
 
-## 9. Decisions only the maintainer can make
+## 9. Decisions taken, 2026-08-17
 
-1. **Does Moira Cloud store conversation content at all?** A "yes" reverses the persistence
-   deletions and makes per-tenant key custody a prerequisite rather than a deferred option.
-2. **Managed retrieval: quarantine, delete, or promote to a Cloud product?** The largest fork in
-   the review, and the one no reviewer could resolve on evidence.
-3. **Is Moira Cloud a separate legal entity from the first caller, or the same one?** Same is
-   simpler operationally and creates the self-dealing disclosure gap in §5.3.
-4. **Does an open-core split happen at all?** §4's criterion says almost everything security-shaped
-   stays OSS.
-5. **Do the caller's own tenants become distinct Cloud tenants, or does the caller remain one
-   opaque tenant?** Distinct means the caller must propagate tenant identity as a *verified claim*.
-   Opaque means its per-tenant isolation guarantee stops at Moira's boundary and its DPA must say
-   so.
-6. **Will consumer-key-only callers be supported for external Cloud tenants?** A "yes" means
-   delete-by-subject is permanently unavailable for them and the DPA must say so.
-7. **PITR window** — a number in a contract, not an operational habit.
-8. **Per-tenant KEK with an external KMS before the first tenant, or "deletion only, no
-   cryptographic erasure" in the DPA?** Choosing the latter is defensible and cheap. Choosing it
-   *implicitly*, by shipping and discovering later, is not — the AAD change that makes the former
-   possible is free only while zero rows are sealed.
+These were open when this plan was drafted. They are now answered, and several of them **reverse
+what the persistence review recommended**. That reversal is recorded rather than smoothed over,
+because the review's *defect* findings survive it and become more urgent, not less.
+
+| Question | Answer |
+|---|---|
+| Does Moira Cloud store conversation content? | **Yes — encrypted, with a TTL** |
+| Managed retrieval (RAG) | **Promoted to a Cloud product capability** |
+| Open-core split | **No. Everything is open source; Cloud sells operation** |
+| Key custody backend | **Vault Transit**, behind the existing pluggable trait |
+| PITR window | **30 days**, stated in the tenant agreement |
+| Consumer-key-only callers | **First-party yes; external tenants must present JWT identity** |
+| Legal entity | **Moira Cloud is a separate entity** from the first caller |
+| Caller's own tenants | **One opaque tenant** for now |
+
+### 9.1 The consequence that outranks everything else
+
+**Storing content and selling retrieval both guarantee sealed rows will exist.** That makes
+**binding an ownership id into the AAD** the most time-critical engineering item in this plan.
+
+It is free at zero sealed rows and a **re-encryption of every sealed row** at any other number.
+The door closes on the first sealed row — not on a date. Nothing that writes sealed content may
+ship before it, and that includes the RAG promotion.
+
+The same applies to the scope columns on `content_data_keys`. Both must land in the same change,
+before the first row.
+
+### 9.2 What the "store it" decision does not undo
+
+The persistence review recommended deleting eleven tables. That recommendation is **overridden**.
+Its findings are not — and every one of them stops being theoretical the moment those tables hold
+rows:
+
+- **`user_text_from_public_input` flattens every message of every role into one string stored with
+  `role=User`.** A stored "transcript" therefore feeds the model a user turn containing a system
+  prompt. This is now a **correctness blocker**, not a curiosity: it must be fixed before anything
+  is persisted, or the store is wrong from its first row.
+- **The `"bearer "` trap.** `contains_secret_like_text` runs over that concatenated blob against a
+  needle list. One seller typing the word "bearer" **422s every subsequent turn** for as long as
+  that message stays inside the replay window.
+- **`conversations.conversation_policy_id` has zero references in the tree.** Still deletable, and
+  deleting it removes the `application_id`-alone primary-key tension entirely.
+- **`idempotency_records.response_body` holds model output** in a table with no application, no
+  tenant and no subject — unreachable by every erasure predicate. Now a live erasure hole.
+- **The ETag bumps twice per turn** (`conversations_bump_version` has no `WHEN` clause), so any
+  `If-Match` holder 412s mid-conversation.
+- **`context_plans` and `retrieval_runs`** accrue one row per turn each, forever, unswept, and
+  orphan past conversation deletion.
+- Four `message_type` values and three columns were never constructible; `deleted_at` has no
+  writer, so its partial index filters nothing.
+
+**The order changes accordingly:** fix the writer, then persist. Not the other way round.
+
+### 9.3 Vault Transit, and what it must not become
+
+Vault Transit is chosen because the key **never leaves Vault**, which is what makes per-tenant
+crypto-shred real rather than a row deletion in cryptographic costume: destroying a key destroys
+the ciphertext's readability *including in backups*, which nulling a `wrapped_key` column inside
+the backup set does not.
+
+Three conditions, all of which must hold or the property is lost:
+
+1. **The custody trait stays pluggable and `environment` remains the OSS default.** Everything is
+   open source (§9 decision 3), so a self-hoster must not need Vault to run Moira. Vault is the
+   Cloud operator's choice, expressed as configuration.
+2. **A hosted deployment must refuse `custody_backend = "environment"` at boot.** That closes the
+   condition OWASP names — key material and data sharing one blast radius — and the seam already
+   exists.
+3. **Vault's own posture must be hardened first.** The current development configuration disables
+   TLS and writes the root token to the same host volume as its file storage. Pointing production
+   key custody at that is worse than the environment backend, because it looks stronger.
+
+### 9.4 Consumer keys — a structural rule, not a deadline
+
+The question was posed as "now or later". That framing is wrong: the distinction is **who the
+caller is**, not when.
+
+**A first-party caller may use a consumer key.** An **external tenant must present verified JWT
+identity.** Per-subject deletion matters when the data subjects are someone else's customers under
+a contract you signed — which is exactly the line between the two.
+
+This has the property a date does not: it never arrives late, and no tenant onboarded under it
+inherits a permanent limitation by accident.
+
+### 9.5 Separate legal entity — what it buys and what it obliges
+
+Moira Cloud being a distinct entity means the sub-processor chain has a **real contract at every
+link**, so the DPA can point at a document rather than explain its absence. The self-dealing
+disclosure gap in §5.3 closes.
+
+The obligation is that those inter-company agreements must actually exist and be signed — a
+processor→sub-processor relationship between two entities you own is still a relationship that
+needs terms. Deferring the paperwork recreates the gap the separation was chosen to remove.
+
+---
+
+## 10. Decisions still open
+
+1. **Which surfaces of the caller become distinct Cloud tenants, and when.** One opaque tenant is
+   the answer for now; the trigger for revisiting it is the first external tenant, not a date.
+2. **Whether the RAG promotion ships before or after the tenant entity.** It cannot ship before the
+   AAD binding (§9.1). Whether it waits for full tenant scoping as well is a product call.
+3. **What the Cloud tiers are, and which capabilities gate on which.** Everything is open source, so
+   the tiers gate operation, support and compliance rather than code.
