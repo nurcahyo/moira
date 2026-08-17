@@ -3,8 +3,12 @@
 Public requests are bounded before dispatch.
 
 - Request size is capped by `public_api.maximum_request_bytes`.
-- Message count is capped by `public_api.maximum_messages`.
 - Content item count is capped by application policy `maximum_input_items`.
+- Message count is capped by application policy `maximum_input_messages`, itself bounded by the
+  deployment ceiling `public_api.maximum_messages` &mdash; the lower of the two applies. These are
+  two different dimensions and are easy to confuse: `maximum_input_items` counts content parts
+  across all messages, so one message with 200 parts and 200 messages with one part each are
+  identical to it and opposite to `maximum_input_messages`.
 - Text part size is capped by `public_api.maximum_text_part_bytes`.
 - Image count is capped by `public_api.maximum_image_count`.
 - Output tokens are capped by application policy `maximum_output_tokens`.

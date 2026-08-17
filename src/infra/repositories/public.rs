@@ -32,6 +32,7 @@ const APPLICATION_EXECUTION_POLICY_COLUMNS: &str = "id, application_id, response
      caller_system_instructions_allowed, model_overrides_allowed, route_overrides_allowed, \
      provider_overrides_allowed, credential_overrides_allowed, timeout_overrides_allowed, \
      persistence_mode, response_retention_seconds, maximum_request_bytes, maximum_input_items, \
+     maximum_input_messages, \
      maximum_output_tokens, maximum_timeout_ms, rate_limit_requests_per_minute, \
      rate_limit_streams_per_minute, metadata, updated_at, version";
 
@@ -309,6 +310,10 @@ impl PublicRepository for PgPublicRepository {
                 response_retention_seconds = coalesce($14, application_execution_policies.response_retention_seconds),
                 maximum_request_bytes = coalesce($15, application_execution_policies.maximum_request_bytes),
                 maximum_input_items = coalesce($16, application_execution_policies.maximum_input_items),
+                -- $23 rather than $17: appended so the existing placeholders keep their
+                -- numbers. Renumbering eighteen binds to keep the SET list alphabetical is
+                -- the kind of diff where one `.bind` slides a column silently.
+                maximum_input_messages = coalesce($23, application_execution_policies.maximum_input_messages),
                 maximum_output_tokens = coalesce($17, application_execution_policies.maximum_output_tokens),
                 maximum_timeout_ms = coalesce($18, application_execution_policies.maximum_timeout_ms),
                 rate_limit_requests_per_minute = coalesce($19, application_execution_policies.rate_limit_requests_per_minute),
@@ -322,7 +327,8 @@ impl PublicRepository for PgPublicRepository {
                       route_overrides_allowed, provider_overrides_allowed,
                       credential_overrides_allowed, timeout_overrides_allowed,
                       persistence_mode, response_retention_seconds, maximum_request_bytes,
-                      maximum_input_items, maximum_output_tokens, maximum_timeout_ms,
+                      maximum_input_items, maximum_input_messages, maximum_output_tokens,
+                      maximum_timeout_ms,
                       rate_limit_requests_per_minute, rate_limit_streams_per_minute,
                       metadata, updated_at, version
             "#,
@@ -349,6 +355,7 @@ impl PublicRepository for PgPublicRepository {
         .bind(request.rate_limit_streams_per_minute)
         .bind(&request.metadata)
         .bind(current_version)
+        .bind(request.maximum_input_messages)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
@@ -937,6 +944,7 @@ pub fn default_application_execution_policy(
         response_retention_seconds: 2_592_000,
         maximum_request_bytes: 1_048_576,
         maximum_input_items: 128,
+        maximum_input_messages: 128,
         maximum_output_tokens: 8192,
         maximum_timeout_ms: 600_000,
         rate_limit_requests_per_minute: 120,
