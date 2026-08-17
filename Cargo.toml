@@ -59,7 +59,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 futures-util = "0.3"
 hmac = "0.12"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 metrics = "0.24"
 # `default-features = false` is a SECURITY requirement, not a size preference. The default
 # feature set is `["http-listener", "push-gateway"]`: `http-listener` starts an independent
