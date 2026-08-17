@@ -23,3 +23,22 @@ resolved graph imposes copyleft obligations on this project.
 
 The name "Moira" and any associated logos are not licensed under Apache-2.0.
 See TRADEMARK.md.
+
+--------------------------------------------------------------------------------
+
+SCOPE OF THE APACHE-2.0 GRANT
+
+Everything in this repository is licensed under Apache-2.0, with one reservation
+stated in advance so that it is never a surprise:
+
+    Any content under an `enterprise/` directory, if such a directory exists, is
+    licensed under the terms in `enterprise/LICENSE` and NOT under Apache-2.0.
+
+No such directory exists today. The reservation is recorded now because it is
+cheap to state before the fact and awkward to introduce after — a contributor
+who submitted work believing the whole tree was Apache-2.0 is owed that
+expectation. The same construction is used by LiteLLM and authentik, including
+the "if such a directory exists" hedge.
+
+The LICENSE file itself is the unmodified Apache-2.0 text and is deliberately
+left that way, so that automated licence detection reads it correctly.
