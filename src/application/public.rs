@@ -944,7 +944,7 @@ impl PublicExecutionService {
         self.state
             .authz
             .require(actor, "moira:execution-policies:write")?;
-        validate_policy_request(&request)?;
+        validate_policy_request(&request, self.state.settings.public_api.maximum_messages)?;
         // The `If-Match` comparison is deliberately *not* done here. Reading the current
         // version on one pooled connection and writing on another is check-then-act: two
         // writers holding the same currently-valid version both passed and both wrote, losing
@@ -1328,7 +1328,18 @@ async fn validate_request(
             "input must contain at least one message",
         ));
     }
-    if request.input.len() > state.settings.public_api.maximum_messages {
+    // Two bounds, both enforced, the application one nested inside the deployment one. The
+    // deployment value used to be the *only* bound, so a tenant needing a longer input array
+    // could be accommodated only by raising the ceiling for every tenant on the deployment —
+    // including the ones whose limit was deliberately low (#347).
+    //
+    // `min` rather than trusting the stored value: `validate_policy_request` refuses a write
+    // above the deployment ceiling, but a row written when the ceiling was higher survives the
+    // ceiling being lowered afterwards. The configured maximum has to bind then too, and this
+    // is the only place that can see both numbers.
+    let message_ceiling =
+        (policy.maximum_input_messages as usize).min(state.settings.public_api.maximum_messages);
+    if request.input.len() > message_ceiling {
         return Err(AppError::unprocessable(
             "input_too_large",
             "too many input messages",
@@ -2523,7 +2534,19 @@ fn replayed_idempotency_state(
     })
 }
 
-fn validate_policy_request(request: &ApplicationExecutionPolicyPutRequest) -> Result<(), AppError> {
+/// Shape-checks an execution-policy write, and refuses one that would have no effect.
+///
+/// `deployment_maximum_messages` is passed in rather than read from settings so this stays a
+/// pure function the unit tests can drive without an `AppState`.
+///
+/// The ceiling refusal is the interesting half. Clamping instead — accepting 500 and quietly
+/// enforcing 128 — is precisely the defect #347 was filed about: a value an operator can set,
+/// validate and deploy, with no effect and no error to explain why. Refusing names the real
+/// number instead.
+fn validate_policy_request(
+    request: &ApplicationExecutionPolicyPutRequest,
+    deployment_maximum_messages: usize,
+) -> Result<(), AppError> {
     if request
         .response_retention_seconds
         .is_some_and(|value| value < 0)
@@ -2531,6 +2554,9 @@ fn validate_policy_request(request: &ApplicationExecutionPolicyPutRequest) -> Re
             .maximum_request_bytes
             .is_some_and(|value| value <= 0)
         || request.maximum_input_items.is_some_and(|value| value <= 0)
+        || request
+            .maximum_input_messages
+            .is_some_and(|value| value <= 0)
         || request
             .maximum_output_tokens
             .is_some_and(|value| value <= 0)
@@ -2545,6 +2571,14 @@ fn validate_policy_request(request: &ApplicationExecutionPolicyPutRequest) -> Re
         return Err(AppError::BadRequest(
             "execution policy numeric limits must be positive".to_string(),
         ));
+    }
+    if let Some(requested) = request.maximum_input_messages
+        && requested as usize > deployment_maximum_messages
+    {
+        return Err(AppError::BadRequest(format!(
+            "maximum_input_messages {requested} exceeds the deployment ceiling \
+             public_api.maximum_messages ({deployment_maximum_messages})"
+        )));
     }
     Ok(())
 }
@@ -3591,5 +3625,66 @@ mod tests {
             .await
             .expect("an image-free request is valid");
         assert_eq!(resolver.calls(), 0);
+    }
+}
+
+#[cfg(test)]
+mod input_message_limit_tests {
+    use super::*;
+
+    fn put(maximum_input_messages: Option<i32>) -> ApplicationExecutionPolicyPutRequest {
+        ApplicationExecutionPolicyPutRequest {
+            maximum_input_messages,
+            ..ApplicationExecutionPolicyPutRequest::default()
+        }
+    }
+
+    /// #347 — an operator raising the bound for one tenant must not be silently clamped.
+    ///
+    /// Accepting 500 and enforcing 128 is the exact defect this issue names in its own
+    /// justification: "A setting that exists, is settable, and is not read". A refusal that
+    /// prints the real ceiling is the difference between an operator who knows and one who
+    /// files a bug about a knob that does nothing.
+    #[test]
+    fn a_policy_above_the_deployment_ceiling_is_refused_and_says_by_how_much() {
+        let error = validate_policy_request(&put(Some(500)), 128)
+            .expect_err("500 messages must be refused against a deployment ceiling of 128");
+        let AppError::BadRequest(message) = error else {
+            panic!("the ceiling refusal must be a 400, not a 500 or a conflict");
+        };
+        assert!(
+            message.contains("500") && message.contains("128"),
+            "the refusal must name both the requested value and the ceiling, or the operator \
+             cannot tell which number to change — got {message:?}"
+        );
+    }
+
+    /// The boundary, both sides of it. Without this the test above is satisfied by a validator
+    /// that refuses everything.
+    #[test]
+    fn a_policy_at_or_below_the_deployment_ceiling_is_accepted() {
+        for accepted in [1, 64, 128] {
+            validate_policy_request(&put(Some(accepted)), 128)
+                .unwrap_or_else(|error| panic!("{accepted} must be accepted, got {error:?}"));
+        }
+        validate_policy_request(&put(None), 128)
+            .expect("a write that does not mention the field must not be refused by it");
+    }
+
+    /// Nonsense values keep failing as nonsense rather than sliding into the ceiling branch,
+    /// whose message would be actively misleading for a zero or a negative.
+    #[test]
+    fn a_non_positive_message_limit_is_refused_as_a_limit_and_not_as_a_ceiling_breach() {
+        for refused in [0, -1] {
+            let error = validate_policy_request(&put(Some(refused)), 128)
+                .expect_err("{refused} must be refused");
+            let AppError::BadRequest(message) = error else {
+                panic!("expected a 400");
+            };
+            assert!(
+                message.contains("positive"),
+                "{refused} must be refused as a non-positive limit — got {message:?}"
+            );
+        }
     }
 }

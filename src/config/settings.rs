@@ -639,7 +639,11 @@ pub struct PublicApiSettings {
     pub chat_completions_compat_enabled: bool,
     pub default_persistence_mode: String,
     pub maximum_request_bytes: i64,
-    pub maximum_input_items: i32,
+    // `maximum_input_items` used to sit here and was read by nothing: the content-part bound is
+    // enforced from `application_execution_policies.maximum_input_items`
+    // (`src/application/public.rs`), never from the deployment value. Removed with #347 rather
+    // than left as a field an operator can set, validate and deploy with no effect. `serde` here
+    // is not `deny_unknown_fields`, so an existing config file that still names it keeps loading.
     pub maximum_messages: usize,
     pub maximum_content_parts_per_message: usize,
     pub maximum_text_part_bytes: usize,
@@ -2037,7 +2041,6 @@ impl Default for PublicApiSettings {
             chat_completions_compat_enabled: false,
             default_persistence_mode: "metadata_only".to_string(),
             maximum_request_bytes: 1_048_576,
-            maximum_input_items: 128,
             maximum_messages: 128,
             maximum_content_parts_per_message: 32,
             maximum_text_part_bytes: 262_144,

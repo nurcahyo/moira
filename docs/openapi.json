@@ -866,6 +866,13 @@
               "null"
             ]
           },
+          "maximum_input_messages": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "maximum_output_tokens": {
             "format": "int64",
             "type": [
@@ -996,6 +1003,11 @@
             "format": "int32",
             "type": "integer"
           },
+          "maximum_input_messages": {
+            "description": "Maximum number of messages this application may send in one `input` array.\n\nDistinct from `maximum_input_items`, which bounds the total content *parts* across all\nmessages: one message holding 200 parts and 200 messages holding one part each are the\nsame to that limit and opposite to this one.\n\nA request is refused when it exceeds either this value or the deployment's own message\nceiling, whichever is lower.",
+            "format": "int32",
+            "type": "integer"
+          },
           "maximum_output_tokens": {
             "format": "int64",
             "type": "integer"
@@ -1078,6 +1090,7 @@
           "response_retention_seconds",
           "maximum_request_bytes",
           "maximum_input_items",
+          "maximum_input_messages",
           "maximum_output_tokens",
           "maximum_timeout_ms",
           "rate_limit_requests_per_minute",

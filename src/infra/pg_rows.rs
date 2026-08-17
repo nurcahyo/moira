@@ -360,6 +360,7 @@ pub fn application_execution_policy_record_from_row(
         response_retention_seconds: row.try_get("response_retention_seconds")?,
         maximum_request_bytes: row.try_get("maximum_request_bytes")?,
         maximum_input_items: row.try_get("maximum_input_items")?,
+        maximum_input_messages: row.try_get("maximum_input_messages")?,
         maximum_output_tokens: row.try_get("maximum_output_tokens")?,
         maximum_timeout_ms: row.try_get("maximum_timeout_ms")?,
         rate_limit_requests_per_minute: row.try_get("rate_limit_requests_per_minute")?,

@@ -47,6 +47,15 @@ pub struct ApplicationExecutionPolicyRecord {
     pub response_retention_seconds: i64,
     pub maximum_request_bytes: i64,
     pub maximum_input_items: i32,
+    /// Maximum number of messages this application may send in one `input` array.
+    ///
+    /// Distinct from `maximum_input_items`, which bounds the total content *parts* across all
+    /// messages: one message holding 200 parts and 200 messages holding one part each are the
+    /// same to that limit and opposite to this one.
+    ///
+    /// A request is refused when it exceeds either this value or the deployment's own message
+    /// ceiling, whichever is lower.
+    pub maximum_input_messages: i32,
     pub maximum_output_tokens: i64,
     pub maximum_timeout_ms: i64,
     pub rate_limit_requests_per_minute: i32,
@@ -74,6 +83,7 @@ pub struct ApplicationExecutionPolicyPutRequest {
     pub response_retention_seconds: Option<i64>,
     pub maximum_request_bytes: Option<i64>,
     pub maximum_input_items: Option<i32>,
+    pub maximum_input_messages: Option<i32>,
     pub maximum_output_tokens: Option<i64>,
     pub maximum_timeout_ms: Option<i64>,
     pub rate_limit_requests_per_minute: Option<i32>,

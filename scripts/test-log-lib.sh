@@ -309,7 +309,19 @@ tl_count_skips() {
 # red under this machine's load and still green at `--test-threads=1`. 1776 passed + 3 failed,
 # of which the third was NOT flaky: `conversation_list_pages_through_by_updated_at_with_id_tiebreaker`
 # genuinely broke on this branch and was fixed in the same commit, so it is green in the total.
-TL_TEST_COUNT_MINIMUM=1779
+#
+# Re-measured 2026-08-18 on `fix/per-application-message-limit-347`, based on `develop` at
+# 0c52e2e: **1784**, source declaring 1778, zero skip lines, 67 `test result` lines (the branch
+# adds `tests/execution_policy_input_limits.rs`, so the target count moves too). The branch adds
+# five tests — three unit tests beside `validate_policy_request` and two integration tests — and
+# both halves moved by five. The +6 doctest offset holds for the thirteenth consecutive
+# measurement.
+#
+# This one is a PLAIN GREEN RUN, unlike the two entries above: `failed=0`, so no substitution and
+# no caveat. The two `tests/execution_lifecycle.rs` deadline assertions tracked by #369 passed
+# here — the machine's load average had fallen from ~194 to a normal range between the runs, which
+# is itself the evidence for #369's diagnosis rather than an argument that the tests are fine.
+TL_TEST_COUNT_MINIMUM=1784
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>
