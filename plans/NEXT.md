@@ -52,10 +52,17 @@ directions. **Update it when you claim or release work**, in the same commit as 
 
 | Claimed by | State | Issue | Files it owns |
 |---|---|---|---|
-| Antigravity | in flight, PR #303 | #253 OpenAPI spec import | `src/orchestration/openapi_import.rs`, `src/infra/repositories/agent_platform.rs`, `.github/workflows/ci.yml` |
-| Antigravity | claimed, next | #252 Rig tool loop | branch `fix/rig-tool-loop-memory-252`; 16 files including `src/orchestration/skill_tool.rs`, `controls.rs`, `runtime_factory.rs`, `src/application/{context,execution,public}.rs`, `src/domain/{agent_platform,runtime}.rs`, `src/config/settings.rs`, `src/security/ssrf.rs`, `migrations/0031_agent_platform.sql` |
+| unknown | **in flight, uncommitted** | #236 flaky key-open test | main tree, branch `fix/flaky-key-open-236`; `src/security/data_keys.rs` held ~146 uncommitted lines on 2026-08-17 |
 
-**Antigravity works in the main tree** at the repository root, and has held unpushed commits there.
+**Released since the last revision of this table.** Both entries that stood here are done, and the
+blocks they imposed elsewhere in this file are lifted:
+
+- **#252 Rig tool loop — CLOSED**, merged as `253b783` (PR #265). Every "do not start while #252 is
+  open" warning below is void.
+- **#253 OpenAPI spec import — PR #303 MERGED.** The umbrella issue stays open for its remaining
+  findings, but no branch is claiming those files.
+
+**Someone works in the main tree** at the repository root, and has held unpushed commits there.
 Do not `git checkout`, `git switch`, `git stash` or `git add -A` in the main tree while that is
 true — that is exactly how a session here lost 932 lines of work once. Use a worktree. A docs-only
 change needs no `target/`, so its worktree is a source checkout and costs nothing.
@@ -70,15 +77,19 @@ check whether another agent is mid-build: the volume has hit 100% twice, and eac
 
 All ten **high**-severity findings are closed. What is left is filed by area:
 
-| Issue | Area | Overlap with Antigravity's #252 |
+| Issue | Area | Former overlap with #252 |
 |---|---|---|
-| #251 | Job dispatcher, provider health read surface | **1 file** — `src/config/settings.rs`. `skill_tool.rs` and `ssrf.rs` appear in the issue only as cited precedent, not as edit targets. |
-| #255 | Native chatgpt provider behind the ToS opt-in | **6 files** — `execution.rs`, `public.rs`, `settings.rs`, `domain/runtime.rs`, `controls.rs`, `runtime_factory.rs`. **Do not start while #252 is open.** |
-| #256 | Relationship graph, metrics, DeepSeek catalog, nextest | **5 files** — `execution.rs`, `repositories/public.rs`, `controls.rs`, `ssrf.rs`, `migrations/0031`. Wait for #252. |
+| #251 | Job dispatcher, provider health read surface | 1 file — `src/config/settings.rs` |
+| #255 | Native chatgpt provider behind the ToS opt-in | 6 files — `execution.rs`, `public.rs`, `settings.rs`, `domain/runtime.rs`, `controls.rs`, `runtime_factory.rs` |
+| #256 | Relationship graph, metrics, DeepSeek catalog, nextest | 5 files — `execution.rs`, `repositories/public.rs`, `controls.rs`, `ssrf.rs`, `migrations/0031` |
+
+**All three are now unblocked.** #252 closed as `253b783`, so the "wait for #252" instruction that
+stood in this table is void. The overlap column is kept only as a record of which files these
+issues touch, which is still worth reading before claiming two of them at once.
 
 Those counts come from the file paths each issue names, which is an **upper bound** — an issue
 often cites a file as evidence without needing to modify it, which is exactly why #251's apparent
-three overlaps are really one. Read the citation's context before trusting the number.
+three overlaps were really one. Read the citation's context before trusting the number.
 
 These are umbrella issues: each holds several findings, so an issue staying open after a fix is
 normal. Close individual findings by referencing them in the commit message — squash merges compose
@@ -101,10 +112,10 @@ That is reachable today — `PgRuntimeRepository::resolve_runtime_credential` ra
 out of the candidate set entirely, so the platform's row wins by default. Everything else in #307
 is a warning; that one is a refusal.
 
-Touches `src/config/settings.rs` (**overlaps Antigravity's #252 and #251**), plus
-`src/orchestration/runtime_factory.rs`, `src/infra/repositories/runtime.rs`,
-`src/application/{admin/providers,runners}.rs`, `src/domain/{admin,runners}.rs`,
-`src/i18n/catalog/errors.rs`. **Do not start while #252 is open.**
+Touches `src/config/settings.rs` (overlaps #251), plus `src/orchestration/runtime_factory.rs`,
+`src/infra/repositories/runtime.rs`, `src/application/{admin/providers,runners}.rs`,
+`src/domain/{admin,runners}.rs`, `src/i18n/catalog/errors.rs`. **Unblocked** — the #252 hold that
+stood here is lifted.
 
 ### 4.3 Flaky test — #236
 
@@ -112,18 +123,64 @@ Touches `src/config/settings.rs` (**overlaps Antigravity's #252 and #251**), plu
 unrelated commits. A flaky test in a required check trains everyone to re-run CI without reading
 it, which is how a real failure gets merged.
 
-Touches `src/domain/message.rs` and `src/security/data_keys.rs` — **no overlap with anything
-claimed above**, so it is the safest code task to pick up while #252 is in flight.
+Touches `src/domain/message.rs` and `src/security/data_keys.rs`.
+
+**Claimed, and being worked right now.** On 2026-08-17 the main tree sat on `fix/flaky-key-open-236`
+with ~146 uncommitted lines in `src/security/data_keys.rs`. This is no longer a free task — take
+something else, and leave that tree alone.
 
 ### 4.4 Held on a human decision — do not start these
 
 - **#71** — the `/setup` wizard branch. The harness blocked autonomous merge three times. Surface
   it; do not retry.
-- **#283, #91, #78** — labelled `[decision]`. They need a product answer, not an implementation.
+- **#91, #78** — labelled `[decision]`. They need a product answer, not an implementation.
+
+**#283 is no longer held.** It asked for a decision on per-tenant authorization for
+credential-scoped writes; that decision is recorded in
+`docs/decision-session-identity-and-conversation-scope.md` and implemented by #322. It is now
+blocked on commerce-os publishing a JWKS, which is a dependency rather than an unanswered question.
+
+### 4.5 Session, context, and provider work — from the 2026-08-17 architecture review
+
+Two documents came out of it and are the context for thirteen issues. Read the relevant one before
+picking any of them up; each issue is deliberately thin because the reasoning lives in the doc.
+
+- `docs/decision-session-identity-and-conversation-scope.md` — four binding decisions on identity,
+  conversation scope, and what Moira stores. **The headline is that Moira does not become the
+  system of record for conversation content**, and `metadata_only` costs nothing because prompt
+  caching turns out to be a wire concern rather than a storage one.
+- `docs/provider-plan-grok-kimi-gemini-flash.md` — xAI, Moonshot, and the current Gemini Flash tier.
+
+**Start with #327.** The pricing table blocks #328, #329, #330 and #332 — four issues behind one —
+and without prices no caching claim can be proved either way. Note that the obvious schema does not
+work: these vendors' prices are **time-dated** and **context-tiered**, so `effective_from` and a
+tier bound have to land in the first version, not a later migration.
+
+| Issue | | Note |
+|---|---|---|
+| #322 | Register commerce-os as a trusted JWT issuer | Blocked on commerce-os publishing a JWKS. Also closes #283. |
+| #323 | Measure JWKS cache behaviour under overlapping rotation | Pure investigation, no dependencies. **Blocks the first key rotation** — measure before, not during. |
+| #324 | Enforce the conversation-id contract | `title` and `metadata` are the only remaining path by which personal data reaches Moira, and nothing enforces the caller-side rule today. |
+| #325 | Propagate erasure to embeddings | Embeddings are unsealed under **every** persistence policy value. |
+| #326 | Retention sweeper honour `retention_expires_at` | Written since `0007`, read by nothing. |
+| #327 | Pricing table, dated and tiered | **Start here.** |
+| #328 | Map `cache_creation_input_tokens` | Without the write count, a 0.1× read and a 1.25× write are indistinguishable. |
+| #329 #330 #331 | Gemini Flash catalog, xAI Grok, Moonshot Kimi | rig-core 0.40 already ships all three clients. **Do not bump rig-core** — its model-id constants are stale but `completion_model` takes any string. |
+| #332 | Per-provider cache semantics as a capability | The five providers disagree; a router should absorb that, not each caller. |
+| #333 | Update the rig-providers skill | Ships last. |
+| #336 | Default new applications to `metadata_only` | Breaking for new applications; existing ones untouched. |
+
+**Three security findings are tracked privately** as GitHub security advisories, not as issues, so
+that an unfixed exploit chain is not published on a public repository. Two are live today. They are
+now the gate for promoting `develop` to `main` — see §5.
 
 ---
 
 ## 5. Housekeeping state, so you do not rediscover it
+
+**Promotion to `main`.** The gate is no longer #259. `main` should not carry a known cross-tenant
+leak, so the gate is the three security advisories in §4.5. #259 stays open on its own merits.
+When you do promote, it is a **merge commit** — never a squash. `CLAUDE.md` says why.
 
 **Branches.** 222 local branches were reduced to 27 on 2026-08-16. Of the 135 that appeared to have
 unique commits, **113 were already merged** — squash merges make ancestry lie. Establish merged-ness
