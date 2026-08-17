@@ -158,34 +158,32 @@ The `deny_unknown_fields` attribute enforces this at the wire today. Do not remo
 under this integration, and — per #336 — as the shipped default for all newly provisioned
 applications.
 
-**Moira is not a processor for the *storage* of conversation content. It remains a processor for
-its transmission and use.**
+### 4.0 This document makes no legal characterisation, and the reason is structural
 
-### 4.0 The narrower claim, and why the wider one was withdrawn
+An earlier revision said flatly that *"Moira does not become a processor of conversation content
+under UU PDP"*. **That is withdrawn, and it is not replaced by a narrower legal claim. It is
+replaced by none at all.**
 
-An earlier revision of this document said flatly that *"Moira does not become a processor of
-conversation content under UU PDP"*. **That conclusion does not follow from its own premise, and it
-is withdrawn.** The decision itself — `metadata_only` — is unchanged; only the legal characterisation
-of what that decision achieves is corrected.
+Moira is a library and a router. It publishes code; it holds no one's data and has no tenants.
+Data-protection obligations attach to **whoever operates a deployment**, never to the project — so a
+legal characterisation stated here would be a claim made on behalf of operators this document has
+never met, about jurisdictions it does not know. That is not a claim a specification is in a
+position to make, and no amount of narrowing fixes it.
 
-UU PDP No. 27/2022 Art. 16(1) enumerates processing as *pemerolehan dan pengumpulan*, *pengolahan
-dan penganalisisan*, *penyimpanan*, and onward. **Storage is one activity among several, not the
-definition.** And §4.1 states the premise that defeats the wider claim: the caller sends the full
-conversation history on every turn — which the first integration does, so this is not a
-hypothetical. Moira receives it, budgets and assembles it through
-`src/application/context_planner.rs`, and transmits it to a provider. Declining to persist removes
-one activity; it does not exit processor status.
+What this document owes its reader instead is **facts about behaviour**, precise enough that an
+operator can assess their own position:
 
-The generic form is the stronger one: Moira transmits whatever *any* caller sends it, so the
-argument holds for every integration rather than for one.
+> Under `metadata_only`, Moira **stores** no conversation content. It still **receives** the full
+> history on every turn, **assembles** it through `src/application/context_planner.rs`, and
+> **transmits** it to a third-party provider.
 
-**Why this correction is not cosmetic.** §4 exists precisely to settle the processor question, so
-it is the sentence most likely to be lifted verbatim into a tenant agreement. A contract drafted on
-the wider claim would omit the processor obligations that do apply — documented processing
-instructions, Art. 39 security duties, breach notification, sub-processor consent for the LLM
-providers Moira routes to — on the belief that none were owed. **The obligations in §4.3 are
-therefore a floor, not the whole set**; what else is owed is a question for counsel, raised as a
-separate issue rather than answered here.
+That distinction is the one that matters, and it is the one the withdrawn claim obscured: declining
+to persist is not the same as not handling. An operator reading only "Moira stores nothing" would
+conclude the content never leaves their control, and it does — to Anthropic, OpenAI, Google, xAI or
+Moonshot, depending on the route.
+
+The consequence for the first integration is recorded on that side, not here: see commerce-os's
+`docs/architecture/pii-boundary.md`.
 
 ### 4.1 Why this costs nothing — for a caller that replays its own history
 
@@ -237,24 +235,25 @@ affinity, and a stable correlation id across turns.
    correction in §4.0, and it is why these two fields matter disproportionately — they are what
    survives the request.
 
-### 4.3 Contractual obligations this creates — a floor, not the whole set
+### 4.3 Capabilities an operator will need, and which Moira must therefore provide
 
-These follow from what Moira *holds*: whatever it holds, it must be able to surrender and destroy.
-The tenant contract must carry:
+These are product requirements, not legal claims. Whatever Moira holds, an operator must be able to
+enumerate, surrender and destroy — whichever regime that operator turns out to be under, and
+without having to modify Moira to do it:
 
-- **dated retention** — not "we delete periodically";
+- **dated retention** — an expiry per row, not "we delete periodically";
 - **delete by conversation id**;
-- **delete by tenant**, propagating to embeddings per §4.2(2).
+- **delete by tenant**, reaching derived artefacts, per §4.2(2).
 
-`conversations.retention_expires_at` has been written and ignored since migration 0007, and the
-retention sweeper currently covers two tables. Shipping these obligations without shipping the
-sweeper would be a contract Moira cannot honour.
+**Two of these do not work today.** `conversations.retention_expires_at` has been written and
+ignored since migration 0007, and the retention sweeper covers two tables. An operator who promised
+dated retention on the strength of that column would be unable to keep the promise — which is why
+#325 and #326 exist, and why they are engineering tickets rather than paperwork.
 
-**What this list does not cover** is the obligations that follow from processing Moira performs
-*without* storing — see §4.0. Documented processing instructions, Art. 39 security duties, breach
-notification, and sub-processor consent for the LLM providers Moira routes to are all plausibly
-owed and are **not** discharged by the three bullets above. That is a question for counsel rather
-than for this document, and it is raised as its own issue in §9.
+Note what this list deliberately does **not** contain: any statement about what an operator owes
+their own tenants. That depends on the operator, their jurisdiction and their contracts, none of
+which this repository knows. Moira's job is to make the capability available; deciding what to
+promise with it belongs to whoever runs it.
 
 ---
 
@@ -362,10 +361,11 @@ Each becomes its own ticket. None is started by this document.
 7. Map `cache_creation_input_tokens` through to usage records. Without the write count, a 0.1x read
    and a 1.25x write are indistinguishable in the usage record, and the caching question stays
    unanswerable.
-8. **Establish which processor obligations Moira owes for the content it transmits but never
-   stores** (§4.0, §4.3). This is a legal question, not an engineering one — it needs counsel, and
-   it must be settled before a tenant agreement is drafted, because the wider claim this document
-   used to make is exactly the sentence such an agreement would have been drafted on.
+*(An eighth item stood here, asking counsel to establish which processor obligations Moira owes for
+content it transmits but never stores. It is removed: the question is an operator's, not the
+project's, and it moved to commerce-os with the rest of that responsibility. Removed rather than
+renumbered — it was last, so items 1–7 keep their numbers, and
+`docs/provider-plan-grok-kimi-gemini-flash.md` still resolves "§9 item 6" correctly.)*
 
 ---
 
@@ -376,6 +376,7 @@ Each becomes its own ticket. None is started by this document.
 - **Decision 3** reverses to `encrypted_content` only if a requirement appears that genuinely needs
   server-side history replay or cross-conversation memory. Note that this reversal is **not
   retroactive in either direction**: switching does not encrypt or decrypt existing rows. It also
-  re-opens the UU PDP processor question that §4 exists to close.
+  changes Moira from holding no conversation content to holding all of it, which is a fact every
+  operator of that deployment needs told — not a footnote to a config change.
 - **Decision 4** reverses to one application plus `policy_key` when budget pooling across surfaces
   is required, and not before.
