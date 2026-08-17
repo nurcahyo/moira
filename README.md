@@ -402,3 +402,13 @@ objection to it, are both in that file.
 Dependencies are permissive throughout — `deny.toml` allows no copyleft licence, and adding a
 dependency under one fails the supply-chain gate deliberately, so that it becomes a decision
 rather than an accident.
+
+**Everything in this repository is Apache-2.0.** There is no dual licence, no `ee/` directory, and
+no source-available tier here. Any commercial component will live in a separate repository under
+its own terms rather than as a differently-licensed corner of this one — at one-maintainer scale a
+mixed-licence monorepo costs more to police than it returns, and it invites contributors to patch
+files they may not modify.
+
+`NOTICE` is deliberately short. Apache-2.0 §4(d) only obliges downstream redistributors to carry a
+NOTICE file **if one exists**, so every line added to it becomes an obligation imposed on everyone
+who redistributes. It carries the copyright line and the trademark reservation, and nothing else.
