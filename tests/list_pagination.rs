@@ -815,9 +815,25 @@ impl PaginationFixture {
     /// them all identically. That is exactly the tie the `(updated_at, id)` keyset has to
     /// break, and it is produced by the production trigger rather than by the test writing a
     /// timestamp the trigger would have overwritten anyway.
+    /// Gives each group one shared `updated_at`, by **setting** it rather than by provoking the
+    /// bump trigger into setting it.
+    ///
+    /// This used to say `set metadata = metadata`: a no-op write whose only purpose was to make
+    /// `conversations_bump_version` stamp `now()` on the whole group in one statement. Since
+    /// `0037_conversation_etag_ignores_message_counters.sql` that trigger has a `WHEN` clause
+    /// comparing the row's identity columns, so an update that changes nothing correctly does
+    /// nothing — and the groups came back with six distinct timestamps, which the test caught.
+    ///
+    /// Saying `updated_at = now()` is not a workaround for that; it is what the helper always
+    /// meant. The property under test is unchanged — the walk still has to order three groups by
+    /// timestamp and break each tie by `id desc` — and the assertion that a tie exists at all,
+    /// two lines after every call site, is what keeps this honest.
+    ///
+    /// `memory_records` keeps the old idiom at its own call site below: 0037 is scoped to
+    /// `conversations`, so nothing there has changed.
     async fn tie_conversation_timestamps(&self, groups: &[&[String]]) {
         for group in groups {
-            sqlx::query("update conversations set metadata = metadata where public_id = any($1)")
+            sqlx::query("update conversations set updated_at = now() where public_id = any($1)")
                 .bind(group.to_vec())
                 .execute(self.pool())
                 .await
