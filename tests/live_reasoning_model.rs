@@ -14,7 +14,7 @@
 //! a passing no-op. That is the same shape `LifecycleFixture::new()` uses for the database.
 //!
 //! ```text
-//! MOIRA_LIVE_REASONING_BASE_URL=https://local-llm.motrait.com \
+//! MOIRA_LIVE_REASONING_BASE_URL=https://your-vllm-host.example \
 //! MOIRA_LIVE_REASONING_MODEL=Qwen/Qwen3-4B \
 //!   cargo test --test live_reasoning_model -- --nocapture
 //! ```

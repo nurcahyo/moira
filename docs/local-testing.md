@@ -259,7 +259,9 @@ console's own first-run path, by the manual walk above. Separately, an operator
 signed in through a browser against a local OIDC provider and got a Moira-routed
 answer — but that was the **commerce-os platform console**, not this one. How
 that is wired is documented in that repo, not copied here: see
-[commerce-os's `DEV-GUIDE.md`](https://github.com/motrait/commerce-os/blob/develop/DEV-GUIDE.md).
+that repository's own `DEV-GUIDE.md`. (Deliberately not linked: it is a private
+repository, and a URL from a public repo advertises its name without being
+reachable by anyone who reads it here.)
 
 **Not proven — meaning not automated:** no suite in this repo drives the
 wizard's `claim` step, and no suite drives any of it against a real Moira.
