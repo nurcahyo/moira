@@ -1,0 +1,47 @@
+- generic [active] [ref=f17e1]:
+  - dialog "cookie consent" [ref=f17e2]:
+    - generic [ref=f17e3]: By browsing Etsy you agree to our use of cookies.
+    - button "dismiss cookie message" [ref=f17e5] [cursor=pointer]: x
+  - generic [ref=f17e8]:
+    - link "Skip to content" [ref=f17e9] [cursor=pointer]:
+      - /url: "#content"
+    - generic [ref=f17e10]:
+      - link [ref=f17e13] [cursor=pointer]:
+        - /url: /hc
+        - generic [ref=f17e14]:
+          - img "Etsy" [ref=f17e15]
+          - paragraph [ref=f17e16]: Help Center
+      - search [ref=f17e18]:
+        - generic [ref=f17e19]:
+          - searchbox "Type your question" [ref=f17e20]
+          - button "Search" [ref=f17e21] [cursor=pointer]
+      - link [ref=f17e28] [cursor=pointer]:
+        - /url: https://www.etsy.com/sso-forced/zendesk?return_to=https://help.etsy.com/hc/en-us/articles/115015628627
+        - button "Sign in" [ref=f17e29]
+  - main [ref=f17e30]:
+    - generic [ref=f17e33]:
+      - heading "Uh oh!" [level=3] [ref=f17e34]
+      - generic [ref=f17e35]:
+        - paragraph [ref=f17e36]: The page you were looking for doesn't exist
+        - paragraph [ref=f17e37]: You may have mistyped the address or the page may have moved
+      - link "Take me back to the home page" [ref=f17e39] [cursor=pointer]:
+        - /url: /hc/en-us
+  - contentinfo [ref=f17e41]:
+    - heading "Footer" [level=2] [ref=f17e42]
+    - generic [ref=f17e43]:
+      - generic [ref=f17e44]:
+        - link [ref=f17e45] [cursor=pointer]:
+          - /url: https://www.etsy.com/?ref=hcfooter
+          - img "Etsy" [ref=f17e46]
+        - text: Keep Commerce Human
+      - generic [ref=f17e48]:
+        - generic [ref=f17e50]:
+          - link "© 2026 Etsy, Inc." [ref=f17e52] [cursor=pointer]:
+            - /url: "#"
+          - link "Terms of Use" [ref=f17e54] [cursor=pointer]:
+            - /url: https://www.etsy.com/legal/?ref=enhc
+          - link "Privacy" [ref=f17e56] [cursor=pointer]:
+            - /url: https://www.etsy.com/legal/privacy/?ref=enhc
+          - link "Interest-based ads" [ref=f17e58] [cursor=pointer]:
+            - /url: https://www.etsy.com/legal/policy/cookies-tracking-technologies/44797645975?ref=enhc
+        - button "English (United States)" [ref=f17e63] [cursor=pointer]

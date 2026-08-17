@@ -1,0 +1,554 @@
+- generic [active] [ref=f20e1]:
+  - generic [ref=f20e2]:
+    - banner [ref=f20e4]:
+      - link "Etsy" [ref=f20e6] [cursor=pointer]:
+        - /url: /?ref=lgo
+      - navigation [ref=f20e11]:
+        - button [ref=f20e13] [cursor=pointer]
+      - search [ref=f20e22]:
+        - generic [ref=f20e23]: Search for items or shops
+        - generic [ref=f20e25]:
+          - combobox "Search for items or shops" [ref=f20e26]
+          - button "Search" [ref=f20e27] [cursor=pointer]
+      - link "Skip to Content" [ref=f20e31] [cursor=pointer]:
+        - /url: "#content"
+      - navigation "Main" [ref=f20e35]:
+        - list [ref=f20e36]:
+          - listitem [ref=f20e37]:
+            - button "Sign in" [ref=f20e38] [cursor=pointer]
+          - listitem [ref=f20e39]:
+            - link "Favorites" [ref=f20e41] [cursor=pointer]:
+              - /url: https://www.etsy.com/guest/favorites?ref=hdr-fav
+          - listitem [ref=f20e45]:
+            - link "Cart" [ref=f20e47] [cursor=pointer]:
+              - /url: https://www.etsy.com/cart?ref=hdr-cart
+    - navigation [ref=f20e51]:
+      - list [ref=f20e55]:
+        - listitem [ref=f20e56]:
+          - link "Gifts" [ref=f20e57] [cursor=pointer]:
+            - /url: /featured/hub/gifts?ref=gift_global_nav
+        - listitem [ref=f20e63]:
+          - link "New Arrivals" [ref=f20e64] [cursor=pointer]:
+            - /url: https://www.etsy.com/r/curated/new-arrivals?sections=1412353280132%2C1412667487298&narrow=new-arrivals&ref=NewArrivals71326_cat_nav
+        - listitem [ref=f20e65]:
+          - link "Home Favorites" [ref=f20e66] [cursor=pointer]:
+            - /url: /featured/hub/home-favorites?ref=contentful_promo_cat_nav-5
+        - listitem [ref=f20e67]:
+          - link "Fashion Finds" [ref=f20e68] [cursor=pointer]:
+            - /url: /featured/hub/fashion-favorites?ref=contentful_promo_cat_nav-6
+        - listitem [ref=f20e69]:
+          - link "Vintage" [ref=f20e70] [cursor=pointer]:
+            - /url: /r/curated/etsys-best-vintage-finds?sections=1461029776888&narrow=best-vintage-finds&ref=contentful_promo_cat_nav-7
+        - listitem [ref=f20e71]:
+          - link "Wedding Trends" [ref=f20e72] [cursor=pointer]:
+            - /url: /r/curated/wedding-trends?sections=1474316920789&narrow=wedding-trends&ref=contentful_promo_cat_nav-9
+  - main [ref=f20e73]:
+    - generic [ref=f20e74]:
+      - generic [ref=f20e78]:
+        - generic [ref=f20e79]:
+          - heading [level=2] [ref=f20e80]:
+            - link "Our House Rules" [ref=f20e81] [cursor=pointer]:
+              - /url: /legal?ref=pageheader
+          - paragraph [ref=f20e82]: Get to know Etsy's legal terms and policies
+        - generic [ref=f20e84]:
+          - generic [ref=f20e85]:
+            - generic [ref=f20e86]: Search our policies
+            - textbox "Search our policies" [ref=f20e87]
+          - button "Search" [ref=f20e89]
+      - generic [ref=f20e95]:
+        - generic [ref=f20e98]:
+          - navigation "breadcrumb'" [ref=f20e99]:
+            - generic [ref=f20e100]:
+              - link "Our House Rules" [ref=f20e101] [cursor=pointer]:
+                - /url: /legal?ref=breadcrumb
+              - text: /
+              - 'link "House Rules Menu: Terms of Use current page" [ref=f20e102] [cursor=pointer]':
+                - /url: "?ref=breadcrumb"
+                - text: Terms of Use
+          - heading "Terms of Use" [level=1] [ref=f20e103]
+        - paragraph [ref=f20e151]: Welcome to Etsy. We’re so glad you’re here. Make yourself comfortable and have a good time, but please follow our house rules.
+        - article [ref=f20e152]:
+          - paragraph [ref=f20e153]:
+            - strong [ref=f20e154]:
+              - text: Please note that
+              - link "Section 11" [ref=f20e155] [cursor=pointer]:
+                - /url: "#arbitrationagreement"
+              - text: of the Terms below contains a binding arbitration agreement and class action waiver for users in North and South America. By agreeing to the Terms, you and Etsy agree to submit any disputes between us exclusively to individual arbitration and not to sue in court, except in the limited circumstances described below.
+          - list [ref=f20e156]:
+            - listitem [ref=f20e157]:
+              - link "Accepting These Terms" [ref=f20e158] [cursor=pointer]:
+                - /url: "#terms"
+            - listitem [ref=f20e159]:
+              - link "Those Other Documents We Mentioned" [ref=f20e160] [cursor=pointer]:
+                - /url: "#documents"
+            - listitem [ref=f20e161]:
+              - link "Your Privacy" [ref=f20e162] [cursor=pointer]:
+                - /url: "#privacy"
+            - listitem [ref=f20e163]:
+              - link "Your Account with Etsy" [ref=f20e164] [cursor=pointer]:
+                - /url: "#account"
+            - listitem [ref=f20e165]:
+              - link "Your Content" [ref=f20e166] [cursor=pointer]:
+                - /url: "#yourcontent"
+            - listitem [ref=f20e167]:
+              - link "Your Use of Our Services" [ref=f20e168] [cursor=pointer]:
+                - /url: "#services"
+            - listitem [ref=f20e169]:
+              - link "Termination" [ref=f20e170] [cursor=pointer]:
+                - /url: "#termination"
+            - listitem [ref=f20e171]:
+              - link "Warranties and Limitation of Liability (or the Things You Can’t Sue Us For)" [ref=f20e172] [cursor=pointer]:
+                - /url: "#warranties"
+            - listitem [ref=f20e173]:
+              - link "Indemnification (and What Happens If You Get Us Sued)" [ref=f20e174] [cursor=pointer]:
+                - /url: "#indemnification"
+            - listitem [ref=f20e175]:
+              - link "Disputes with Other Users" [ref=f20e176] [cursor=pointer]:
+                - /url: "#disputes"
+            - listitem [ref=f20e177]:
+              - link "Arbitration and Dispute Resolution Agreement (North and South America)" [ref=f20e178] [cursor=pointer]:
+                - /url: "#arbitrationagreement"
+            - listitem [ref=f20e179]:
+              - link "Dispute Resolution (Rest of World)" [ref=f20e180] [cursor=pointer]:
+                - /url: "#disputeresolution"
+            - listitem [ref=f20e181]:
+              - link "Changes to the Terms" [ref=f20e182] [cursor=pointer]:
+                - /url: "#changes"
+            - listitem [ref=f20e183]:
+              - link "Some Finer Legal Points" [ref=f20e184] [cursor=pointer]:
+                - /url: "#legal"
+            - listitem [ref=f20e185]:
+              - link "Contact Information" [ref=f20e186] [cursor=pointer]:
+                - /url: "#contact"
+          - heading "1. Accepting These Terms" [level=2] [ref=f20e187]
+          - paragraph [ref=f20e188]: This document and the other documents that we reference below make up our house rules, or what we officially call our Terms of Use (the “Terms” for short).
+          - paragraph [ref=f20e189]: The Terms are a legally binding contract between you and Etsy. If you live in North America or South America, the contract is between you and Etsy, Inc.; if you live elsewhere, the contract is between you and Etsy Ireland UC, a subsidiary of Etsy, Inc. We’ll just refer to Etsy, Inc. and all of its subsidiaries collectively as “Etsy.”
+          - paragraph [ref=f20e190]: If you are a buyer on Etsy, the Etsy entity acting as merchant of record may vary depending on the currency and location of your payment instrument. The merchant of record is Etsy, Inc., 117 Adams St, Brooklyn, NY 11201 if you reside in the US; Etsy Ireland UC, One Le Pole Square, Ship Street Great, Dublin 8, Ireland if you reside in the EU; Etsy UK Limited, The Pavilions, Bridgwater Road, Bristol, England BS13 8FD if you reside in the UK (UK); Etsy Canada Limited, 22 Adelaide Street West, Suite 3600, Toronto ON M5H 4E3, if you reside in Canada; Etsy Australia Pty Limited, Yarra Falls, 452 Johnston Street, Abbotsford, Victoria 3067 if you reside in Australia; and Etsy Ireland UC, One Le Pole Square, Ship Street Great, Dublin 8, Ireland, if you reside in the rest of the world.
+          - paragraph [ref=f20e191]:
+            - text: Please note that
+            - link "Section 11" [ref=f20e192] [cursor=pointer]:
+              - /url: "#arbitrationagreement"
+            - text: contains an arbitration clause and class action waiver, applicable to users in North and South America, and explains how to opt out of arbitration.
+            - strong [ref=f20e193]: Unless you validly opt out, you agree to resolve any disputes with Etsy exclusively through binding individual arbitration, with only limited exceptions. This means you and Etsy are waiving the right to sue in court, have a trial by jury, or participate in a class or representative action. Please read this Section carefully, as it affects your rights.
+          - paragraph [ref=f20e194]: This contract sets out your rights and responsibilities when you use Etsy.com, Pattern by Etsy, our mobile apps, and the other services provided by Etsy (we’ll refer to all of these collectively as our “Services”), so please read it carefully. By using any of our Services (even just browsing one of our websites or apps), you’re agreeing to the Terms. If you don’t agree with the Terms, you may not use our Services. Agree with us? Great, read on!
+          - heading "2. Those Other Documents We Mentioned" [level=2] [ref=f20e195]
+          - paragraph [ref=f20e196]: "Etsy’s Services connect people around the world, both online and offline, to make, sell, and buy unique goods. Here’s a handy guide to help you understand the specific rules that are relevant for you, depending on how you use the Services:"
+          - paragraph [ref=f20e197]:
+            - text: Our House Rules for Everyone. If you use any of our Services, you agree to these Terms, our
+            - link "Privacy Policy" [ref=f20e198] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/privacy
+            - text: ", and our"
+            - link "Anti-Discrimination Policy" [ref=f20e199] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/policy/anti-discrimination-policy/123551108902
+            - text: .
+          - paragraph [ref=f20e200]:
+            - strong [ref=f20e201]:
+              - link "Our House Rules for Sellers" [ref=f20e202] [cursor=pointer]:
+                - /url: https://www.etsy.com/legal/section/sellers
+            - text: . If you list any items for sale through our Services, these policies apply to you. You can read them
+            - link "here" [ref=f20e203] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/section/sellers
+            - text: .
+          - paragraph [ref=f20e204]:
+            - strong [ref=f20e205]:
+              - link "Our House Rules for Buyers" [ref=f20e206] [cursor=pointer]:
+                - /url: https://www.etsy.com/legal/section/buyers
+            - text: . If you use our Services to browse or shop, these policies apply to you. You can read them
+            - link "here" [ref=f20e207] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/section/buyers
+            - text: .
+          - paragraph [ref=f20e208]:
+            - strong [ref=f20e209]:
+              - link "Our House Rules for Third Parties" [ref=f20e210] [cursor=pointer]:
+                - /url: https://www.etsy.com/legal/section/third-party
+            - text: . These policies apply to
+            - link "intellectual property owners" [ref=f20e211] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/ip
+            - text: ","
+            - link "Etsy API users" [ref=f20e212] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/api
+            - text: ","
+            - link "affiliates" [ref=f20e213] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/affiliates
+            - text: ", and"
+            - link "anyone requesting information from Etsy" [ref=f20e214] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/requests-for-information
+            - text: .
+          - paragraph [ref=f20e215]:
+            - strong [ref=f20e216]: Search, Advertising and Recommendation Ranking Disclosures.
+            - link "This" [ref=f20e217] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/policy/search-advertisement-ranking-disclosures/899478564529
+            - text: is a concise summary of how Etsy organizes search results and advertising results that could include Your Content.
+          - paragraph [ref=f20e218]: All of these policies are a part of our Terms, so be sure to read the ones that are relevant for you. Of course, you’ll still want to read the rest of this document because it applies to everyone!
+          - heading "3. Your Privacy" [level=2] [ref=f20e219]
+          - paragraph [ref=f20e220]:
+            - text: We know your personal information is important to you, so it’s important to us. Our
+            - link "Privacy Policy" [ref=f20e221] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/privacy
+            - text: details how your information is collected, used and shared when you use our Services. By using our Services, you're also agreeing that we can process your information in the ways set out in the Privacy Policy, so please read it
+            - link "here" [ref=f20e222] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/privacy
+            - text: .
+          - paragraph [ref=f20e223]: Both Etsy and sellers process members’ personal information (for example, buyer name, email address, and shipping address) and are therefore considered separate and independent data controllers of buyers’ personal information under EU law. That means that each party is responsible for the personal information it processes in providing the Services. For example, if a seller accidentally discloses a buyer’s name and email address when fulfilling another buyer’s order, the seller, not Etsy, will be responsible for that unauthorized disclosure.
+          - paragraph [ref=f20e224]:
+            - text: If, however, you (as a seller) and Etsy are found to be joint data controllers of buyers’ personal information, and if Etsy is sued, fined, or otherwise incurs expenses because of something that you did (or failed to do) as a joint data controller of buyer personal information, then you agree to defend and indemnify Etsy in accordance with
+            - link "Section 9" [ref=f20e225] [cursor=pointer]:
+              - /url: "#indemnification"
+            - text: below.
+          - heading "4. Your Account with Etsy" [level=2] [ref=f20e226]
+          - paragraph [ref=f20e227]: "You’ll need to create an account with Etsy to use some of our Services. Here are a few rules about accounts with Etsy:"
+          - paragraph [ref=f20e228]:
+            - strong [ref=f20e229]: A. You must be 18 years or older to use our Services.
+            - text: Minors under 18 and at least 13 years of age are only permitted to use our Services through an account owned by a parent or legal guardian with their appropriate permission and under their direct supervision. Children under 13 years are not permitted to use Etsy or the Services. You are responsible for any and all account activity conducted by a minor on your account, and there may be commercial products or services available that you may want to consider to limit a minor's access to material online. For more information, see Etsy's
+            - link "Minors Policy" [ref=f20e230] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/minors
+            - text: .
+          - paragraph [ref=f20e231]:
+            - strong [ref=f20e232]: B. Be honest with us.
+            - text: Provide accurate information about yourself. It’s prohibited to use false information or impersonate another person or company through your account.
+          - paragraph [ref=f20e233]:
+            - strong [ref=f20e234]: C. Choose an appropriate name.
+            - text: If you decide to not have your full name serve as the name associated with your account, you may not use language that is offensive, vulgar, infringes someone’s intellectual property rights, or otherwise violates the Terms.
+          - paragraph [ref=f20e235]:
+            - strong [ref=f20e236]: D. You're responsible for your account.
+            - text: You’re solely responsible for any activity on your account. If you’re sharing an account with other people, then the person whose financial information is on the account will ultimately be responsible for all activity. If you’re registering as a business entity, you personally guarantee that you have the authority to agree to the Terms on behalf of the business. Accounts are generally not transferable.
+          - paragraph [ref=f20e237]:
+            - strong [ref=f20e238]: E. Protect your password.
+            - text: As we mentioned above, you’re solely responsible for any activity on your account, so it’s important to keep your account password secure.
+            - link "Here’s a Help article on how to make your account more secure" [ref=f20e239] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/115015569567
+            - text: .
+          - paragraph [ref=f20e240]:
+            - strong [ref=f20e241]: F. Let's be clear about our relationship.
+            - text: These Terms don't create any agency, partnership, joint venture, employment, or franchisee relationship between you and Etsy.
+          - paragraph [ref=f20e242]:
+            - strong [ref=f20e243]: G. Cases and Appeals.
+            - text: To participate in our case system (as described in Section 10), or to appeal an action by Etsy, you must have an account.
+          - paragraph [ref=f20e244]:
+            - link "This detailed Help article" [ref=f20e245] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/115015568007
+            - text: should answer any questions you may have about registering an account with Etsy.
+          - heading "5. Your Content" [level=2] [ref=f20e246]
+          - paragraph [ref=f20e247]: Content that you post using our Services is your content (so let’s refer to it as “Your Content”). We don’t make any claim to it, which includes anything you post using our Services (like shop names, profile pictures, listing photos, listing descriptions, reviews, comments, videos, usernames, etc.).
+          - paragraph [ref=f20e248]:
+            - strong [ref=f20e249]: A. Responsibility for Your Content.
+            - text: You understand that you are solely responsible for Your Content. You represent that you have all necessary rights to all parts of Your Content and that you’re not infringing or violating any third party’s rights by posting it.
+          - paragraph [ref=f20e250]:
+            - strong [ref=f20e251]: B. Permission to Use Your Content
+            - text: . By posting Your Content through our Services, you grant Etsy and, as authorized by Etsy in its sole discretion, third parties, a license to use it. We don’t claim any ownership to Your Content, but we have your permission to use it to help Etsy function and grow. That way, we won’t infringe any rights you have in Your Content and we can help promote it. For example, you acknowledge and agree Etsy may offer you or Etsy buyers promotions on the Site, from time to time, that may relate to your listings or other listings on Etsy.
+          - paragraph [ref=f20e252]:
+            - strong [ref=f20e253]: C. Rights You Grant Etsy.
+            - text: (Here’s the legalese version of the last section). By posting Your Content, you grant Etsy and, as authorized by Etsy in its sole discretion, third parties, a non-exclusive, worldwide, royalty-free, irrevocable, sub-licensable, perpetual license to use, display, edit, modify, reproduce, distribute, store, and prepare derivative works of Your Content. This allows us to provide the Services and to promote Etsy, your Etsy shop, other shops and listings, or the Services in general, in any formats and through any channels, including across any Etsy Services, our partners, or third-party website or advertising medium. You agree not to assert any moral rights or rights of publicity against us for using Your Content. You also recognize our legitimate interest in using it, in accordance with the scope of this license, to the extent Your Content contains any personal information.
+          - paragraph [ref=f20e254]: "That sounds like a lot, but it’s necessary for us to keep Etsy going. Consider these examples: if you upload a photo or video of a listing on your Etsy shop, we have permission to display it to buyers, and we can resize or enhance it so it looks good to a buyer using our mobile app; if you post a description in English, we can translate it into French so a buyer in Paris can learn the story behind your item; and if you post a beautiful photo or video of your latest handmade necklace, we can feature it– often along with your shop name and shop picture– on our homepage, in one of our blogs or even on a billboard to help promote your business and Etsy’s."
+          - paragraph [ref=f20e255]:
+            - strong [ref=f20e256]: D. Reporting Unauthorized Content.
+            - text: Etsy has great respect for intellectual property rights, and is committed to following appropriate legal procedures to remove infringing content from the Services. If content that you own or have rights to has been posted to the Services without your permission and you want it removed, please follow the steps listed in our
+            - link "Intellectual Property Policy" [ref=f20e257] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/ip
+            - text: . If Your Content is alleged to infringe another person’s intellectual property, we will take appropriate action, such as disabling it if we receive a report of infringement that complies with our policies, or terminating your account if you are found to be a repeat infringer. We’ll notify you if any of that happens.
+          - paragraph [ref=f20e258]:
+            - strong [ref=f20e259]: E. Inappropriate, False, or Misleading Content.
+            - text: This should be common sense, but there are certain types of content we don’t want posted on Etsy’s Services (for legal reasons or otherwise). You agree that you will not post any content that is abusive, threatening, defamatory, obscene, vulgar, or otherwise offensive or in violation of our
+            - link "Prohibited Items Policy" [ref=f20e260] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/prohibited
+            - text: ","
+            - link "Community Policy" [ref=f20e261] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/community
+            - text: ", or any part of our Terms. You also agree not to post any content that is false and misleading or uses the Services in a manner that is fraudulent or deceptive."
+          - heading "6. Your Use of Our Services" [level=2] [ref=f20e262]
+          - paragraph [ref=f20e263]:
+            - strong [ref=f20e264]: License to Use Our Services.
+            - text: "We grant you a limited, non-exclusive, non-transferable, and revocable license to use our Services—subject to the Terms and the following restrictions in particular:"
+          - paragraph [ref=f20e265]:
+            - strong [ref=f20e266]: A. Don’t Use Our Services to Break the Law.
+            - text: You agree that you will not violate any laws in connection with your use of the Services. This includes any local, state, federal, and international laws that may apply to you. For example, it’s your responsibility to obtain any permits or licenses that your shop requires, and to meet applicable legal requirements in applicable jurisdiction(s). This includes the sale and delivery of your items, such as age verification upon delivery, where required by law. You may not
+            - link "sell anything that violates any laws" [ref=f20e267] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/prohibited
+            - text: ; you must comply with our
+            - link "Sanctions Policy" [ref=f20e268] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/policy/sanctions-policy/122383404929
+            - text: ", and you may not engage in fraud (including false claims or infringement notices), theft, anti-competitive conduct, threatening conduct, or any other unlawful acts or crimes against Etsy, another Etsy user, or a third party."
+          - paragraph [ref=f20e269]:
+            - strong [ref=f20e270]: B. Pay Your Bills.
+            - text: You are responsible for paying all fees that you owe to Etsy. Except as set forth below, you are also solely responsible for collecting and/or paying any applicable taxes for any purchases or sales you make through our Services. Where applicable, Etsy will calculate, collect and remit value-added tax or VAT and sales tax. Some countries may refer to VAT using other terms, e.g. Goods and Services Tax (GST), but we’ll just refer to VAT, GST, and any local sales taxes collectively as “VAT.” Please see
+            - link "this FAQ" [ref=f20e271] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/articles/360000343968
+            - text: and our and our
+            - link "Fees & Payments Policy" [ref=f20e272] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/fees
+            - text: for more information on taxes, including details on the taxes Etsy collects and remits from the buyers. Your fees, bills, taxes, and how you can pay them are fully explained in our
+            - link "Fees & Payments Policy" [ref=f20e273] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/fees
+            - text: .
+          - paragraph [ref=f20e274]:
+            - strong [ref=f20e275]: C. Don’t Steal Our Stuff.
+            - text: You agree not to crawl, scrape, or spider any page of the Services or to reverse engineer or attempt to obtain the source code of the Services (including both Etsy Intellectual Property and Seller Content) without our express permission. If you want to use our API, please follow our
+            - link "API Terms of Use" [ref=f20e276] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/api
+            - text: .
+          - paragraph [ref=f20e277]:
+            - strong [ref=f20e278]: D. Don’t Try to Harm Our Systems.
+            - text: You agree not to interfere with or try to disrupt our Services, for example by distributing a virus, excessive requests to our site or platform, or other harmful computer code.
+          - paragraph [ref=f20e279]:
+            - strong [ref=f20e280]: E. Follow Our Trademark Policy.
+            - text: The name "Etsy" and the other Etsy marks, phrases, logos, and designs that we use in connection with our Services (the Etsy Trademarks), are trademarks, service marks, or trade dress of Etsy in the US and other countries. If you’d like to use our trademarks, you agree to follow our
+            - link "Trademark Policy" [ref=f20e281] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/trademarks
+            - text: .
+          - paragraph [ref=f20e282]:
+            - strong [ref=f20e283]: F. Share Your Ideas.
+            - text: We love your suggestions and ideas! They can help us improve your experience and our Services. Any ideas or other materials you submit to Etsy (not including Your Content or items you sell through our Services) are considered non-confidential and non-proprietary to you. You grant us a non-exclusive, worldwide, royalty-free, irrevocable, sub-licensable, perpetual license to use and publish those ideas and materials for any purpose, without compensation to you.
+          - paragraph [ref=f20e284]:
+            - strong [ref=f20e285]: G. Talk to Us Online.
+            - text: From time to time, Etsy will provide you with certain legal information in writing. By using our Services, you’re agreeing to our
+            - link "Electronic Communications Policy" [ref=f20e286] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/electronic-communications
+            - text: ", which describes how we provide that information to you. It says that we can send you information electronically (such as by email) instead of mailing you paper copies (it’s better for the environment), and that your electronic agreement is the same as your signature on paper."
+          - heading "7. Termination" [level=2] [ref=f20e287]
+          - paragraph [ref=f20e288]:
+            - strong [ref=f20e289]: Termination By You.
+            - text: We'd hate to see you go, but you may terminate your account with Etsy at any time from your account settings. You can find more information in this
+            - link "Help article" [ref=f20e290] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/115015693707
+            - text: . Terminating your account will not affect the availability of some of Your Content that you posted through the Services prior to termination. Oh, and you’ll still have to pay any outstanding bills.
+          - paragraph [ref=f20e291]:
+            - strong [ref=f20e292]: Termination By Etsy.
+            - text: We may terminate or suspend your account (and any accounts Etsy determines are related to your account) and your access to the Services should we have reason to believe you, your Content, or your use of the Services violate our Terms. If we do so, it’s important to understand that you don’t have a contractual or legal right to continue to use our Services, for example, to sell or buy on our websites or mobile apps. Generally, Etsy will notify you that your account has been terminated or suspended, unless you’ve repeatedly violated our Terms or we have legal or regulatory reasons preventing us from notifying you.
+          - paragraph [ref=f20e293]: If you or Etsy terminate your account, you may lose any information associated with your account, including Your Content.
+          - paragraph [ref=f20e294]:
+            - strong [ref=f20e295]: We May Discontinue the Services
+            - text: Etsy reserves the right to change, suspend, or discontinue any of the Services for you, any or all users, at any time, for any reason, including those laid out in Etsy’s policies under these Terms of Use. We will not be liable to you for the effect that any changes to the Services may have on you, including your income or your ability to generate revenue through the Services.
+          - paragraph [ref=f20e296]:
+            - strong [ref=f20e297]: Survival.
+            - text: The Terms will remain in effect even after your access to the Service is terminated, or your use of the Service ends.
+          - heading "8. Warranties and Limitation of Liability (or the Things You Can’t Sue Us For)" [level=2] [ref=f20e298]
+          - paragraph [ref=f20e299]:
+            - strong [ref=f20e300]: Items You Purchase.
+            - text: You understand that Etsy does not manufacture, store, or inspect any of the items sold through our Services. We provide the venue; the items in our marketplaces are produced, listed, and sold directly by independent sellers, so Etsy cannot and does not make any warranties about their quality, safety, authenticity, or their legality. Any legal claim related to an item you purchase must be brought directly against the seller of the item. You release Etsy from any claims related to items sold through our Services, including for defective items, misrepresentations by sellers, or items that caused physical injury (like product liability claims).
+          - paragraph [ref=f20e301]:
+            - strong [ref=f20e302]: Content You Access.
+            - text: You may come across materials that you find offensive or inappropriate while using our Services. We make no representations concerning any content posted by users through the Services. Etsy is not responsible for the accuracy, copyright compliance, legality, or decency of content posted by users that you accessed through the Services. You release us from all liability relating to that content.
+          - paragraph [ref=f20e303]:
+            - strong [ref=f20e304]: People You Interact With.
+            - text: You can use the Services to interact with other individuals, either online or in person. However, you understand that we do not screen users of our Services other than to meet certain compliance and legal obligations, and you release us from all liability relating to your interactions with other users. Please be careful and exercise caution and good judgment in all interactions with others, especially if you are meeting someone in person.
+            - link "This Help article" [ref=f20e305] [cursor=pointer]:
+              - /url: https://www.etsy.com/legal/policy/personal-safety-when-meeting-members-in/243317335177
+            - text: has some good advice about handling in-person meetings.
+          - paragraph [ref=f20e306]:
+            - strong [ref=f20e307]: Third-Party Services.
+            - text: Our Services may contain links to third-party websites or services that we don’t own or control (for example, links to Facebook, Twitter, and Pinterest). You may also need to use a third party’s product or service in order to use some of our Services (like a compatible mobile device to use our mobile apps). When you access these third-party services, you do so at your own risk. The third parties may require you to accept their own terms of use. Etsy is not a party to those agreements; they are solely between you and the third party.
+          - paragraph [ref=f20e308]:
+            - strong [ref=f20e309]: Promotions.
+            - text: Etsy special offers or promotions are managed by Etsy in its sole discretion and redemption of and participation in such offers or promotions are subject to Etsy's sole discretion. Etsy is not responsible for special offers or promotions provided by sellers.
+          - table [ref=f20e310]:
+            - rowgroup [ref=f20e311]:
+              - row [ref=f20e312]:
+                - cell [ref=f20e313]:
+                  - paragraph [ref=f20e314]:
+                    - strong [ref=f20e315]: WARRANTIES.
+                    - text: ETSY IS DEDICATED TO MAKING OUR SERVICES THE BEST THEY CAN BE, BUT WE’RE NOT PERFECT AND SOMETIMES THINGS CAN GO WRONG. YOU UNDERSTAND THAT OUR SERVICES ARE PROVIDED “AS IS” AND "AS AVAILABLE" WITHOUT ANY KIND OF WARRANTY (EXPRESS OR IMPLIED). WE ARE EXPRESSLY DISCLAIMING ANY WARRANTIES OF TITLE, NON-INFRINGEMENT, MERCHANTABILITY, AND FITNESS FOR A PARTICULAR PURPOSE, AS WELL AS ANY WARRANTIES IMPLIED BY A COURSE OF PERFORMANCE, COURSE OF DEALING, OR USAGE OF TRADE.
+                  - paragraph [ref=f20e316]: "WE DO NOT GUARANTEE THAT: (I) THE SERVICES WILL BE SECURE OR AVAILABLE AT ANY PARTICULAR TIME OR LOCATION; (II) ANY DEFECTS OR ERRORS WILL BE CORRECTED; (III) THE SERVICES WILL BE FREE OF VIRUSES OR OTHER HARMFUL MATERIALS; OR (IV) THE RESULTS OF USING THE SERVICES WILL MEET YOUR EXPECTATIONS. YOU USE THE SERVICES SOLELY AT YOUR OWN RISK. SOME JURISDICTIONS DO NOT ALLOW LIMITATIONS ON IMPLIED WARRANTIES, SO THE ABOVE LIMITATIONS MAY NOT APPLY TO YOU."
+                  - paragraph [ref=f20e317]: "LIABILITY LIMITS. TO THE FULLEST EXTENT PERMITTED BY LAW, NEITHER ETSY (INCLUDING ITS OFFICERS, DIRECTORS, EMPLOYEES, AGENTS, SUBSIDIARIES, PARTNERS, OR AFFILIATES) SHALL BE LIABLE TO YOU FOR ANY LOST PROFITS OR REVENUES, OR FOR ANY CONSEQUENTIAL, INCIDENTAL, INDIRECT, SPECIAL, OR PUNITIVE DAMAGES ARISING OUT OF OR IN CONNECTION WITH THE SERVICES OR THESE TERMS. IN NO EVENT SHALL ETSY’S AGGREGATE LIABILITY FOR ANY DAMAGES EXCEED THE GREATER OF: (A) $100, (B) ANY AMOUNTS DUE UNDER THE ETSY PURCHASE PROTECTION PROGRAM UP TO THE PRICE YOU PAID FOR AN ITEM SOLD BY A THIRD PARTY ON ETSY (INCLUDING ANY APPLICABLE SALES TAX) AND ITS ORIGINAL SHIPPING COSTS, OR (C) THE AMOUNT YOU PAID ETSY IN FEES IN THE PAST 12 MONTHS PRIOR TO ANY ACTION GIVING RISE TO THE LIABILITY. SOME JURISDICTIONS DO NOT ALLOW LIMITATIONS ON INCIDENTAL OR CONSEQUENTIAL DAMAGES, SO THE ABOVE LIMITATIONS MAY NOT APPLY TO YOU."
+          - heading "9. Indemnification (and What Happens If You Get Us Sued)" [level=2] [ref=f20e318]
+          - paragraph [ref=f20e319]: We hope this never happens, but if Etsy gets sued or receives a claim, notice, inquiry or demand because of something that you did (or failed to do), you agree to defend and indemnify us. That means, without limitation, you’ll defend, reimburse, compensate, and hold Etsy (including any of our employees, officers, directors, agents, subsidiaries, and affiliates) harmless from any allegation, claim, demand, lawsuit, loss, liability, or expense of any kind (including reasonable attorneys’ fees) that arises from your actions, your use (or misuse) of our Services, your breach of the Terms, items you buy or sell through the Services, and/or your actual or alleged violation of any law or any third party’s rights. We reserve the right to handle our legal defense however we see fit, even if you are indemnifying us, in which case you agree to cooperate with us so we can execute our strategy.
+          - heading "10. Disputes with Other Users" [level=2] [ref=f20e320]
+          - paragraph [ref=f20e321]: If you find yourself in a dispute with another user of Etsy’s Services or a third party, we encourage you to contact the other party and try to resolve the dispute amicably.
+          - paragraph [ref=f20e322]:
+            - strong [ref=f20e323]: Case System.
+            - text: Buyers and sellers who are unable to resolve a dispute related to a transaction on our websites or mobile apps may participate in our case system with a registered account. You can find details about the case system in
+            - link "this Help article" [ref=f20e324] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/115013375668-How-to-Report-a-Problem-with-an-Order?segment=shopping
+            - text: . In our sole discretion, Etsy will attempt to help you resolve disputes in good faith, but we will not make judgments or determinations regarding legal issues or claims. Etsy has no obligation to resolve, or to assist in resolving, any disputes.
+          - paragraph [ref=f20e325]:
+            - strong [ref=f20e326]: Release of Etsy.
+            - text: You release Etsy from any claims, demands, and damages arising out of disputes with other users or third parties.
+          - heading "11. Arbitration and Dispute Resolution Agreement (North and South America)" [level=2] [ref=f20e327]
+          - paragraph [ref=f20e328]: If you’re upset with us, let us know, and we’ll work together in good faith to resolve your issue. But if we can’t work it out, then you and Etsy (including our employees, officers, directors, agents, subsidiaries, and affiliates) agree to submit our disputes exclusively to binding individual arbitration, and we won’t sue each other in court before a judge or jury, except in the limited circumstances described below.
+          - paragraph [ref=f20e329]: This Section 11 (which we’ll also refer to as the “Arbitration Agreement” or “Agreement”) applies only if you are a user in North or South America, and applies to the fullest extent allowable by law.
+          - paragraph [ref=f20e330]:
+            - strong [ref=f20e331]: Please read this Section carefully, as it affects your rights.
+          - paragraph [ref=f20e332]:
+            - strong [ref=f20e333]: A. Disputes that We’ll Arbitrate.
+            - text: You and Etsy agree to mandatory individual arbitration for all claims arising from or relating to the Services, these and prior versions of the Terms, any products, data, or content bought, sold, offered, accessed, displayed, transmitted, or listed through the Services, and actions or statements by Etsy or its users, in each case including disputes that arose before the effective date of these Terms (each, a “
+            - strong [ref=f20e334]: Dispute
+            - text: ”). The exception is that we each may (1) bring qualifying individual claims in “small claims” court, so long as those claims remain in small claims court; and (2) seek injunctive relief in court for infringement or misuse of intellectual property rights (like trademarks, copyrights, and patents).
+            - strong [ref=f20e335]: All other Disputes must be arbitrated, which means you and Etsy are each waiving your right to sue in court and have a court or jury trial.
+          - paragraph [ref=f20e336]:
+            - strong [ref=f20e337]: B. Class and Representative Action Waiver.
+            - text: You and Etsy agree that each of us may bring claims against the other
+            - strong [ref=f20e338]: only on an individual basis, and not on a class, representative, or collective basis (and we each waive any right we have to bring such claims).
+            - text: We each may only seek or obtain individualized relief, and, except as provided in Section 11.F (Batch Arbitration), disputes between us cannot be arbitrated or consolidated with those of any other person or entity. If there is a final decision (after exhaustion of all appeals) that any part of this Section 11.B is unenforceable as to a particular claim or request for relief (e.g., public injunctive relief), then solely that particular claim or request for relief shall be severed from the arbitration and may be litigated in court (but only after the arbitrator issues an award on the arbitrable claims and remedies).
+          - paragraph [ref=f20e339]:
+            - strong [ref=f20e340]: C. Informal Dispute Resolution.
+            - text: Before filing an arbitration, you and Etsy will try in good faith to resolve any Dispute informally. To start the dispute process, you must send an individualized written notice (“Notice of Dispute”) to disputeresolution@etsy.com that includes (1) your name, phone number, the email address for your account, username and shop name (if applicable), and (2) a description of the Dispute and how you’d like it resolved. If Etsy has a Dispute with you, we will send a Notice of Dispute with the same information to the email address for your account. Once a complete Notice of Dispute has been received, the recipient has 60 days to investigate the claims. If either side requests a settlement conference during this period, then you and Etsy must cooperate to schedule that meeting by phone or videoconference. You and Etsy each will personally participate and can each bring counsel, but the conference must be individualized, even if the same firm(s) represent multiple parties. For the claims in the Notice of Dispute, any statute of limitations will be tolled from the date the notice is received until the later of (i) 60 days, or (ii) after a timely requested settlement conference is completed (“Informal Resolution Period”). An arbitration cannot be filed until the Informal Resolution Period has ended, and a court can enjoin the filing or prosecution of an arbitration in breach of this Section.
+          - paragraph [ref=f20e341]:
+            - strong [ref=f20e342]: D. Arbitration Rules and Procedures.
+            - text: "To initiate arbitration, either you or we must file an arbitration demand with the American Arbitration Association (“AAA”). You must serve Etsy with any arbitration demand by mail to: Etsy, Inc. c/o United Agent Group Inc., 1521 Concord Pike, Suite 201, Wilmington, DE 19803. If Etsy has a dispute with you, we will send an arbitration demand to the email address for your account. If the AAA cannot or will not administer the arbitration in accordance with Section 11, you and we will select another provider (and if we can’t agree, a court will choose the provider)."
+          - paragraph [ref=f20e343]: The arbitration will be conducted in the English language by a single arbitrator. Unless otherwise agreed by the parties or ordered by the arbitrator, (i) if the amount in dispute is less than $25,000, the arbitration will be conducted as a documents-only arbitration (i.e., there will be no in-person or telephonic hearing); and (ii) if the amount in dispute is $25,000 or more, the arbitration will be held by videoconference (i.e., there will be no in-person hearing). If an in-person hearing is required, it will be held in the county where you live (for US residents), New York County, New York (for non-US residents), or as determined by the arbitrator (in the case of Batch Arbitration).
+          - paragraph [ref=f20e344]:
+            - text: The arbitration will be decided under AAA’s
+            - link "Consumer Arbitration Rules" [ref=f20e345] [cursor=pointer]:
+              - /url: https://adr.org/sites/default/files/Consumer%2520Rules.pdf
+            - text: ", as modified by this Agreement. But if you are using the Services as a business (e.g., a seller or developer) and either your or Etsy’s claims exceed $75,000, the AAA’s"
+            - link "Commercial Arbitration Rules" [ref=f20e346] [cursor=pointer]:
+              - /url: https://www.adr.org/sites/default/files/Commercial_Rules_Web.pdf
+            - text: will apply, as modified by this Agreement. As in court, the arbitrator shall apply governing law and any counsel must comply with Federal Rule of Civil Procedure 11(b); and the arbitrator may impose any sanctions available under the AAA Rules, Rule 11, or other applicable law. The arbitrator also shall enforce statutes of limitations and other time-based defenses, offers of judgment/compromise, and fee-shifting rules in the same way as a court would.
+          - paragraph [ref=f20e347]: The arbitrator will have exclusive authority to resolve all issues, except that a court has exclusive authority to decide issues related to the arbitrability of a dispute, the enforceability of any part of this Section 11 (Arbitration and Dispute Resolution Agreement (North and South America)), and either party’s compliance with Section 11.C (Informal Dispute Resolution). Except as provided in Section 11.F (Batch Arbitration), the arbitrator can award damages and other relief only in favor of the individual claimant, and only to the extent necessary to provide relief warranted by the claimant’s individual claim(s). The arbitrator will not be bound by decisions reached in other arbitrations. The arbitrator’s award is final and binding on you and Etsy. Judgment on the award may be entered in any court with jurisdiction.
+          - paragraph [ref=f20e348]:
+            - strong [ref=f20e349]: E. Arbitration Fees.
+            - text: Payment of all filing, case-management, administrative, hearing, and arbitrator fees (“Arbitration Fees”) will be governed by the AAA’s rules and fee schedules, unless otherwise stated in this Arbitration Agreement. If you are using the Services as a consumer and your share of Arbitration Fees is more than you’d otherwise pay in court, let us know, and Etsy will pay the difference on your behalf.
+          - paragraph [ref=f20e350]:
+            - strong [ref=f20e351]: F. Batch Arbitration.
+            - text: "To ensure efficient resolution, if within a 90-day period, 25 or more claimants submit Notices of Dispute or file arbitrations raising similar claims (i.e., with the same or similar facts or events and legal issues) and are represented by the same or coordinated counsel, the disputes must be arbitrated in batches of up to 100 claimants each (“Batch”). Specifically, upon notice from either side, the AAA shall group the claimants into: (1) a single Batch (if there are 25-100 claimants), or (2) Batches of 100 claimants each, with a smaller, final Batch consisting of any remaining claimants (if there are more than 100 claimants). The AAA shall thereafter provide for the resolution of each Batch as a single consolidated arbitration with a single arbitrator appointed by the AAA, one set of Arbitration Fees, and one hearing (if any) per Batch to be held by videoconference (or in a place decided by the arbitrator). The parties will cooperate in good faith to implement this process and minimize the time and costs of arbitration, and agree that the AAA Mass Arbitration Supplementary Rules shall apply, except as provided in this Section. Any challenges to administrative determinations by AAA shall be heard by a single process arbitrator. If this Section 11.F is deemed unenforceable as to a particular claimant or Batch, then it shall be severed as to that claimant or Batch, and those parties shall arbitrate in individual proceedings."
+          - paragraph [ref=f20e352]:
+            - strong [ref=f20e353]: G. Opt out.
+            - text: If you are a new user of our Services, you can opt out of this Arbitration Agreement (excluding Section 11.I) within 30 days after you first accept the Terms. To opt out, you must send a timely email to arbitrationoptout@etsy.com with your name, the email address for your account, your username and your shop name (if applicable), and a request to opt out of arbitration. If you validly opt out, neither Etsy nor you will be required to arbitrate as a result of this (or any prior version of the) Arbitration Agreement, but the Terms (and any other agreements between us) will otherwise apply to you. If we update the Terms after you validly opt out, we will continue to respect your opt-out, but such updates do not provide a new opportunity to opt out of arbitration.
+          - paragraph [ref=f20e354]:
+            - strong [ref=f20e355]: H. Future Changes to the Arbitration Agreement.
+            - text: Etsy will notify you of material changes to this Arbitration Agreement at least 30 days before they become effective. You may reject future changes to the Arbitration Agreement by emailing arbitrationchanges@etsy.com within 30 days after you receive notice, including your name, email address associated with your account, your username, and shop name (if applicable). Otherwise, you’ll be bound by the change, and the modified Arbitration Agreement shall apply to all Disputes between you and Etsy, including those arising before the effective date of the changes, but excluding any claims pending in arbitration (or court, if permitted) as of the effective date. If you reject a change, you’ll be bound by the most recent version of the Arbitration Agreement before the change you rejected.
+          - paragraph [ref=f20e356]:
+            - strong [ref=f20e357]: I. Choice of Law and Forum.
+            - text: Etsy is based in New York, so if there are claims between you and Etsy that aren’t subject to arbitration, you and Etsy each agree to litigate those claims exclusively in state or federal court in New York County, New York, and to submit to the personal jurisdiction of those courts. The exception is if you file in small claims court–you can do that in the county of your residence. Except as prohibited by law, these Terms shall be governed exclusively by New York law, without regard to conflict-of-law rules, and U.S. federal law (including the Federal Arbitration Act). However, if you are based in Canada, you may instead bring any non-arbitrable claims in the courts and under the laws (including federal law) of either Quebec (if you are an individual or sole proprietor in Quebec), or Ontario. For clarity, this Section 11.I will continue to apply even if you validly opt out of arbitration under Section 11.G.
+          - heading "12. Dispute Resolution (Rest of World)" [level=2] [ref=f20e358]
+          - paragraph [ref=f20e359]: This Section 12 applies if your country of principal residence or establishment is within Europe (including the European Economic Area, Switzerland, and the United Kingdom), Asia, Australia, or Africa. Because your contract is with Etsy Ireland UC, we each agree that the Terms and any disputes between us will be exclusively governed by Irish law, and exclusively decided in the courts of Ireland, except to the extent prohibited by law. However, if you are based in Australia, the Terms and any disputes will be governed by the laws and courts of Australia. If you are using the Services as an individual consumer, you may be entitled to invoke the mandatory consumer protection laws of your country of residence, and/or to bring legal proceedings in the courts of that country. If Etsy needs to enforce its rights against you as an individual consumer, we will do so only in your country of residence. The application of the United Nations Convention on Contracts for the International Sale of Goods (CISG) is excluded.
+          - paragraph [ref=f20e360]:
+            - text: If a dispute arises between you and Etsy, we encourage you to contact
+            - link "Etsy Support" [ref=f20e361] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/115013375488-How-to-Contact-Etsy-Support?segment=shopping
+            - text: to seek a resolution, and/or to follow the Informal Dispute Resolution process outlined in Section 11.C above. For EU sellers, Etsy provides a complaint-handling system that is available free of charge and easily accessible. Information about the Platform-to-Business (“P2B”) Regulation is
+            - link "here" [ref=f20e362] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/articles/360051541413-European-Union-Platform-to-Business-Regulation-on-Etsy?segment=selling
+            - text: ", including information about how we handle complaints. You may raise a concern or complaint related to P2B"
+            - link "here" [ref=f20e363] [cursor=pointer]:
+              - /url: https://help.etsy.com/hc/en-us/requests/new?segment=selling#issue_account_p2b-solution_primary
+            - text: . You or Etsy also may refer disputes to mediation before the
+            - link "Centre for Effective Dispute Resolution" [ref=f20e364] [cursor=pointer]:
+              - /url: https://www.cedr.com/
+            - text: . For users covered by the EU Digital Services Act, if you disagree with a decision that Etsy has taken on your content or account or in response to a DSA notice, you may choose to appeal such decisions directly with Etsy. You may also be entitled to engage with a
+            - link "certified out-of-court dispute settlement body" [ref=f20e365] [cursor=pointer]:
+              - /url: https://digital-strategy.ec.europa.eu/en/policies/dsa-out-court-dispute-settlement
+            - text: . If any of the certified out-of-court dispute settlement bodies need to contact Etsy, we ask that you please contact legal@etsy.com.
+          - heading "13. Changes to the Terms" [level=2] [ref=f20e366]
+          - paragraph [ref=f20e367]: We may update these Terms from time to time, including by adding entirely new terms and deleting existing terms. If the changes are material, we’ll let you know in advance by posting the changes through the Services and/or sending you an email or message about the changes. Your use of the Services after the effective date of the changes constitutes your acceptance of the updated Terms. If you do not agree with the changes, you may close your account.
+          - heading "14. Some Finer Legal Points" [level=2] [ref=f20e368]
+          - paragraph [ref=f20e369]: The Terms, including all of the policies that make up the Terms, supersede any other agreement between you and Etsy regarding the Services. Except as provided in Section 11, if any part of the Terms is found to be invalid or unenforceable, that part will be limited to the minimum extent necessary and severed so that the Terms will otherwise remain in full force and effect. Our failure to enforce any part of the Terms is not a waiver of our right to later enforce that or any other part of the Terms. We may assign any of our rights and obligations under the Terms.
+          - heading "15. Contact Information" [level=2] [ref=f20e370]
+          - paragraph [ref=f20e371]:
+            - text: If you have any questions about the Terms, please email us at
+            - link "legal@etsy.com" [ref=f20e372] [cursor=pointer]:
+              - /url: mailto:legal@etsy.com
+            - text: .
+          - paragraph [ref=f20e373]: Last updated on Aug 26, 2025
+  - contentinfo [ref=f20e375]:
+    - generic [ref=f20e377]:
+      - heading "We're on a mission to keep commerce human." [level=2] [ref=f20e380]
+      - navigation "Footer" [ref=f20e382]:
+        - generic [ref=f20e383]:
+          - generic [ref=f20e384]:
+            - heading "Shop" [level=3] [ref=f20e385]
+            - list [ref=f20e387]:
+              - listitem [ref=f20e388]:
+                - link "Gift cards" [ref=f20e390] [cursor=pointer]:
+                  - /url: https://www.etsy.com/giftcards?ref=ftr
+              - listitem [ref=f20e391]:
+                - link "Etsy Registry" [ref=f20e393] [cursor=pointer]:
+                  - /url: https://www.etsy.com/registry?ref=ftr
+              - listitem [ref=f20e394]:
+                - link "Sitemap" [ref=f20e396] [cursor=pointer]:
+                  - /url: https://www.etsy.com/categories
+              - listitem [ref=f20e397]:
+                - link "Etsy blog" [ref=f20e399] [cursor=pointer]:
+                  - /url: /blog/en/?ref=ftr
+              - listitem [ref=f20e400]:
+                - link "Etsy United Kingdom" [ref=f20e402] [cursor=pointer]:
+                  - /url: https://www.etsy.com/uk/?locale_override=GBP%7Cen-GB%7CGB
+              - listitem [ref=f20e403]:
+                - link "Etsy Germany" [ref=f20e405] [cursor=pointer]:
+                  - /url: https://www.etsy.com/de/?locale_override=EUR%7Cde%7CDE
+              - listitem [ref=f20e406]:
+                - link "Etsy Canada" [ref=f20e408] [cursor=pointer]:
+                  - /url: https://www.etsy.com/ca/?locale_override=CAD%7Cen-US%7CCA
+          - generic [ref=f20e409]:
+            - heading "Sell" [level=3] [ref=f20e410]
+            - list [ref=f20e412]:
+              - listitem [ref=f20e413]:
+                - link "Sell on Etsy" [ref=f20e415] [cursor=pointer]:
+                  - /url: https://www.etsy.com/sell?ref=ftr
+              - listitem [ref=f20e416]:
+                - link "Teams" [ref=f20e418] [cursor=pointer]:
+                  - /url: https://community.etsy.com/pages/etsy-teams/
+              - listitem [ref=f20e419]:
+                - link "Forums" [ref=f20e421] [cursor=pointer]:
+                  - /url: https://community.etsy.com/feed/
+              - listitem [ref=f20e422]:
+                - link "Affiliates & Creators" [ref=f20e424] [cursor=pointer]:
+                  - /url: https://www.etsy.com/affiliates?ref=ftr
+          - generic [ref=f20e425]:
+            - heading "About" [level=3] [ref=f20e426]
+            - list [ref=f20e428]:
+              - listitem [ref=f20e429]:
+                - link "Etsy, Inc." [ref=f20e431] [cursor=pointer]:
+                  - /url: https://www.etsy.com/about?ref=ftr
+              - listitem [ref=f20e432]:
+                - link "Policies" [ref=f20e434] [cursor=pointer]:
+                  - /url: https://www.etsy.com/legal?ref=ftr
+              - listitem [ref=f20e435]:
+                - link "Investors" [ref=f20e437] [cursor=pointer]:
+                  - /url: https://investors.etsy.com
+              - listitem [ref=f20e438]:
+                - link "Careers" [ref=f20e440] [cursor=pointer]:
+                  - /url: https://www.etsy.com/careers?ref=ftr
+              - listitem [ref=f20e441]:
+                - link "Press" [ref=f20e443] [cursor=pointer]:
+                  - /url: https://www.etsy.com/press?ref=ftr
+              - listitem [ref=f20e444]:
+                - link "Impact" [ref=f20e446] [cursor=pointer]:
+                  - /url: https://action.etsy.com/
+              - listitem [ref=f20e447]:
+                - link "Legal imprint" [ref=f20e449] [cursor=pointer]:
+                  - /url: https://www.etsy.com/help/article/25840304230?ref=ftr
+          - generic [ref=f20e450]:
+            - heading "Help" [level=3] [ref=f20e451]
+            - list [ref=f20e453]:
+              - listitem [ref=f20e454]:
+                - link "Help Center" [ref=f20e456] [cursor=pointer]:
+                  - /url: https://www.etsy.com/help?ref=ftr
+              - listitem [ref=f20e457]:
+                - link "Privacy settings" [ref=f20e459] [cursor=pointer]:
+                  - /url: "#"
+      - list "Download the Etsy App" [ref=f20e463]:
+        - listitem [ref=f20e464]:
+          - link "App Store" [ref=f20e465] [cursor=pointer]:
+            - /url: https://etsy.app.link/d7nDUdp49V
+        - listitem [ref=f20e466]:
+          - link "Google Play" [ref=f20e467] [cursor=pointer]:
+            - /url: https://etsy.app.link/d7nDUdp49V
+      - img "Illustration of two people looking at a framed abstract artwork" [ref=f20e470]
+    - generic [ref=f20e473]:
+      - generic [ref=f20e475]:
+        - link "Update your settings Indonesia English (US) Rp (IDR)" [ref=f20e476] [cursor=pointer]:
+          - /url: https://www.etsy.com/your/account/locale_preferences?from_page=https%3A%2F%2Fwww.etsy.com%2Fin-en%2Flegal%2Fterms-of-use
+          - generic [ref=f20e481]: Indonesia
+        - generic [ref=f20e483]:
+          - link [ref=f20e484] [cursor=pointer]:
+            - /url: /social-tracking?network=instagram
+          - link [ref=f20e489] [cursor=pointer]:
+            - /url: /social-tracking?network=facebook
+          - link [ref=f20e493] [cursor=pointer]:
+            - /url: /social-tracking?network=pinterest
+          - link [ref=f20e497] [cursor=pointer]:
+            - /url: /social-tracking?network=youtube
+      - generic [ref=f20e502]:
+        - generic [ref=f20e503]: © 2026 Etsy, Inc.
+        - generic [ref=f20e504]:
+          - generic [ref=f20e505]:
+            - link "Terms of Use" [ref=f20e507] [cursor=pointer]:
+              - /url: /legal/terms-of-use?ref=ftr
+            - link "Privacy" [ref=f20e509] [cursor=pointer]:
+              - /url: /legal/privacy/?ref=ftr
+          - generic [ref=f20e510]:
+            - link "Interest-based ads" [ref=f20e512] [cursor=pointer]:
+              - /url: /legal/policy/cookies-tracking-technologies/44797645975?ref=ftr#marketing-services
+            - link "Local Shops" [ref=f20e514] [cursor=pointer]:
+              - /url: /search/shops
+            - button "Regions" [ref=f20e516] [cursor=pointer]

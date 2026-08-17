@@ -59,7 +59,23 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 config = { version = "0.15", default-features = false, features = ["toml", "yaml"] }
 futures-util = "0.3"
 hmac = "0.12"
-jsonwebtoken = "9"
+# 10.x fixes CVE-2026-25537 (GHSA-h395-gr6q-cpjc): a standard claim supplied with the wrong
+# JSON type deserialised to `FailedToParse`, which validation treated identically to
+# `NotPresent` — so an `exp` sent as a string skipped expiry validation entirely whenever
+# `exp` was not in `required_spec_claims`. Moira was never exploitable (both `Validation`
+# construction sites have `exp` required, one explicitly and one by 9.3.1's default), but
+# that safety was inherited from a library default rather than asserted; `trusted_jwt_validation`
+# in `src/security/auth.rs` now states it, and `tests/jwt_claim_validation.rs` holds it there.
+#
+# `aws_lc_rs` is REQUIRED, not preferred. jsonwebtoken 10.0 made the crypto backend a
+# choice between `aws_lc_rs` and `rust_crypto` and defaults to NEITHER, so a plain version
+# bump compiles a crate that cannot verify a single algorithm. Between the two:
+# `aws-lc-rs` 1.17 is already in the graph (rustls pulls it), so it adds no crate, no
+# build-time toolchain, and no entry to `deny.toml`'s minimal license allow-list; picking
+# `rust_crypto` would instead ADD `rsa` 0.9, which carries the unfixed RUSTSEC-2023-0071
+# (Marvin timing sidechannel) that `deny.toml` does not ignore — reddening `supply-chain-scan`
+# to fix a CVE. Verified with `cargo tree -i rsa` (absent today) and `cargo tree -i aws-lc-rs`.
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 metrics = "0.24"
 # `default-features = false` is a SECURITY requirement, not a size preference. The default
 # feature set is `["http-listener", "push-gateway"]`: `http-listener` starts an independent

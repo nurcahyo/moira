@@ -978,7 +978,7 @@ async fn validate_static_jwt(
     let key = DecodingKey::from_jwk(jwk)
         .map_err(|err| AppError::Unauthorized(format!("invalid jwk: {err}")))?;
 
-    let mut validation = Validation::new(algorithm_from_jwk(jwk.common.key_algorithm));
+    let mut validation = base_validation(algorithm_from_jwk(jwk.common.key_algorithm));
     validation.leeway = leeway_seconds;
     if let Some(issuer) = issuer {
         validation.set_issuer(&[issuer]);
@@ -1300,13 +1300,37 @@ fn algorithm_name(algorithm: Algorithm) -> &'static str {
     }
 }
 
+/// The only place in Moira that constructs a [`Validation`], and the only place that decides
+/// which claims a token cannot omit.
+///
+/// Expiry is the whole of a token's lifetime control, so `exp` is required here **explicitly**
+/// rather than left to `Validation::new`'s default. The distinction is not cosmetic. Until
+/// CVE-2026-25537 (GHSA-h395-gr6q-cpjc) was fixed in jsonwebtoken 10.3, a claim supplied with
+/// the wrong JSON type deserialised to `FailedToParse`, which validation treated exactly like
+/// `NotPresent` — so `"exp": "9999999999"` skipped expiry validation entirely on any path where
+/// `exp` was not in `required_spec_claims`. Moira was not exploitable, because both of its call
+/// sites required `exp`: one by stating it, and one by inheriting the library default. **That is
+/// the asymmetry this function removes.** An inherited default is not a decision; it can be
+/// changed by a dependency bump, or missed by the next path someone adds, and the resulting
+/// failure is invisible — a token that skips expiry validation looks exactly like a valid one.
+///
+/// `no_second_validation_construction_site` pins the "only place" claim to the source, because
+/// the guarantee is about *every* path, and a guarantee about every path cannot be tested one
+/// path at a time.
+fn base_validation(algorithm: Algorithm) -> Validation {
+    let mut validation = Validation::new(algorithm);
+    validation.set_required_spec_claims(&["exp"]);
+    validation
+}
+
 /// Builds the [`Validation`] a trusted-issuer token is decoded under, after refusing any
 /// algorithm the issuer has not allowlisted.
 ///
 /// Extracted from [`AuthService::authenticate_trusted_jwt_with_issuer`] so both refusals —
 /// the per-issuer algorithm allowlist and the audience expectation — are reachable by a test
-/// without a database, a JWKS endpoint or a signed token per case. The production path builds
-/// its `Validation` *only* here; there is no second construction site to drift from.
+/// without a database, a JWKS endpoint or a signed token per case. The trusted-issuer path
+/// shapes its `Validation` *only* here — the sibling static-JWT path has its own call site, and
+/// what the two share is [`base_validation`], not a copied constant.
 ///
 /// Two independent gates keep the classic algorithm-confusion attack out, and they are worth
 /// naming because only one of them is per-issuer:
@@ -1329,7 +1353,7 @@ fn trusted_jwt_validation(
         ));
     }
 
-    let mut validation = Validation::new(algorithm);
+    let mut validation = base_validation(algorithm);
     validation.leeway = issuer_config.clock_skew_seconds.max(0) as u64;
     validation.set_issuer(&[issuer_config.issuer.as_str()]);
     if issuer_config.expected_audiences.is_empty() {
@@ -1352,8 +1376,10 @@ fn trusted_jwt_validation(
         // the claim closes that, and is only done for issuers that registered an expectation,
         // so the opt-out above keeps its meaning.
         //
-        // The set is *replaced*, not extended, so `exp` has to be restated or expiry
-        // validation would be dropped by this line.
+        // The set is *replaced*, not extended, so `exp` has to be restated or this line would
+        // silently undo what `base_validation` just required — adding audience binding by
+        // dropping expiry validation. That trap was caught once by a careful author;
+        // `exp_is_required_on_every_validation_moira_builds` is what catches it next time.
         validation.set_required_spec_claims(&["exp", "aud"]);
     }
     Ok(validation)
@@ -1958,6 +1984,212 @@ mod tests {
                     Err(AppError::Unauthorized(_))
                 ),
                 "{symmetric} must not be reachable as a trusted-JWT algorithm"
+            );
+        }
+    }
+
+    /// `exp` is the entire lifetime control on a Moira-facing token — the session-identity
+    /// decision makes an end-user assertion a ~5-minute credential, so an expiry check that is
+    /// skipped turns that into a permanent one.
+    ///
+    /// The interesting branch is the one **without** an expected audience. That branch never
+    /// calls `set_required_spec_claims`, so before [`base_validation`] it required `exp` only
+    /// because jsonwebtoken happened to default to it. This asserts the requirement on every
+    /// branch, so a dependency whose default changes reds the build instead of quietly widening
+    /// the window.
+    ///
+    /// Stated plainly, because this repository's reviews keep finding the opposite: **deleting
+    /// [`base_validation`]'s explicit line does not turn this test red today.** jsonwebtoken's
+    /// own default would keep it green — which is the entire fragility being removed, not an
+    /// oversight. The falsifying assertion lives in `no_second_validation_construction_site`.
+    #[test]
+    fn exp_is_required_on_every_validation_moira_builds() {
+        let requires_exp =
+            |validation: &Validation| validation.required_spec_claims.contains("exp");
+
+        assert!(
+            requires_exp(&base_validation(Algorithm::RS256)),
+            "the shared constructor must require `exp`"
+        );
+
+        // Branch 1: no audience registered. `set_required_spec_claims` is never reached here.
+        let open = trusted_issuer_with_application_claim();
+        assert!(open.expected_audiences.is_empty(), "fixture drift");
+        let open_validation =
+            trusted_jwt_validation(&open, Algorithm::RS256).expect("RS256 is allowlisted");
+        assert!(
+            requires_exp(&open_validation),
+            "an issuer with no audience expectation must still require `exp`"
+        );
+
+        // Branch 2: audience registered, which *replaces* the required set. `exp` survives only
+        // because it is restated there.
+        let bound = TrustedIssuerConfig {
+            expected_audiences: vec!["moira".to_string()],
+            ..trusted_issuer_with_application_claim()
+        };
+        let bound_validation =
+            trusted_jwt_validation(&bound, Algorithm::RS256).expect("RS256 is allowlisted");
+        assert!(
+            requires_exp(&bound_validation),
+            "adding audience binding must not drop the expiry requirement"
+        );
+        assert!(
+            bound_validation.required_spec_claims.contains("aud"),
+            "an issuer that registered an audience must reject a token carrying none"
+        );
+    }
+
+    /// The two assertions above cover the paths that exist today. This one covers the path
+    /// somebody adds next.
+    ///
+    /// A guarantee about *every* `Validation` cannot be tested one `Validation` at a time — a
+    /// third construction site would pass both tests above by never being called by them. So the
+    /// claim in [`base_validation`]'s docs is pinned to the source itself: there is one
+    /// constructor, and a new caller either goes through it or turns this red.
+    #[test]
+    fn no_second_validation_construction_site() {
+        // Assembled from fragments so this test's own source does not count as an occurrence.
+        let needle = concat!("Validation", "::new(");
+
+        let sites: Vec<(usize, &str)> = include_str!("auth.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains(needle))
+            .map(|(index, line)| (index + 1, line.trim()))
+            .collect();
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "`{needle}` must appear exactly once in src/security/auth.rs, inside \
+             `base_validation` — every other path builds on it so that the required-claim set \
+             is decided in one place. Found: {sites:?}"
+        );
+
+        // And that one place must *state* the requirement. Without this, the single constructor
+        // could go back to inheriting `exp` from the library default and every assertion above
+        // would stay green — which is exactly the condition this change exists to end.
+        let constructor: String = include_str!("auth.rs")
+            .split_once("fn base_validation")
+            .expect("base_validation must exist")
+            .1
+            .lines()
+            .take_while(|line| !line.starts_with('}'))
+            .collect();
+        assert!(
+            constructor.contains(concat!("set_required_spec_claims", "(&[\"exp\"])")),
+            "`base_validation` must require `exp` itself rather than inherit it from \
+             jsonwebtoken's default — an inherited default is not a decision"
+        );
+    }
+
+    /// CVE-2026-25537 (GHSA-h395-gr6q-cpjc), reduced to a single token.
+    ///
+    /// Before jsonwebtoken 10.3, a standard claim supplied with the wrong JSON type deserialised
+    /// to `FailedToParse`, and validation treated that identically to `NotPresent` — so wherever
+    /// `exp` was not in `required_spec_claims`, sending it as a **string** skipped expiry
+    /// validation and produced a token that never expired.
+    ///
+    /// Moira was never exploitable, for a reason worth keeping: `exp` was required on both call
+    /// sites, so a malformed `exp` failed the *presence* check instead of being skipped.
+    ///
+    /// The two defences are **layered, not independent**, and the ordering matters enough to
+    /// pin. `validate` (jsonwebtoken 10.4 `validation.rs:268-281`) runs the `required_spec_claims`
+    /// loop first, and `FailedToParse` is not `Parsed`, so a required `exp` returns
+    /// `MissingRequiredClaim` and the malformed-claim branch below it is never reached. Which
+    /// means the library fix is unreachable *while* Moira requires `exp` — it is the layer that
+    /// catches the token if that requirement is ever dropped.
+    ///
+    /// So both layers are asserted separately, on the configuration where each is the one doing
+    /// the work. The second is what makes this test falsifiable against 9.3.1, where the same
+    /// token verified successfully and never expired.
+    #[test]
+    fn a_token_whose_exp_is_a_string_is_refused() {
+        use jsonwebtoken::{EncodingKey, Header, encode, errors::ErrorKind};
+
+        // HS256 for the same reason as `a_token_audience_outside_the_issuer_expectation_is_refused`:
+        // it keeps RSA key material out of the test and is unreachable in production. What is
+        // under test is claim parsing, which is algorithm-independent.
+        let issuer = TrustedIssuerConfig {
+            allowed_algorithms: vec!["HS256".to_string()],
+            ..trusted_issuer_with_application_claim()
+        };
+        let secret = EncodingKey::from_secret(b"exp-type-confusion-secret");
+        let key = DecodingKey::from_secret(b"exp-type-confusion-secret");
+        let validation = trusted_jwt_validation(&issuer, Algorithm::HS256)
+            .expect("the issuer's registered algorithm must be accepted");
+
+        let expiry = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp();
+        let token_with_exp = |exp: Value| {
+            encode(
+                &Header::new(Algorithm::HS256),
+                &json!({ "iss": issuer.issuer, "sub": "user-1", "exp": exp }),
+                &secret,
+            )
+            .expect("the test token must encode")
+        };
+
+        // The control. Without it a refusal below would prove nothing — the token could be
+        // failing for any of a dozen unrelated reasons and the test would still be green.
+        decode::<Value>(&token_with_exp(json!(expiry)), &key, &validation)
+            .expect("a token with a numeric exp must verify");
+
+        // The string case from the advisory, plus the other *scalar* wrong types — the bug was
+        // the deserialiser failing, not strings specifically, so a bool and `null` have to land
+        // in the same place. Composites are a separate case, below, and for a reason.
+        let malformed = [json!(expiry.to_string()), json!(true), json!(null)];
+
+        // An object or an array in `exp` never reaches the claim machinery at all. `numeric_type`
+        // drives `deserialize_any`, whose visitor rejects a map or a seq *without draining it*,
+        // and the swallowed error leaves serde_json mid-value — so the remaining claims fail to
+        // parse and the token dies as `ErrorKind::Json` instead. Still refused, which is what
+        // matters, but by the parser rather than by validation. Asserted separately so the
+        // scalar assertions below can be exact rather than watered down to `is_err()`.
+        for composite in [json!({ "at": expiry }), json!([expiry])] {
+            assert!(
+                decode::<Value>(&token_with_exp(composite.clone()), &key, &validation).is_err(),
+                "`exp` as {composite} must be refused"
+            );
+        }
+
+        // Layer 1 — what actually protects Moira today. `base_validation` requires `exp`, so a
+        // wrong-typed claim is not `Parsed` and never reaches the malformed check.
+        for wrong_type in &malformed {
+            let err = decode::<Value>(&token_with_exp(wrong_type.clone()), &key, &validation)
+                .expect_err(&format!("`exp` as {wrong_type} must be refused"));
+            assert!(
+                matches!(err.kind(), ErrorKind::MissingRequiredClaim(claim) if claim == "exp"),
+                "`exp` as {wrong_type} must fail the presence check — got {:?}",
+                err.kind()
+            );
+        }
+
+        // Layer 2 — the one the version bump buys, and the only assertion here that 9.3.1 could
+        // not satisfy. Drop the presence requirement and the same tokens were previously waved
+        // through as if they carried no expiry at all: valid, forever. They must now be refused
+        // on their own merits.
+        let mut without_requirement = validation.clone();
+        without_requirement.required_spec_claims.clear();
+        assert!(
+            without_requirement.validate_exp,
+            "the layer under test is guarded by validate_exp; if that is off this proves nothing"
+        );
+        for wrong_type in &malformed {
+            let err = decode::<Value>(
+                &token_with_exp(wrong_type.clone()),
+                &key,
+                &without_requirement,
+            )
+            .expect_err(&format!(
+                "`exp` as {wrong_type} must be refused even when `exp` is not required — \
+                 this is CVE-2026-25537 and it is the reason for the 10.x bump"
+            ));
+            assert!(
+                matches!(err.kind(), ErrorKind::InvalidClaimFormat(claim) if claim == "exp"),
+                "`exp` as {wrong_type} must be refused as malformed — got {:?}",
+                err.kind()
             );
         }
     }

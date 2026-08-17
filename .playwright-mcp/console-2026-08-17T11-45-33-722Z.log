@@ -1,0 +1,16 @@
+[     610ms] [ERROR] Failed to load resource: the server responded with a status of 404 () @ https://help.etsy.com/hc/en-us/articles/115015628627:0
+[     930ms] Uncaught ReferenceError: ga is not defined
+    at <anonymous> (https://www.etsy.com/ac/evergreenVendor/js/en-US/zendesk_help_center/error_page.4fedd7bce53cd407e627.js?z=d5c92767e9d6bdd2773776c9c432a3df:0:706)
+    at <anonymous> (https://www.etsy.com/ac/evergreenVendor/js/en-US/zendesk_help_center/error_page.4fedd7bce53cd407e627.js?z=d5c92767e9d6bdd2773776c9c432a3df:0:755)
+[    1134ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Graphik-Medium-Web.woff2:0
+[    1180ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Guardian-EgypTT-Light.woff2?v=2:0
+[    1481ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Graphik-Regular-Web.woff2:0
+[    1545ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Graphik-Medium-Web.woff:0
+[    1589ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Guardian-EgypTT-Light.woff?v=2:0
+[    1766ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/StagCyr-Light-Web.woff2?v=20210506:0
+[    1790ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/StagCyr-Light-Web.woff?v=20210506:0
+[    1924ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/Graphik-Regular-Web.woff:0
+[    2127ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/GraphikCyr-Medium-Web.woff2?v=20210506:0
+[    2305ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/GraphikCyr-Regular-Web.woff2?v=20210506:0
+[    2689ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/GraphikCyr-Regular-Web.woff?v=20210506:0
+[    3017ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://help.etsy.com/assets/type/GraphikCyr-Medium-Web.woff?v=20210506:0

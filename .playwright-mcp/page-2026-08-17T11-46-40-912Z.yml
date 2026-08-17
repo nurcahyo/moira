@@ -1,0 +1,15 @@
+- generic [active] [ref=f23e1]:
+  - link "Amazon.com":
+    - /url: /ref=cs_503_logo
+    - img "Amazon.com" [ref=f23e2] [cursor=pointer]
+  - search [ref=f23e3]:
+    - generic [ref=f23e4]:
+      - textbox "Search" [ref=f23e5]
+      - button "Go" [ref=f23e6] [cursor=pointer]
+  - generic [ref=f23e7]:
+    - link [ref=f23e9] [cursor=pointer]:
+      - /url: /ref=cs_503_link
+      - img "Sorry! Something went wrong on our end. Please go back and try again or go to Amazon's home page." [ref=f23e10]
+    - link [ref=f23e11] [cursor=pointer]:
+      - /url: /dogsofamazon/ref=cs_503_d
+      - img "Dogs of Amazon" [ref=f23e12]
