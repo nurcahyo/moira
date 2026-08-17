@@ -41,3 +41,8 @@ console/dist/
 console/coverage/
 console/*.tsbuildinfo
 console/next-env.d.ts
+
+# Private security working notes. Never commit these to a public repository —
+# an unfixed finding written down in full is a disclosure, not a note.
+# Published findings live in GitHub security advisories; see SECURITY.md.
+security-notes/
