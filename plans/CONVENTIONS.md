@@ -61,7 +61,7 @@ Each iteration plan is executed on its **own branch** and lands via **its own pu
 
 ## 1A. Long-lived branches (`main` / `develop`) and merge method
 
-This repository has two long-lived branches. **`main`** is the default branch and the release branch; **`develop`** is the integration branch. Feature and plan branches land on `develop`; `develop` is periodically promoted to `main`. **Every merge into `main` — a promotion or anything else — is followed by a step that puts `main` back inside `develop`**; see "The ritual" below, which is mandatory rather than occasional.
+This repository has two long-lived branches. **`develop`** is the default branch and the integration branch; **`main`** is the release branch. (`main` was the default until 2026-08-17 — see "What changing the default branch cost" below, because the switch had a consequence nobody predicted.) Feature and plan branches land on `develop`; `develop` is periodically promoted to `main`. **Every merge into `main` — a promotion or anything else — is followed by a step that puts `main` back inside `develop`**; see "The ritual" below, which is mandatory rather than occasional.
 
 Unlike the rest of this file, this section is **not** scoped to the iteration plans. It binds **every** merge between `main` and `develop`, whoever or whatever performs it, plan-related or not.
 
@@ -109,6 +109,25 @@ The moment `main` acquires content of its own, this changes completely. `develop
 - **any other PR mistakenly opened against `main`** — including plan work. `plans/RUNNER-PROMPT.md` §9 no longer instructs that (see above), but nothing in configuration prevents a human or an agent from choosing `main` as the base by hand: `conditions.ref_name` cannot tell a promotion from a feature branch.
 
 Both produce the same state and the same silent revert. The protection on `main` prevents a stray local commit; it does **not** prevent this. Steps 3–5 below are what prevent it, and they are keyed on *any* merge into `main` for exactly this reason.
+
+### What changing the default branch cost — 2026-08-17
+
+The default branch moved from `main` to `develop` so that a `Closes #N` in a commit message would actually close its issue: GitHub only auto-closes for commits landing on the **default** branch, so while `main` held that role every fixed issue stayed open until the next promotion, and `plans/NEXT.md` — reconciled from the issue list — inherited the lie.
+
+That part worked. **The switch also silently moved a ruleset**, and this is the part worth remembering:
+
+> A ruleset whose target is `~DEFAULT_BRANCH` follows the default branch. Change the default, and the ruleset changes which branch it protects — without anyone editing the ruleset.
+
+The ruleset named *"main: promotions land as merge commits"* targeted `~DEFAULT_BRANCH` and never named `refs/heads/main`. The instant `develop` became default:
+
+- **`main` lost its merge-method pin entirely.** Squash into `main` became configuration-legal — the exact operation PR #102 performed and that this section exists to prevent. Nothing about the ruleset was touched; it simply pointed elsewhere.
+- **`develop` inherited a merge-commit-only rule**, which — intersected with its own ruleset — left squash forbidden on the branch where every feature PR squashes.
+
+Both were repaired the same day by retargeting every ruleset at an explicit `refs/heads/…` and removing `~DEFAULT_BRANCH` from all of them. The configuration is now immune to a future default-branch change.
+
+**The general rule: never target `~DEFAULT_BRANCH` in a ruleset for a repository with two long-lived branches.** It reads as a convenience and behaves as an indirection, and the failure is silent in both directions at once — one branch quietly unprotected, another quietly over-restricted.
+
+Note also what this episode did *not* break: `main` kept its pull-request requirement, its required checks and its force-push refusal throughout, because those came from a different ruleset. The loss was one merge-method pin — which happens to be the only half of §1A that configuration can enforce at all.
 
 ### The ritual — a merge into `main` is not finished when the PR merges
 
