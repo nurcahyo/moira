@@ -77,6 +77,12 @@ services:
   #
   #   docker compose --profile claude-runner up -d claude-runner
   #   docker compose --profile claude-runner rm --stop --force --volumes claude-runner
+  #
+  # `claude setup-token` mints a SUBSCRIPTION credential, not an API key. Anthropic's terms
+  # treat subscription auth as being for ordinary individual use of Claude Code and the other
+  # native Claude apps; building a product or service on it is directed to API-key auth.
+  # Running the official CLI in a container changes the mechanism, not the purpose. See
+  # docs/claude-subscription-boundary.md.
   claude-runner:
     image: moira-claude-runner:local
     profiles: ["claude-runner"]

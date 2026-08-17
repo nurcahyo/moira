@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+Read `plans/NEXT.md` when you are picking up this repository without a specific task already assigned. It holds the current work queue, what is deliberately blocked on a human decision, and the housekeeping state — branches, worktrees, the test floor — that is expensive to rediscover.
+
 Use `skills/moira-project-structure/SKILL.md` before making structural changes, adding new APIs, touching provider orchestration, modifying credential/security behavior, or reorganizing modules.
 
 Use `.claude/skills/moira-openapi/SKILL.md` whenever adding or changing HTTP routes, API DTOs, parameters, status codes, authentication, headers, streaming, metrics, or API documentation.

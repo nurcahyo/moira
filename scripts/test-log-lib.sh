@@ -232,7 +232,51 @@ tl_count_skips() {
 # `cargo test --all-features --doc` on whichever shard draws the `__doc__` unit, so the union
 # includes the same 6 doctests this local run does and 1756 is the right floor for both. Had it
 # not, this constant would have turned CI red while every local gate stayed green.
-TL_TEST_COUNT_MINIMUM=1756
+#
+# Re-measured 2026-08-17 on `fix/openapi-body-collision-regression`: **1761** passed, source
+# declaring 1755, by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. Measured
+# twice, once based on `develop` at 38e789d and again after rebasing onto f62e444, which is
+# docs-only and moved neither number. The branch adds 3 tests (2 in
+# `src/orchestration/openapi_import.rs`, 1 in `src/orchestration/skill_tool.rs`), and the base was
+# already carrying 2 more than the line above claimed — 1756 was 2 low before this branch existed,
+# which is exactly the drift this file keeps warning about and keeps accumulating.
+#
+# The local/CI equality was checked directly this time rather than reasoned about: CI run
+# 31963437261 on that same base commit printed `tests passed: 1758 (source declares 1752)`, and
+# this branch measured 1761/1755 locally — the same +3 on both halves, so the local number and
+# the sharded union are still the same number and 1761 is the right floor for both.
+#
+# Re-measured 2026-08-17 on `fix/rig-tool-loop-memory-252`, based on `develop` at 754ef83 (which
+# already carries the branch measured directly above): **1762** passed, source declaring 1756, by
+# `scripts/gates.sh` with Postgres and Redis up and zero skip lines. This branch adds exactly 1
+# test, `a_successful_loop_meters_every_turn_not_only_the_one_that_answered` in
+# `tests/skill_tool_loop.rs`, and both halves moved by 1 — so the base was carrying neither
+# surplus nor deficit this time, the first measurement in this file where that is true. The +6
+# doctest offset holds for the ninth consecutive measurement.
+#
+# The number is READ OFF THE RUN, not 1761+1. Those happen to agree here, and that agreement is
+# the check rather than the derivation: an arithmetic floor cannot notice a test that was
+# silently lost while another was added, which is precisely the accident the paragraph above
+# describes twice.
+#
+# The first run of that gate went red on
+# `security::api_keys::tests::an_unrelated_future_keeps_running_while_verifications_are_in_flight`
+# — a timing assertion (119 timer fires against a required 139) taken while the machine sat at
+# load average 24 under Spotlight indexing. It passes alone and passed in the re-run below load
+# 8; no count was read from the red run. Recorded here because a measurement taken under
+# contention is the documented way this repository has published wrong numbers before.
+#
+# Re-measured 2026-08-17 on `fix/dispatcher-ssrf-251`, based on `develop` at c9cb440 (which
+# already carries the branch measured directly above): **1775** passed, source declaring 1769,
+# by `scripts/gates.sh` with Postgres and Redis up and zero skip lines. The branch adds 13
+# tests — 5 in `src/infra/workers/queue.rs`, 2 in `src/config/settings.rs`, 4 in
+# `tests/workers/worker_queue.rs`, 2 in `tests/workers/latency_health_oauth.rs` — and both
+# halves moved by 13, so the base was again carrying neither surplus nor deficit. The +6
+# doctest offset holds for the tenth consecutive measurement.
+#
+# Read off the run, not 1762+13; see the paragraph above for why the agreement is the check
+# and not the derivation.
+TL_TEST_COUNT_MINIMUM=1775
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

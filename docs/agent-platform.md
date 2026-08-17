@@ -91,11 +91,20 @@ tool loop (#84).
 Every imported skill lands `draft`, exactly like a hand-authored one (§5 decision 22) — the
 operator reviews and enables via the existing `/enable`/`/bulk-enable` endpoints above.
 
-`params_schema` is derived from each operation's `parameters` (flattened to top-level properties)
-and `requestBody`'s `application/json` schema (nested under a `body` property). Component `$ref`s
+`params_schema` is derived from each operation's `parameters` — both the operation's own and the
+path item's, which OpenAPI says every operation under that path inherits, with the operation's
+winning on a `(name, in)` tie — flattened to top-level properties, plus `requestBody`'s
+`application/json` schema nested under a `body` property. Component `$ref`s
 (`#/components/parameters/...`, `#/components/schemas/...`) are resolved one level against the
 same document; a `$ref` nested inside an already-resolved schema is left as written. See the
 module docs in `src/orchestration/openapi_import.rs` for the exact rules.
+
+Nothing stops a spec from declaring a **parameter** named `body`. When one does, the request body
+is nested under the first free name from `request_body`, `request_body_2`, … and the schema
+carries `"x-moira-body-property": "<that name>"` at its root. The executor never assumes the name:
+it asks `openapi_import::body_property_name`, the one function that decides, so a schema whose
+body moved cannot be dispatched as though it had not. Schemas with no such property are
+unchanged — the annotation is written only when the default name was taken.
 
 ### `skill_http_executors` CRUD
 
@@ -358,12 +367,21 @@ the agent author". Resolution runs once per execution, before any provider is ch
    `skill_execution.maximum_tool_turns` model calls. Each turn's tool calls become one assistant
    message plus exactly one user message carrying every tool result, in call order — the shape
    providers require for parallel calls.
+4. **The last permitted turn never dispatches.** A tool result only means something if a further
+   model call reads it, and on turn `maximum_tool_turns` there is none — so a tool call there ends
+   the attempt as `deadline_exceeded` without issuing the request, rather than mutating an
+   operator's third-party API for a result that is discarded. With the default budget of `4`, a
+   model that only ever calls tools makes 4 completions and 3 dispatches.
+5. **The attempt's reported usage is the sum of every turn**, not the last one's, on success and
+   on failure alike. `usage_records` rows are per attempt, and a tool-bearing attempt is several
+   billed completions whose later turns are the expensive ones.
 
 ### What a call does
 
 `HttpSkillTool` fills `{placeholder}` segments from the model's arguments (percent-encoded, so an
 argument cannot escape its segment), sends every remaining declared argument as a query parameter,
-sends `body` as the JSON request body on `POST`/`PUT`/`PATCH`, and re-runs
+sends the argument `openapi_import::body_property_name` names — `body` unless a parameter took
+that name, see above — as the JSON request body on `POST`/`PUT`/`PATCH`, and re-runs
 `security::ssrf::validate_outbound_url` on the **resolved** URL plus an `allowed_host` equality
 check (plan 12 risk R20 — import-time validation cannot cover a URL that only exists at call time).
 The executor's `credential_id` is decrypted per execution into an `Authorization: Bearer` header;

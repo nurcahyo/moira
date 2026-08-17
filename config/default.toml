@@ -209,6 +209,13 @@ allow_insecure_dev_urls = false
 # root-equivalent on its host. Moira never holds Docker access; it calls this endpoint
 # server-to-server instead. Deployment topology, not runtime configuration — which is why it
 # lives here rather than in a table the admin API can rewrite.
+#
+# What a runner mints is a Claude SUBSCRIPTION credential, not an API key, and Anthropic's terms
+# treat subscription auth as being for ordinary individual use of Claude Code and the other
+# native Claude apps — developers building products or services are directed to API-key auth.
+# Running the official CLI in a container changes the mechanism, not the purpose. There is no
+# opt-in gate for this yet, unlike provider_security.allow_chatgpt_subscription above; see
+# docs/claude-subscription-boundary.md and issue #307.
 [claude_runner]
 # Off by default: a deployment with no runner service is the normal case. While false the whole
 # /api/v1/admin/runners surface answers 503 runner_service_disabled before any network call.

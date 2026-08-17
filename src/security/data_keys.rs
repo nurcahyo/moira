@@ -668,6 +668,17 @@ pub struct ContentKeyring {
     single_flight_collapses: AtomicU64,
     /// Misses refused by `min_refresh_seconds` without a load.
     floor_throttles: AtomicU64,
+    /// Misses that reached the gate at all, counted **before** the permit is taken.
+    ///
+    /// The other three counters all record what happened *after* a miss won or lost the permit,
+    /// which leaves "a miss reached the gate" unobservable — and that is the one fact a test of
+    /// single flight has to establish before it can conclude anything. Counting it here, ahead of
+    /// `acquire()`, gives the arrival a happens-after edge on the snapshot read that missed and a
+    /// happens-before edge on the queueing, so a test can park the first loader mid-load and wait
+    /// for the burst to be provably queued instead of hoping the scheduler obliges. See issue
+    /// #236: without it the test asserted an interleaving rather than the invariant, and reddened
+    /// `rust-shard (2)` on commits that never touched this file.
+    gate_arrivals: AtomicU64,
     generation: AtomicU64,
     /// Milliseconds since [`Self::origin`] at the last on-demand refresh, or [`NEVER`].
     last_on_demand_ms: AtomicU64,
@@ -753,6 +764,7 @@ impl ContentKeyring {
             database_loads,
             single_flight_collapses: AtomicU64::new(0),
             floor_throttles: AtomicU64::new(0),
+            gate_arrivals: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             last_on_demand_ms: AtomicU64::new(NEVER),
             origin: Instant::now(),
@@ -806,6 +818,15 @@ impl ContentKeyring {
     /// Misses refused without a load because `min_refresh_seconds` had not elapsed.
     pub fn floor_throttles(&self) -> u64 {
         self.floor_throttles.load(Ordering::SeqCst)
+    }
+
+    /// Misses that reached the single-flight gate, counted before the permit is taken.
+    ///
+    /// Every arrival ends up in exactly one of the three outcomes above — a collapse, a throttle,
+    /// or a load — so this is their total, and reading it while a load is parked tells a caller
+    /// how much of the burst is already committed to queueing.
+    pub fn gate_arrivals(&self) -> u64 {
+        self.gate_arrivals.load(Ordering::SeqCst)
     }
 
     /// Resolve the cipher an envelope's header names.
@@ -926,6 +947,9 @@ impl ContentKeyring {
     /// The floor is measured from the last *on-demand* refresh, never from boot, so the first miss
     /// a process ever sees always gets its reload.
     async fn refresh_for_miss(&self, observed_generation: u64) -> Arc<KeyringSnapshot> {
+        // Before `acquire()`, deliberately: an arrival counted here has already observed its miss
+        // and cannot now escape the queue, which is what makes the count usable as a barrier.
+        self.gate_arrivals.fetch_add(1, Ordering::SeqCst);
         let _permit = self
             .refresh_gate
             .acquire()
@@ -1397,6 +1421,13 @@ mod tests {
     struct CountingCustody {
         inner: EnvironmentMasterKeyCustody,
         unwrap_calls: AtomicU64,
+        /// Taken by every `unwrap`, and free unless a test is holding it.
+        ///
+        /// `assemble` unwraps every row, so a test that locks this parks a load *after* its query
+        /// and *before* it installs a snapshot — the one window in which a concurrent miss is
+        /// still a miss. That is how the single-flight test stops depending on the scheduler
+        /// choosing the interleaving it wants; see issue #236.
+        unwrap_hold: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl CountingCustody {
@@ -1408,11 +1439,17 @@ mod tests {
             Self {
                 inner: EnvironmentMasterKeyCustody::new(keys, active).expect("custody"),
                 unwrap_calls: AtomicU64::new(0),
+                unwrap_hold: Arc::new(tokio::sync::Mutex::new(())),
             }
         }
 
         fn unwrap_calls(&self) -> u64 {
             self.unwrap_calls.load(Ordering::SeqCst)
+        }
+
+        /// Lock the returned mutex to park the next load part-way through.
+        fn unwrap_hold(&self) -> Arc<tokio::sync::Mutex<()>> {
+            Arc::clone(&self.unwrap_hold)
         }
     }
 
@@ -1453,6 +1490,7 @@ mod tests {
             wrapped: &WrappedKey,
             aad: &[u8],
         ) -> Result<Zeroizing<[u8; 32]>, KeyCustodyError> {
+            let _hold = self.unwrap_hold.lock().await;
             self.unwrap_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.unwrap(wrapped, aad).await
         }
@@ -1967,14 +2005,30 @@ mod tests {
         );
         let loads_after_boot = keyring.database_loads();
         let unwraps_after_boot = custody.unwrap_calls();
+        let arrivals_after_boot = keyring.gate_arrivals();
 
         // A real latecomer, so the hundred misses end in a *success*. A test where every task
         // fails would pass just as happily against a keyring that never reloaded at all.
         let latecomer = insert_key(&pool, custody.as_ref(), 3, DataKeyState::Retiring, 61).await;
 
-        // All hundred released at once, so they genuinely queue on the same permit rather than
-        // arriving one after another and being collapsed by the floor instead — which would make
-        // this a test of the floor wearing the single-flight test's name.
+        // The interleaving is the test's to decide, not the scheduler's — issue #236.
+        //
+        // A barrier alone only guarantees the hundred *start* together. Whichever one wins the
+        // permit can then finish its whole load before the other ninety-nine are next polled, and
+        // they all hit the fresh snapshot and never reach the gate: one load, nothing collapsed,
+        // and an assertion on collapses fails against code that behaved perfectly. That is what
+        // reddens `rust-shard (2)`, and it was reproduced here by simply awaiting one
+        // `cipher_for` before releasing the rest.
+        //
+        // So the load is pinned open instead. `assemble` unwraps every row, so holding the
+        // custody's `unwrap` parks the first loader after its query and before it installs a
+        // snapshot — which means the snapshot cannot change under anyone until this test says so.
+        // The hold is released only once all hundred have been counted at the gate, and an
+        // arrival is counted after its miss and before it queues, so at that instant every one of
+        // them has missed the *old* generation and none can escape the permit queue.
+        let hold = custody.unwrap_hold();
+        let held = hold.lock().await;
+
         let barrier = Arc::new(tokio::sync::Barrier::new(100));
         let mut tasks = Vec::with_capacity(100);
         for _ in 0..100 {
@@ -1988,6 +2042,21 @@ mod tests {
                     .map(|cipher| cipher.data_key_id())
             }));
         }
+
+        // Bounded, because a hang here would otherwise be a test that never finishes rather than
+        // a test that reports. Every arrival is guaranteed while the load is held, so reaching
+        // the deadline means single flight itself has changed shape and the failure should say so.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while keyring.gate_arrivals() - arrivals_after_boot < 100 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of 100 misses reached the single-flight gate while a load was held open",
+                keyring.gate_arrivals() - arrivals_after_boot
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(held);
+
         for task in tasks {
             assert_eq!(task.await.expect("join").expect("resolved"), latecomer);
         }
@@ -2002,16 +2071,21 @@ mod tests {
         // This pair is the difference between a test with teeth and one without. Deleting the
         // generation check entirely leaves the load count at one — `min_refresh_seconds` refuses
         // the other 99 just as effectively — so the count alone proves nothing about single
-        // flight. Measured: with the generation check disabled, `floor_throttles` becomes 99 and
-        // this assertion is the only one that fails.
+        // flight. Measured on this tree: with the generation check disabled, `floor_throttles`
+        // becomes 99, this is the assertion that fires, and the load count stays at one.
         assert_eq!(
             keyring.floor_throttles(),
             0,
             "the burst was collapsed by the refresh floor, not by the single-flight gate"
         );
-        assert!(
-            keyring.single_flight_collapses() > 0,
-            "no miss observed the concurrent load; this did not exercise single flight"
+        // Exactly ninety-nine, not merely "some". With the load held until all hundred are past
+        // the gate's turnstile, one of them performs the load and the other ninety-nine must each
+        // find the generation moved on — so this is now an invariant the code either satisfies or
+        // does not, with no interleaving left for it to depend on.
+        assert_eq!(
+            keyring.single_flight_collapses(),
+            99,
+            "every miss but the loader must have been collapsed by the single-flight gate"
         );
 
         // The load unwrapped three keys once — the original content key, the latecomer, and the

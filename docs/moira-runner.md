@@ -19,6 +19,18 @@ prints the content-pinned `sha256:` id to put in `MOIRA_RUNNER__IMAGE`. See
 honest "N containers on one account is not N× capacity" limit. This document covers the
 service.
 
+**What this service mints is a subscription credential, and that is not an API key.**
+Anthropic's terms treat subscription OAuth authentication as being for ordinary individual
+use of Claude Code and the other native Claude apps; developers building products or
+services are directed to API-key authentication. Running the **official** `claude` CLI
+inside a container — which is exactly what this service does — changes the mechanism, not
+the purpose. `moira-runner` has no way to tell whose traffic the credential it mints will
+end up answering, and does not pretend to. Read
+[`claude-subscription-boundary.md`](claude-subscription-boundary.md) before deploying it,
+in particular the scope rule: a `global`-scoped subscription credential serving a tenant's
+request is the one case that should be a hard refusal, and it is not implemented yet
+([#307](https://github.com/nurcahyo/moira/issues/307)).
+
 ## Why a separate process
 
 Docker socket access is **root-equivalent on the host**: anything that can create a container

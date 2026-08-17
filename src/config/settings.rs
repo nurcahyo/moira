@@ -840,7 +840,31 @@ pub struct WorkerSettings {
     /// mid-job never writes a terminal state, and without this threshold the row
     /// would stay `running` forever. It must exceed the longest job body, or a
     /// slow job gets a second executor while the first is still working.
+    ///
+    /// That is no longer left to an operator to make true by inspection: one
+    /// poll's whole dispatch phase is bounded by a fixed share of this value
+    /// (`DISPATCH_BUDGET_PERCENT_OF_STALE_CLAIM` in
+    /// `src/infra/workers/queue.rs`), and each job inside it by
+    /// [`Self::queue_job_timeout_seconds`].
     pub queue_stale_claim_seconds: u64,
+    /// The longest one job body may run before the queue abandons it as a failed
+    /// attempt.
+    ///
+    /// A ceiling on a *single* handler; the batch as a whole is bounded
+    /// separately and unconditionally by a share of
+    /// [`Self::queue_stale_claim_seconds`], because eight jobs each finishing
+    /// inside this timeout can still overrun the stale threshold together. Must
+    /// be below `queue_stale_claim_seconds` — validated, because a per-job timeout
+    /// at or above the stale threshold can never fire before the row it is meant
+    /// to protect has already been handed to a second executor.
+    ///
+    /// Sized for the two network-bound handlers shipped today:
+    /// `provider-health-check` probes each active provider at
+    /// `provider_health_probe_timeout_ms` (3s), and `oauth-token-refresh` walks up
+    /// to 100 due credentials at a 10s HTTP timeout each. Neither approaches 120s
+    /// against a working dependency; both run for many minutes against a dead one,
+    /// which is the case this bounds.
+    pub queue_job_timeout_seconds: u64,
     /// Pending-depth cap. `enqueue` refuses beyond it with
     /// `moira.error.worker_queue_capacity_exceeded`.
     ///
@@ -1444,6 +1468,21 @@ impl Settings {
                  job is immediately reclaimable by another replica"
                     .to_string(),
             );
+        }
+        if self.workers.queue_job_timeout_seconds == 0 {
+            violations.push(
+                "workers.queue_job_timeout_seconds must be at least 1, or every job body is \
+                 abandoned as failed before it has started"
+                    .to_string(),
+            );
+        } else if self.workers.queue_job_timeout_seconds >= self.workers.queue_stale_claim_seconds {
+            violations.push(format!(
+                "workers.queue_job_timeout_seconds ({}) must be below \
+                 workers.queue_stale_claim_seconds ({}), or a wedged job is still running when \
+                 another replica reclaims its row and runs the same job concurrently — the \
+                 per-job timeout would fire only after the damage it exists to prevent",
+                self.workers.queue_job_timeout_seconds, self.workers.queue_stale_claim_seconds
+            ));
         }
         if self.workers.queue_max_pending_jobs < 1 {
             violations.push(
@@ -2073,6 +2112,11 @@ impl Default for WorkerSettings {
             // shipped today is a stub that completes immediately; the threshold is
             // sized for the real bodies plan 11 will add.
             queue_stale_claim_seconds: 300,
+            // 2 minutes: comfortably above what either network-bound handler needs
+            // against a working dependency, and comfortably below both the
+            // 300s stale threshold and the 240s (80%) batch budget derived from it,
+            // so a single wedged job cannot consume a whole poll's budget on its own.
+            queue_job_timeout_seconds: 120,
             // 10k pending rows is roughly where the claim's `(status, run_at)`
             // index scan stops being free on commodity hardware.
             queue_max_pending_jobs: 10_000,
@@ -2905,5 +2949,51 @@ mod tests {
                 "https://two.example.com".to_string()
             ]
         );
+    }
+
+    /// A per-job timeout at or above the stale-claim threshold is one that can only fire
+    /// after the row it protects has already been reclaimed and handed to a second executor
+    /// — the exact concurrent re-execution the timeout exists to prevent (issue #251
+    /// finding 4). The two values are only meaningful relative to each other, so the
+    /// inequality is validated rather than left to an operator to notice.
+    #[test]
+    fn a_job_timeout_at_or_above_the_stale_claim_threshold_is_refused() {
+        let mut settings = Settings::default();
+        settings.workers.queue_stale_claim_seconds = 300;
+        settings.workers.queue_job_timeout_seconds = 300;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a job timeout equal to the stale threshold must not validate")
+            .to_string();
+        assert!(
+            error.contains("workers.queue_job_timeout_seconds"),
+            "the violation must name the setting an operator has to change: {error}"
+        );
+
+        settings.workers.queue_job_timeout_seconds = 301;
+        assert!(settings.validate(ProcessMode::Serve).is_err());
+
+        settings.workers.queue_job_timeout_seconds = 0;
+        let error = settings
+            .validate(ProcessMode::Serve)
+            .expect_err("a zero job timeout abandons every job before it starts")
+            .to_string();
+        assert!(
+            error.contains("workers.queue_job_timeout_seconds"),
+            "{error}"
+        );
+
+        settings.workers.queue_job_timeout_seconds = 299;
+        settings
+            .validate(ProcessMode::Serve)
+            .expect("a job timeout below the stale threshold is the supported configuration");
+    }
+
+    /// The shipped defaults must satisfy the invariant they are the example of.
+    #[test]
+    fn the_default_job_timeout_is_below_the_default_stale_claim_threshold() {
+        let workers = WorkerSettings::default();
+        assert!(workers.queue_job_timeout_seconds >= 1);
+        assert!(workers.queue_job_timeout_seconds < workers.queue_stale_claim_seconds);
     }
 }

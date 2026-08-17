@@ -15,11 +15,19 @@
 //!   check constraint could never store them.
 //! - `params_schema` flattens `parameters` (path/query/header) into top-level JSON-Schema
 //!   properties, and — if present — nests `requestBody`'s `application/json` schema under
-//!   a `body` property. This is a deliberate simplification, not a full OpenAPI-to-
-//!   JSON-Schema translator: a parameter and the request body can never collide (`body`
-//!   is not itself a legal OpenAPI parameter name in this shape), but two parameters that
-//!   share a name across different `in` locations (e.g. a path param and a query param
-//!   both named `id`) do collide, and the later one silently wins.
+//!   a [`DEFAULT_BODY_PROPERTY`] property. Both parameter lists are read: the path item's,
+//!   which OpenAPI says every operation under that path inherits, then the operation's own,
+//!   which overrides an inherited parameter with the same `(name, in)` pair. This is a
+//!   deliberate simplification, not a full OpenAPI-to-JSON-Schema translator: two parameters
+//!   that share a name across different `in` locations (e.g. a path param and a query param
+//!   both named `id`) still collide in the flattened property list, and the later one
+//!   silently wins.
+//! - A parameter *can* be named `body` — OpenAPI puts nothing off limits — so the request
+//!   body can lose that name to a parameter. It is then nested under the first free name
+//!   from `request_body`, `request_body_2`, … and the schema records which property that
+//!   was under [`BODY_PROPERTY_ANNOTATION`]. See [`body_property_name`]: the executor reads
+//!   the answer back out of the schema rather than assuming one, which is what keeps the
+//!   two halves from disagreeing.
 //! - `$ref` is resolved **exactly one level deep**, against the same document, for
 //!   parameter objects and for the request body's media-type schema — the two shapes
 //!   real-world specs use `$ref` for almost universally (shared parameter components,
@@ -90,6 +98,79 @@ pub const MAX_OPERATION_SCHEMA_BYTES: usize = 64 * 1024;
 /// actually bounds the `$ref` amplification, since the whole failure mode is one big schema
 /// cloned three hundred times, each clone individually modest.
 pub const MAX_TOTAL_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
+
+/// The `params_schema` property a JSON `requestBody` is nested under when no parameter has
+/// already taken the name.
+pub const DEFAULT_BODY_PROPERTY: &str = "body";
+
+/// Schema-level annotation naming the property that actually carries the request body.
+///
+/// Written by [`build_params_schema`] **only** when the request body could not have
+/// [`DEFAULT_BODY_PROPERTY`], so the overwhelmingly common schema is byte-for-byte what it
+/// was before this key existed — nothing new is put in front of a provider that has never
+/// needed to tolerate it. Absence therefore carries meaning, and [`body_property_name`] is
+/// where that meaning is spelled out.
+///
+/// `x-`-prefixed after the OpenAPI extension convention. JSON Schema ignores keywords it does
+/// not recognise, so this changes nothing about how the schema validates.
+pub const BODY_PROPERTY_ANNOTATION: &str = "x-moira-body-property";
+
+/// Which property of a derived `params_schema` carries the HTTP request body, if any.
+///
+/// **The single place that question is answered.** [`build_params_schema`] picks the name and
+/// `orchestration::skill_tool::HttpSkillTool` finds it again at call time by calling *this*
+/// function — neither side spells a property name out, so neither can drift from the other.
+/// It matters because the two used to: the importer learned to rename a colliding body to
+/// `request_body` while the executor still hard-coded `"body"`, which inverted the dispatch
+/// outright — the request body went into the query string and the scalar parameter went into
+/// the JSON body.
+///
+/// The rule, in precedence order:
+///
+/// 1. [`BODY_PROPERTY_ANNOTATION`], when it names a property that exists. A stale or
+///    misspelled annotation falls through rather than naming a body that is not there.
+/// 2. [`DEFAULT_BODY_PROPERTY`], when present. This is both the ordinary un-annotated case
+///    and the compatibility path for `params_schema` values stored before the annotation
+///    existed.
+/// 3. Otherwise `None` — the operation declares no request body.
+///
+/// Note what rule 2 cannot distinguish: a parameter genuinely named `body` on an operation
+/// with *no* `requestBody` still reads as the request body. Closing that needs a positive
+/// "this operation has no body" marker on every schema, which the stored rows predating it
+/// could not carry; it is a strictly smaller wrong than the inversion above, and unchanged
+/// by this function.
+pub fn body_property_name(params_schema: &Value) -> Option<&str> {
+    let object = params_schema.as_object()?;
+    let properties = object.get("properties").and_then(Value::as_object)?;
+    if let Some(annotated) = object.get(BODY_PROPERTY_ANNOTATION).and_then(Value::as_str)
+        && let Some((name, _)) = properties.get_key_value(annotated)
+    {
+        return Some(name.as_str());
+    }
+    properties
+        .get_key_value(DEFAULT_BODY_PROPERTY)
+        .map(|(name, _)| name.as_str())
+}
+
+/// The first property name free for the request body: [`DEFAULT_BODY_PROPERTY`], then
+/// `request_body`, then `request_body_2`, `request_body_3`, … Terminates because each
+/// candidate it rejects is a distinct key already in a finite map.
+///
+/// The counter is not decoration. `request_body` alone was the previous fallback, and a spec
+/// carrying parameters named both `body` and `request_body` plus a `requestBody` would have
+/// silently overwritten one of the three.
+fn free_body_property_name(properties: &Map<String, Value>) -> String {
+    if !properties.contains_key(DEFAULT_BODY_PROPERTY) {
+        return DEFAULT_BODY_PROPERTY.to_string();
+    }
+    if !properties.contains_key("request_body") {
+        return "request_body".to_string();
+    }
+    (2..)
+        .map(|suffix| format!("request_body_{suffix}"))
+        .find(|candidate| !properties.contains_key(candidate))
+        .expect("a finite property map always leaves a suffixed name free")
+}
 
 /// The only HTTP methods `skill_http_executors.method` can store, in the fixed order
 /// operations are enumerated — this is what makes skill-key deduplication deterministic
@@ -256,16 +337,19 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
     // so the cap check below runs before any per-operation work.
     let mut path_keys: Vec<&String> = paths.keys().collect();
     path_keys.sort();
-    let mut raw_operations: Vec<(&str, &str, &Value, HttpMethod)> = Vec::new();
+    let mut raw_operations: Vec<(&str, &Value, &str, &Value, HttpMethod)> = Vec::new();
     for path in path_keys {
-        let Some(item) = paths.get(path).and_then(Value::as_object) else {
+        let Some(item) = paths.get(path) else {
+            continue;
+        };
+        let Some(item_obj) = item.as_object() else {
             continue;
         };
         for (method_name, method) in RECOGNIZED_METHODS {
-            if let Some(operation) = item.get(method_name)
+            if let Some(operation) = item_obj.get(method_name)
                 && operation.is_object()
             {
-                raw_operations.push((path.as_str(), method_name, operation, method));
+                raw_operations.push((path.as_str(), item, method_name, operation, method));
             }
         }
     }
@@ -284,10 +368,11 @@ pub fn parse_openapi_document(document: &Value) -> Result<ParsedImport, OpenApiI
     let mut budget = SchemaBudget::default();
     let operations = raw_operations
         .into_iter()
-        .map(|(path, method_name, operation, method)| {
+        .map(|(path, path_item, method_name, operation, method)| {
             build_operation(
                 document,
                 path,
+                path_item,
                 method_name,
                 operation,
                 method,
@@ -372,11 +457,13 @@ fn serialized_len(value: &Value) -> usize {
     }
 }
 
-fn build_operation(
-    root: &Value,
+#[allow(clippy::too_many_arguments)]
+fn build_operation<'a>(
+    root: &'a Value,
     path: &str,
+    path_item: &'a Value,
     method_name: &str,
-    operation: &Value,
+    operation: &'a Value,
     method: HttpMethod,
     used_keys: &mut HashSet<String>,
     budget: &mut SchemaBudget,
@@ -418,7 +505,7 @@ fn build_operation(
         })
         .unwrap_or_default();
 
-    let params_schema = build_params_schema(root, operation, &skill_key, budget)?;
+    let params_schema = build_params_schema(root, path_item, operation, &skill_key, budget)?;
 
     Ok(ParsedOperation {
         skill_key,
@@ -437,39 +524,60 @@ fn build_operation(
 /// Every value this copies into `properties` is charged against `budget` *before* the copy,
 /// because the copies are the whole amplification: a resolved `$ref` is a deep clone of a
 /// subtree the document holds once and this function may hold three hundred times.
-fn build_params_schema(
-    root: &Value,
-    operation: &Value,
+fn build_params_schema<'a>(
+    root: &'a Value,
+    path_item: &'a Value,
+    operation: &'a Value,
     skill_key: &str,
     budget: &mut SchemaBudget,
 ) -> Result<Value, OpenApiImportError> {
     let mut properties = Map::new();
     let mut required: Vec<String> = Vec::new();
+    let mut body_property: Option<String> = None;
     budget.begin_operation();
 
-    if let Some(parameters) = operation.get("parameters").and_then(Value::as_array) {
-        for parameter in parameters {
-            let parameter = resolve_maybe_ref(root, parameter);
-            let Some(name) = parameter.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            // A parameter that declares no schema gets the fixed 17-byte `{"type":"string"}`
-            // substitute below, which cannot amplify — three hundred of them is under 6 KiB —
-            // so only a declared (and possibly `$ref`-resolved) schema is charged.
-            let declared = parameter.get("schema");
-            budget.charge(declared.map_or(0, serialized_len), skill_key)?;
-            let schema = declared
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "string"}));
-            if parameter
-                .get("required")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                required.push(name.to_string());
+    let mut param_list: Vec<(&'a Value, &'a str, Option<&'a str>)> = Vec::new();
+
+    let mut process_param_array = |params: &'a Value| {
+        if let Some(arr) = params.as_array() {
+            for param in arr {
+                let resolved = resolve_maybe_ref(root, param);
+                if let Some(name) = resolved.get("name").and_then(Value::as_str) {
+                    let param_in = resolved.get("in").and_then(Value::as_str);
+                    if let Some(pos) = param_list
+                        .iter()
+                        .position(|(_, n, i)| *n == name && *i == param_in)
+                    {
+                        param_list[pos] = (resolved, name, param_in);
+                    } else {
+                        param_list.push((resolved, name, param_in));
+                    }
+                }
             }
-            properties.insert(name.to_string(), schema);
         }
+    };
+
+    if let Some(params) = path_item.get("parameters") {
+        process_param_array(params);
+    }
+    if let Some(params) = operation.get("parameters") {
+        process_param_array(params);
+    }
+
+    for (parameter, name, _) in param_list {
+        let declared = parameter.get("schema");
+        budget.charge(declared.map_or(0, serialized_len), skill_key)?;
+        let schema = declared
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "string"}));
+        if parameter
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            required.push(name.to_string());
+        }
+        properties.insert(name.to_string(), schema);
     }
 
     if let Some(request_body) = operation.get("requestBody") {
@@ -482,22 +590,38 @@ fn build_params_schema(
         {
             let schema = resolve_maybe_ref(root, schema);
             budget.charge(serialized_len(schema), skill_key)?;
-            properties.insert("body".to_string(), schema.clone());
+            let chosen = free_body_property_name(&properties);
+            properties.insert(chosen.clone(), schema.clone());
             if request_body
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                required.push("body".to_string());
+                required.push(chosen.clone());
             }
+            body_property = Some(chosen);
+        }
+    }
+
+    let mut unique_required = Vec::new();
+    for req in required {
+        if !unique_required.contains(&req) {
+            unique_required.push(req);
         }
     }
 
     let mut schema = Map::new();
     schema.insert("type".to_string(), json!("object"));
     schema.insert("properties".to_string(), Value::Object(properties));
-    if !required.is_empty() {
-        schema.insert("required".to_string(), json!(required));
+    if !unique_required.is_empty() {
+        schema.insert("required".to_string(), json!(unique_required));
+    }
+    // Only when the name is not the one `body_property_name` already assumes — see
+    // `BODY_PROPERTY_ANNOTATION` for why the ordinary schema is left exactly as it was.
+    if let Some(body_property) = body_property
+        && body_property != DEFAULT_BODY_PROPERTY
+    {
+        schema.insert(BODY_PROPERTY_ANNOTATION.to_string(), json!(body_property));
     }
     Ok(Value::Object(schema))
 }
@@ -723,6 +847,10 @@ mod tests {
             op.params_schema["properties"]["body"]["properties"]["sku"]["type"],
             "string"
         );
+        // The uncontested case must stay exactly the schema it always was: no annotation, so
+        // nothing new is put in front of a provider, and `body_property_name` still answers.
+        assert!(op.params_schema.get(BODY_PROPERTY_ANNOTATION).is_none());
+        assert_eq!(body_property_name(&op.params_schema), Some("body"));
     }
 
     #[test]
@@ -1075,5 +1203,149 @@ mod tests {
         }));
         let parsed = parse_openapi_document(&document).expect("must parse");
         assert!(parsed.operations[0].skill_key.len() <= MAX_SKILL_KEY_LEN);
+    }
+
+    #[test]
+    fn path_item_level_parameters_are_inherited_and_overridden_by_operation_level() {
+        let document = minimal_document(json!({
+            "/orders/{order_id}": {
+                "parameters": [
+                    {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string"}},
+                    {"name": "tenant", "in": "header", "schema": {"type": "string"}}
+                ],
+                "get": {
+                    "operationId": "getOrder",
+                    "parameters": [
+                        {"name": "order_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+                    ]
+                }
+            }
+        }));
+
+        let parsed = parse_openapi_document(&document).expect("must parse");
+        let op = &parsed.operations[0];
+        let props = op.params_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("order_id"));
+        assert!(props.contains_key("tenant"));
+        assert_eq!(props["order_id"]["format"], "uuid");
+    }
+
+    #[test]
+    fn body_parameter_and_request_body_collision_is_prevented_and_required_is_deduplicated() {
+        let document = minimal_document(json!({
+            "/items": {
+                "post": {
+                    "operationId": "createItem",
+                    "parameters": [
+                        {"name": "body", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "body", "in": "header", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object", "properties": {"name": {"type": "string"}}}
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let parsed = parse_openapi_document(&document).expect("must parse");
+        let op = &parsed.operations[0];
+        let props = op.params_schema["properties"].as_object().unwrap();
+
+        assert!(props.contains_key("body"));
+        assert!(props.contains_key("request_body"));
+
+        let req = op.params_schema["required"].as_array().unwrap();
+        let req_strings: Vec<&str> = req.iter().filter_map(Value::as_str).collect();
+        assert_eq!(req_strings, vec!["body", "request_body"]);
+
+        // Renaming the property is only half the job — the schema has to say which property
+        // it became, or the executor cannot know. `skill_tool` reads exactly this.
+        assert_eq!(
+            body_property_name(&op.params_schema),
+            Some("request_body"),
+            "the renamed body must be discoverable, not merely present"
+        );
+    }
+
+    /// `request_body` was the whole fallback, so a document that also declares a parameter
+    /// by that name put three values into two properties and lost one without a word.
+    #[test]
+    fn a_parameter_named_request_body_does_not_take_the_fallback_from_the_body() {
+        let document = minimal_document(json!({
+            "/items": {
+                "post": {
+                    "operationId": "createItem",
+                    "parameters": [
+                        {"name": "body", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "request_body", "in": "query", "required": true, "schema": {"type": "integer"}}
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object", "properties": {"name": {"type": "string"}}}
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let parsed = parse_openapi_document(&document).expect("must parse");
+        let op = &parsed.operations[0];
+        let props = op.params_schema["properties"].as_object().unwrap();
+
+        assert_eq!(
+            props["body"]["type"], "string",
+            "the parameter keeps `body`"
+        );
+        assert_eq!(
+            props["request_body"]["type"], "integer",
+            "the parameter keeps `request_body`"
+        );
+        assert_eq!(
+            props["request_body_2"]["properties"]["name"]["type"], "string",
+            "the request body takes the first name neither parameter claimed"
+        );
+
+        let req = op.params_schema["required"].as_array().unwrap();
+        let req_strings: Vec<&str> = req.iter().filter_map(Value::as_str).collect();
+        assert_eq!(req_strings, vec!["body", "request_body", "request_body_2"]);
+        assert_eq!(
+            body_property_name(&op.params_schema),
+            Some("request_body_2")
+        );
+    }
+
+    /// The annotation is a hint, not an authority: it can only ever name a property that is
+    /// really there, so a hand-edited `params_schema` cannot point the executor at nothing.
+    #[test]
+    fn an_annotation_naming_a_property_that_does_not_exist_is_ignored() {
+        assert_eq!(
+            body_property_name(&json!({
+                "type": "object",
+                "properties": {"body": {"type": "object"}, "page": {"type": "integer"}},
+                BODY_PROPERTY_ANNOTATION: "not_a_property"
+            })),
+            Some("body")
+        );
+        assert_eq!(
+            body_property_name(&json!({
+                "type": "object",
+                "properties": {"page": {"type": "integer"}},
+                BODY_PROPERTY_ANNOTATION: "not_a_property"
+            })),
+            None
+        );
+        assert_eq!(
+            body_property_name(&json!({"type": "object", "properties": {}})),
+            None
+        );
     }
 }
