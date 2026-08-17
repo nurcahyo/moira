@@ -276,7 +276,29 @@ tl_count_skips() {
 #
 # Read off the run, not 1762+13; see the paragraph above for why the agreement is the check
 # and not the derivation.
-TL_TEST_COUNT_MINIMUM=1775
+#
+# Re-measured 2026-08-17 on `fix/jsonwebtoken-10-338`, based on `develop` at f5ddd1f: **1778**,
+# source declaring 1772, with Postgres and Redis up and zero skip lines. The branch adds 3 tests,
+# all in `src/security/auth.rs`, and both halves moved by 3. The +6 doctest offset holds for the
+# eleventh consecutive measurement.
+#
+# HOW THIS ONE WAS MEASURED, because it was not a plain green `gates.sh` run and saying so is the
+# point of this file. The machine sat at load average ~194 — a Docker VM holding 7.75 GB and 68%
+# CPU alongside the build — and two deadline-based assertions in `tests/execution_lifecycle.rs`
+# went red under it: the terminal-persistence audit row (a *bounded* best-effort write, so a
+# starved budget means no row) and a 5-second cancellation deadline. Both pass with
+# `--test-threads=1`, CI is green on the same base commit, and neither touches JWT validation.
+#
+# So the count comes from `cargo test --workspace --all-features --no-fail-fast` at
+# `RUST_TEST_THREADS=4`: **every** target ran — 66 `test result` lines against 62 files in
+# `tests/`, plus lib, doc and two bin harnesses — giving 1776 passed and those same 2 failed.
+# 1776 + 2 = 1778. That is a substitution of two individually-measured tests into an otherwise
+# complete run, not arithmetic on a remembered figure, and `--no-fail-fast` is what makes it
+# legitimate: without it cargo stops at the first red binary and the log silently omits the rest,
+# which is exactly how the earlier attempt here reported 1364.
+#
+# It agrees with 1772 + 6. As above, the agreement is the check and not the derivation.
+TL_TEST_COUNT_MINIMUM=1778
 
 # ---------------------------------------------------------------------------------
 # tl_declared_tests <repo-root>

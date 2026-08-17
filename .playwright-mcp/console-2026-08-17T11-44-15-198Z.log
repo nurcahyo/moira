@@ -1,0 +1,7 @@
+[    3858ms] Uncaught Error: Cannot find module "ebay/legacy/utils/Uri"
+    at n (https://ir.ebaystatic.com/rs/c/cusr-serv-article-RnKOUA5p.js:102:2998)
+    at p (https://ir.ebaystatic.com/rs/c/cusr-serv-article-RnKOUA5p.js:102:4937)
+    at L (https://ir.ebaystatic.com/rs/c/cusr-serv-article-RnKOUA5p.js:104:156)
+    at require (https://ir.ebaystatic.com/rs/c/cusr-serv-article-RnKOUA5p.js:104:910)
+    at <anonymous> (https://www.ebay.com/help/policies/member-behaviour-policies/user-agreement?id=4259:776:705)
+[    9317ms] [LOG] genesys.min.js loaded @ :27
